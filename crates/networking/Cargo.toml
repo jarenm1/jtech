@@ -1,0 +1,10 @@
+[package]
+name = "networking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+protocol.workspace = true
+serde.workspace = true
+getrandom = "0.3"

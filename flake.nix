@@ -41,7 +41,17 @@
               gdb
             ];
 
-            buildInputs = [ cuda.cudatoolkit ];
+            buildInputs = with pkgs; [
+              cuda.cudatoolkit
+              wayland
+              libxkbcommon
+              vulkan-loader
+              libGL
+              libx11
+              libxcursor
+              libxi
+              libxrandr
+            ];
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             CUDA_PATH = "${cuda.cudatoolkit}";
@@ -55,6 +65,14 @@
                 pkgs.lib.makeLibraryPath [
                   cuda.cudatoolkit
                   pkgs.stdenv.cc.cc
+                  pkgs.wayland
+                  pkgs.libxkbcommon
+                  pkgs.vulkan-loader
+                  pkgs.libGL
+                  pkgs.libx11
+                  pkgs.libxcursor
+                  pkgs.libxi
+                  pkgs.libxrandr
                 ]
               }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             '';
