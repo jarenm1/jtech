@@ -1,0 +1,15 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "server"
+
+[dependencies]
+bevy_app.workspace = true
+simulation.workspace = true
+voxel_world.workspace = true
+networking.workspace = true
+protocol.workspace = true
+physics.workspace = true
+glam.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "voxel_render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy.workspace = true
+voxel_world.workspace = true

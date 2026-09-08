@@ -1,0 +1,13 @@
+[package]
+name = "voxel-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy.workspace = true
+voxel_world.workspace = true
+voxel_render.workspace = true
+physics.workspace = true
+protocol.workspace = true
+networking.workspace = true
