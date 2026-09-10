@@ -21,6 +21,62 @@ fn arena() -> VoxelWorld {
 }
 
 #[test]
+fn reconciliation_preserves_blast_momentum_through_input_replay() {
+    let world = arena();
+    let start = PlayerState {
+        position: Vec3::new(0.5, 0.0, 0.5),
+        grounded: true,
+        ..default()
+    };
+    let mut client = ClientSession {
+        state: start,
+        ..default()
+    };
+    for sequence in 1..=10 {
+        client.predict_input(
+            &world,
+            PlayerInput {
+                sequence,
+                ..default()
+            },
+            &[],
+        );
+    }
+    let mut authoritative = start;
+    physics::apply_player_impulse(&mut authoritative, Vec3::new(400.0, 640.0, 0.0));
+    let snapshot = Snapshot {
+        tick: 1,
+        you: PlayerSnapshot {
+            id: 1,
+            last_input: 4,
+            state: authoritative,
+            health: Health::default(),
+            yaw: 0.0,
+        },
+        players: vec![],
+    };
+    let mut expected = authoritative;
+    for sequence in 5..=10 {
+        step_player(
+            &world,
+            &mut expected,
+            &PlayerInput {
+                sequence,
+                ..default()
+            },
+            FIXED_DT,
+        );
+    }
+    reconcile(&mut client, &world, &snapshot, &[]);
+    assert_eq!(client.state, expected);
+    assert!(client.state.position.x > start.position.x);
+    assert!(client.state.position.y > start.position.y);
+    assert!(client.state.external_velocity.x > 0.0);
+    reconcile(&mut client, &world, &snapshot, &[]);
+    assert_eq!(client.state, expected);
+}
+
+#[test]
 fn reconciliation_copies_authoritative_health_without_predicting_damage() {
     let world = arena();
     let start = PlayerState {
@@ -356,7 +412,8 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
         Some(ClientMessage::FireBow {
             request: 1,
             yaw: 0.75,
-            pitch: 1.0
+            pitch: 1.0,
+            power: BowPower::Standard,
         })
     ));
     assert!(block_action(&mut client, &world, false, false, false).is_none());
@@ -366,6 +423,118 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
     keys.press(KeyCode::Digit3);
     client.selected = selected_slot(&keys).unwrap();
     assert!(block_action(&mut client, &world, false, false, true).is_none());
+}
+
+#[test]
+fn bow_requests_copy_each_selected_power() {
+    let mut client = ClientSession {
+        selected: EXPLOSIVE_BOW_SLOT,
+        ..default()
+    };
+    let world = VoxelWorld::default();
+    for (index, power) in [
+        BowPower::Low,
+        BowPower::Standard,
+        BowPower::High,
+        BowPower::Extreme,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client.bow_power = power;
+        assert!(matches!(
+            block_action(&mut client, &world, false, false, true),
+            Some(ClientMessage::FireBow { power: sent, request, .. })
+                if sent == power && request == index as u64 + 1
+        ));
+    }
+}
+
+#[test]
+fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
+    let mut app = App::new();
+    app.insert_resource(Options {
+        server: "127.0.0.1:4000".parse().unwrap(),
+        bot: false,
+        frames: None,
+        screenshot: None,
+    })
+    .insert_resource(ClientSession {
+        selected: EXPLOSIVE_BOW_SLOT,
+        ..default()
+    })
+    .init_resource::<ButtonInput<KeyCode>>()
+    .init_resource::<AccumulatedMouseMotion>()
+    .add_systems(Update, controls);
+    let cursor = app
+        .world_mut()
+        .spawn(CursorOptions {
+            visible: false,
+            grab_mode: CursorGrabMode::Locked,
+            ..default()
+        })
+        .id();
+    assert_eq!(
+        app.world().resource::<ClientSession>().bow_power,
+        BowPower::Standard
+    );
+    for expected in [
+        BowPower::High,
+        BowPower::Extreme,
+        BowPower::Low,
+        BowPower::Standard,
+    ] {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyR);
+        app.update();
+        assert_eq!(app.world().resource::<ClientSession>().bow_power, expected);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.update();
+        assert_eq!(app.world().resource::<ClientSession>().bow_power, expected);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+    }
+    for key in [KeyCode::Digit3, KeyCode::Digit6] {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+        app.update();
+        assert_eq!(
+            app.world().resource::<ClientSession>().bow_power,
+            BowPower::Standard
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+    }
+    app.world_mut()
+        .entity_mut(cursor)
+        .get_mut::<CursorOptions>()
+        .unwrap()
+        .visible = true;
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::KeyR);
+    app.update();
+    assert_eq!(
+        app.world().resource::<ClientSession>().bow_power,
+        BowPower::Standard
+    );
+    app.world_mut()
+        .entity_mut(cursor)
+        .get_mut::<CursorOptions>()
+        .unwrap()
+        .visible = false;
+    app.world_mut().resource_mut::<ClientSession>().selected = 3;
+    app.update();
+    assert_eq!(
+        app.world().resource::<ClientSession>().bow_power,
+        BowPower::Standard
+    );
 }
 
 #[test]

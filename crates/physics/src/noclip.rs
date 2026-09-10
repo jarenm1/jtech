@@ -14,6 +14,9 @@ pub(super) fn step(
     dt: f32,
     bodies: &[DynamicCollider],
 ) -> bool {
+    if input.noclip || state.noclip {
+        state.external_velocity = glam::Vec2::ZERO;
+    }
     if input.noclip {
         state.noclip = true;
     } else if state.noclip && clear(world, state.position, bodies) {

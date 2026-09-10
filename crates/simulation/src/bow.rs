@@ -1,6 +1,6 @@
 //! Authoritative point-projectile flight with swept terrain and loose-cube hits.
 use glam::Vec3;
-use protocol::{ArrowSnapshot, PhysicsBodySnapshot};
+use protocol::{ArrowSnapshot, BowPower, PhysicsBodySnapshot};
 use voxel_world::VoxelWorld;
 
 const ARROW_SPEED: f32 = 36.0;
@@ -10,6 +10,7 @@ const MAX_AGE_TICKS: u32 = 180;
 
 pub(super) struct Arrow {
     pub snapshot: ArrowSnapshot,
+    pub power: BowPower,
     age: u32,
     traveled: f32,
     pending_steps: u32,
@@ -22,13 +23,14 @@ pub(super) enum Flight {
 }
 
 impl Arrow {
-    pub fn new(id: u32, origin: Vec3, direction: Vec3) -> Self {
+    pub fn new(id: u32, origin: Vec3, direction: Vec3, power: BowPower) -> Self {
         Self {
             snapshot: ArrowSnapshot {
                 id,
                 position: origin,
                 velocity: direction * ARROW_SPEED,
             },
+            power,
             age: 0,
             traveled: 0.0,
             pending_steps: 0,
@@ -147,7 +149,7 @@ mod tests {
         for y in 0..16 {
             world.set_block(IVec3::new(20, y, 2), 3).unwrap();
         }
-        let mut arrow = Arrow::new(7, Vec3::new(2.5, 10.5, 2.5), Vec3::X);
+        let mut arrow = Arrow::new(7, Vec3::new(2.5, 10.5, 2.5), Vec3::X, BowPower::Standard);
         for _ in 0..100 {
             match arrow.step(&world, &[]) {
                 Flight::Flying => {}
@@ -171,7 +173,7 @@ mod tests {
             velocity: Vec3::ZERO,
             material: 3,
         };
-        let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X);
+        let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, BowPower::Standard);
         let Flight::Impact(position) = arrow.step(&world, &[body]) else {
             panic!("missed body");
         };
@@ -185,7 +187,7 @@ mod tests {
     #[test]
     fn arrows_expire_at_range_and_loaded_boundary() {
         let world = empty_world();
-        let mut arrow = Arrow::new(1, Vec3::new(1., 20., 1.), Vec3::X);
+        let mut arrow = Arrow::new(1, Vec3::new(1., 20., 1.), Vec3::X, BowPower::Standard);
         for _ in 0..180 {
             if matches!(arrow.step(&world, &[]), Flight::Expired) {
                 assert!(arrow.snapshot.position.x <= 65.0 && arrow.snapshot.position.x > 64.0);
@@ -193,7 +195,7 @@ mod tests {
             }
         }
         assert!(arrow.traveled >= MAX_TRAVEL);
-        let mut arrow = Arrow::new(2, Vec3::new(95.9, 10., 1.), Vec3::X);
+        let mut arrow = Arrow::new(2, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
         assert!(matches!(arrow.step(&world, &[]), Flight::Expired));
     }
 
@@ -206,7 +208,7 @@ mod tests {
             velocity: Vec3::ZERO,
             material: 3,
         };
-        let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X);
+        let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, BowPower::Standard);
         assert!(matches!(
             arrow.tick(&world, &[stale], false),
             Flight::Flying

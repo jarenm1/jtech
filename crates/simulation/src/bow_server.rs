@@ -5,8 +5,10 @@ use super::{
     explosion::{self, Target},
 };
 use glam::Vec3;
-use physics::{EYE_HEIGHT, look_direction};
-use protocol::{EXPLOSIVE_BOW_SHOTS_PER_SECOND, EditRejection, MAX_ARROWS, ServerMessage};
+use physics::{EYE_HEIGHT, PLAYER_MASS, apply_player_impulse, look_direction};
+use protocol::{
+    BowPower, EXPLOSIVE_BOW_SHOTS_PER_SECOND, EditRejection, MAX_ARROWS, ServerMessage,
+};
 use voxel_world::VoxelWorld;
 
 impl Simulation {
@@ -17,6 +19,7 @@ impl Simulation {
         request: u64,
         yaw: f32,
         pitch: f32,
+        power: BowPower,
     ) {
         let Some(player) = self.players.get(&id) else {
             return;
@@ -63,6 +66,7 @@ impl Simulation {
             self.next_arrow,
             origin,
             look_direction(yaw, pitch),
+            power,
         ));
         self.next_arrow += 1;
         self.arrow_revision += 1;
@@ -96,7 +100,8 @@ impl Simulation {
             match arrow.tick(world, &bodies, ready) {
                 Flight::Flying => self.arrows.push(arrow),
                 Flight::Impact(position) => {
-                    self.detonations.push_back((arrow.snapshot.id, position))
+                    self.detonations
+                        .push_back((arrow.snapshot.id, position, arrow.power))
                 }
                 Flight::Expired => {}
             }
@@ -133,7 +138,7 @@ impl Simulation {
         let mut physics = self.physics.take();
         // Bound voxel scans, transactions, and replication work per server tick.
         for _ in 0..2 {
-            let Some((id, position)) = self.detonations.pop_front() else {
+            let Some((id, position, power)) = self.detonations.pop_front() else {
                 break;
             };
             let bodies = physics
@@ -141,7 +146,13 @@ impl Simulation {
                 .filter(|p| !p.failed())
                 .map(|p| p.snapshots())
                 .unwrap_or_default();
-            let loads = explosion::plan(world, &bodies, position);
+            let mut players: Vec<_> = self
+                .players
+                .iter()
+                .map(|(&id, player)| (id, player.state))
+                .collect();
+            players.sort_unstable_by_key(|(id, _)| *id);
+            let loads = explosion::plan(world, &bodies, &players, position, power);
             for load in loads {
                 match load.target {
                     Target::Grid(target) => {
@@ -175,6 +186,17 @@ impl Simulation {
                             }
                         }
                     }
+                    Target::Player(player_id) => {
+                        if let Some(player) = self.players.get_mut(&player_id) {
+                            let impulse = explosion::kinetic_impulse(
+                                PLAYER_MASS,
+                                player.state.velocity,
+                                load.direction,
+                                load.kinetic_energy,
+                            );
+                            apply_player_impulse(&mut player.state, impulse);
+                        }
+                    }
                     Target::Body(body_id) => {
                         if let Some(physics) = &mut physics
                             && let Some((target, material)) = physics.apply_blast(body_id, &load)
@@ -188,7 +210,7 @@ impl Simulation {
             let event = ServerMessage::Explosion {
                 id,
                 position,
-                radius: explosion::RADIUS,
+                radius: power.radius(),
             };
             let recipients: Vec<_> = self.players.keys().copied().collect();
             for recipient in recipients {
@@ -221,9 +243,9 @@ mod tests {
             // Retire projectiles here to isolate admission from the active-arrow cap.
             sim.arrows.clear();
             request += 1;
-            sim.fire_bow(&world, 1, request, 0.0, 0.0);
+            sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
             let shots = sim.metrics.bow_shots;
-            sim.fire_bow(&world, 1, request, 0.0, 0.0);
+            sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
             assert_eq!(sim.metrics.bow_shots, shots);
             if tick % 60 == 59 {
                 assert_eq!(shots, (tick / 60 + 1) * 25);
@@ -232,16 +254,121 @@ mod tests {
         sim.tick = 1200;
         sim.arrows.clear();
         request += 1;
-        sim.fire_bow(&world, 1, request, 0.0, 0.0);
+        sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
         assert_eq!(sim.metrics.bow_shots, 251);
         for tick in 1200..1203 {
             sim.tick = tick;
             request += 1;
-            sim.fire_bow(&world, 1, request, 0.0, 0.0);
+            sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
             assert_eq!(sim.metrics.bow_shots, 251);
         }
         sim.tick = 1203;
-        sim.fire_bow(&world, 1, request + 1, 0.0, 0.0);
+        sim.fire_bow(&world, 1, request + 1, 0.0, 0.0, BowPower::Standard);
         assert_eq!(sim.metrics.bow_shots, 252);
+    }
+
+    #[test]
+    fn each_shot_keeps_its_power_through_impact_and_queued_detonation() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
+        world.set_block(IVec3::new(5, 10, 4), 3).unwrap();
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        let mut player = Player::new();
+        player.state.position = Vec3::new(4.5, 9.0, 4.5);
+        sim.players.insert(1, player);
+        let yaw = -std::f32::consts::FRAC_PI_2;
+        for (index, power) in BowPower::ALL.into_iter().enumerate() {
+            sim.tick = index as u64 * 10;
+            sim.fire_bow(&world, 1, index as u64 + 1, yaw, 0.0, power);
+        }
+        assert_eq!(
+            sim.arrows
+                .iter()
+                .map(|arrow| arrow.power)
+                .collect::<Vec<_>>(),
+            BowPower::ALL
+        );
+        // A replay with a changed preset must not alter an existing arrow.
+        sim.fire_bow(&world, 1, 1, yaw, 0.0, BowPower::Extreme);
+        assert_eq!(sim.arrows.len(), 4);
+        assert_eq!(sim.arrows[0].power, BowPower::Low);
+        // Occupy this tick's two detonation slots, retaining the new impacts in the queue.
+        for id in [100, 101] {
+            sim.detonations
+                .push_back((id, Vec3::splat(24.0), BowPower::Low));
+        }
+        sim.advance_bow(&mut world);
+        assert!(sim.arrows.is_empty());
+        assert_eq!(sim.metrics.explosions, 2);
+        assert_eq!(
+            sim.detonations
+                .iter()
+                .map(|(_, _, power)| *power)
+                .collect::<Vec<_>>(),
+            BowPower::ALL
+        );
+        sim.advance_bow(&mut world);
+        assert_eq!(sim.metrics.explosions, 4);
+        assert_eq!(sim.detonations.len(), 2);
+    }
+
+    #[test]
+    fn own_ground_shot_launches_player_once_and_preserves_momentum() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
+        for x in 6..=14 {
+            for z in 6..=14 {
+                world.set_block(IVec3::new(x, 9, z), 3).unwrap();
+            }
+        }
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        let mut player = Player::new();
+        player.state.position = Vec3::new(10.5, 10.0, 10.5);
+        player.state.grounded = true;
+        sim.players.insert(1, player);
+        sim.fire_bow(&world, 1, 1, 0.0, -1.2, BowPower::Extreme);
+        for _ in 0..10 {
+            sim.advance_bow(&mut world);
+        }
+        assert_eq!(sim.metrics.explosions, 1);
+        let launched = sim.players[&1].state;
+        assert!(launched.velocity.y > 2.0, "{launched:?}");
+        assert!(launched.external_velocity.y > 0.0);
+        assert!(!launched.grounded);
+        sim.advance_bow(&mut world);
+        assert_eq!(sim.players[&1].state, launched);
+        let mut after = launched;
+        physics::step_player(&world, &mut after, &Default::default(), physics::FIXED_DT);
+        assert!(after.position.y > launched.position.y);
+        assert!(after.position.z > launched.position.z);
+    }
+
+    #[test]
+    fn queued_blasts_accumulate_on_players_without_reapplying_drained_events() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        let mut player = Player::new();
+        player.state.position = Vec3::new(10.5, 10.0, 10.5);
+        let center = player.state.position;
+        sim.players.insert(1, player);
+        for id in 0..3 {
+            sim.detonations.push_back((id, center, BowPower::Standard));
+        }
+        sim.detonate_ready(&mut world);
+        assert_eq!(sim.detonations.len(), 1);
+        let first_speed = sim.players[&1].state.velocity.y;
+        sim.detonate_ready(&mut world);
+        let final_state = sim.players[&1].state;
+        assert!(final_state.velocity.y > first_speed);
+        assert_eq!(sim.metrics.explosions, 3);
+        sim.detonate_ready(&mut world);
+        assert_eq!(sim.players[&1].state, final_state);
     }
 }

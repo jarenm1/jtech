@@ -72,8 +72,11 @@ fn simultaneous_remote_blasts_release_and_move_supported_terrain() {
                     }
                 }
             }
-            sim.detonations
-                .push_back((id as u32, base.as_vec3() + Vec3::new(6.5, 10.02, 6.5)));
+            sim.detonations.push_back((
+                id as u32,
+                base.as_vec3() + Vec3::new(6.5, 10.02, 6.5),
+                protocol::BowPower::Standard,
+            ));
         }
         sim.advance_bow(world);
         assert_eq!(sim.metrics.explosions, 2);
@@ -126,6 +129,7 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
             sim.detonations.push_back((
                 id as u32,
                 cell.as_vec3() + Vec3::splat(0.5) - Vec3::X * 2.75,
+                protocol::BowPower::Standard,
             ));
         }
         sim.advance_bow(world);
@@ -140,8 +144,11 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
 
         submit(sim, world);
         // The impact arrives during GPU ownership. It must not mutate the old observation.
-        sim.detonations
-            .push_back((2, initial[1].position + Vec3::Z * 2.75));
+        sim.detonations.push_back((
+            2,
+            initial[1].position + Vec3::Z * 2.75,
+            protocol::BowPower::Standard,
+        ));
         sim.advance_bow(world);
         assert_eq!(sim.detonations.len(), 1);
         assert_eq!(sim.metrics.explosions, 2);
@@ -159,7 +166,8 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
 
         // Before submitting that surviving body's impulse, remove the earlier slot.
         let victim = moving.iter().find(|body| body.id == doomed).unwrap();
-        sim.detonations.push_back((3, victim.position));
+        sim.detonations
+            .push_back((3, victim.position, protocol::BowPower::Standard));
         sim.advance_bow(world);
         assert_eq!(sim.metrics.destroyed_blocks, 1);
         let remaining = sim.physics.as_ref().unwrap().snapshots();
@@ -177,8 +185,10 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
         assert!(physics.body_damage(survivor) >= damaged);
 
         // A fresh airborne observation is destructible, and cannot be destroyed twice.
-        sim.detonations.push_back((4, body.position));
-        sim.detonations.push_back((5, body.position));
+        sim.detonations
+            .push_back((4, body.position, protocol::BowPower::Standard));
+        sim.detonations
+            .push_back((5, body.position, protocol::BowPower::Standard));
         sim.advance_bow(world);
         assert!(sim.physics.as_ref().unwrap().snapshots().is_empty());
         assert_eq!(sim.metrics.destroyed_blocks, 2);

@@ -527,7 +527,7 @@ mod tests {
             .unwrap();
         let mut damage = std::collections::HashMap::new();
         let mut launches = Vec::new();
-        for load in explosion::plan(&world, &[], center) {
+        for load in explosion::plan(&world, &[], &[], center, protocol::BowPower::Standard) {
             let explosion::Target::Grid(cell) = load.target else {
                 unreachable!()
             };

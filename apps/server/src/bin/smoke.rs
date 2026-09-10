@@ -430,6 +430,7 @@ fn explosive_bow() -> Result<()> {
         request: 1,
         yaw,
         pitch: 0.0,
+        power: protocol::BowPower::Standard,
     };
     first.net.send(shot.clone())?;
     first.net.send(shot.clone())?;
@@ -437,6 +438,7 @@ fn explosive_bow() -> Result<()> {
         request: 2,
         yaw,
         pitch: 0.0,
+        power: protocol::BowPower::Standard,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 120, [0.0; 2], 0.0)?;
     require(first.edits.get(&1) == Some(&true), "bow shot was rejected")?;
@@ -510,6 +512,7 @@ fn explosive_bow() -> Result<()> {
         request: 2,
         yaw,
         pitch: 0.0,
+        power: protocol::BowPower::Standard,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
     require(
@@ -533,6 +536,7 @@ fn explosive_bow() -> Result<()> {
         request: 3,
         yaw,
         pitch: 0.5,
+        power: protocol::BowPower::Standard,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
     require(

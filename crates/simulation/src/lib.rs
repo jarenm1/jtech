@@ -1,5 +1,7 @@
 mod active_terrain;
 #[cfg(test)]
+mod blast_jump_tests;
+#[cfg(test)]
 mod bombardment_tests;
 mod bow;
 mod bow_server;
@@ -9,6 +11,7 @@ mod material_damage;
 #[cfg(test)]
 mod noclip_tests;
 mod physics_slice;
+mod streaming;
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
 use gameplay::Health;
@@ -65,7 +68,7 @@ impl Default for ServerConfig {
         Self {
             bind: "127.0.0.1:4000".parse().unwrap(),
             seed: 7,
-            radius: 3,
+            radius: protocol::DEFAULT_VIEW_RADIUS,
             metrics_every: 600,
             gpu_physics: false,
         }
@@ -87,7 +90,7 @@ impl SimulationPlugin {
 
     /// Run the same authoritative simulation without socket IO, for embedding and tests.
     pub fn headless(mut config: ServerConfig) -> io::Result<Self> {
-        config.radius = config.radius.clamp(1, 6);
+        config.radius = config.radius.clamp(1, protocol::MAX_VIEW_RADIUS);
         let physics = if config.gpu_physics {
             Some(PhysicsSlice::new().map_err(io::Error::other)?)
         } else {
@@ -236,7 +239,7 @@ pub struct Simulation {
     damage: HashMap<IVec3, DamageState>,
     strikes: VecDeque<QueuedStrike>,
     arrows: Vec<bow::Arrow>,
-    detonations: VecDeque<(u32, Vec3)>,
+    detonations: VecDeque<(u32, Vec3, protocol::BowPower)>,
     next_arrow: u32,
     arrow_revision: u64,
 }
@@ -956,10 +959,11 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 request,
                 yaw,
                 pitch,
-            } => sim.fire_bow(&world, id, request, yaw, pitch),
+                power,
+            } => sim.fire_bow(&world, id, request, yaw, pitch, power),
             ClientMessage::Resync { coord } => {
                 if let Some(player) = sim.players.get_mut(&id) {
-                    // Baseline transmission is already capped at two chunks/tick. Retain
+                    // Baseline transmission has a bounded per-tick batch. Retain
                     // every requested repair: dropping a burst here can strand a client
                     // on a stale revision forever.
                     if player.interest.contains(&coord) {
@@ -997,12 +1001,12 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     for &coord in &needed {
         sim.last_needed.insert(coord, sim.tick);
     }
-    let mut missing: Vec<_> = needed
+    let missing: Vec<_> = needed
         .iter()
         .copied()
         .filter(|coord| !world.chunks.contains_key(coord))
         .collect();
-    missing.sort_unstable_by_key(|coord| {
+    let missing = streaming::nearest_chunks(missing, streaming::CHUNKS_PER_TICK, |coord| {
         (
             !physics_needed.contains(coord),
             sim.players
@@ -1015,7 +1019,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 .unwrap_or(0),
         )
     });
-    for coord in missing.into_iter().take(2) {
+    for coord in missing {
         restore(&mut world, coord, sim.journal.get(&coord));
         sim.metrics.generated += 1;
     }
@@ -1061,14 +1065,16 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             continue;
         };
         let center = chunk_coord(player.state.position.floor().as_ivec3());
-        let mut available: Vec<_> = player
+        let available: Vec<_> = player
             .interest
             .iter()
             .copied()
             .filter(|coord| !player.known.contains_key(coord) && world.chunks.contains_key(coord))
             .collect();
-        available.sort_unstable_by_key(|coord| (*coord - center).length_squared());
-        for coord in available.into_iter().take(2) {
+        let available = streaming::nearest_chunks(available, streaming::CHUNKS_PER_TICK, |coord| {
+            (*coord - center).length_squared()
+        });
+        for coord in available {
             let chunk = &world.chunks[&coord];
             if !sim.send(
                 *id,
