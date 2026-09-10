@@ -1,11 +1,15 @@
+mod material_damage;
+mod physics_slice;
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
 use glam::{IVec3, Vec3};
+use material_damage::{MAX_DAMAGED_BLOCKS, tool_contact};
 use networking::ServerTransport;
 use physics::{
     EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, look_direction, overlaps_block, step_player,
 };
-use protocol::{ClientMessage, PlayerSnapshot, ServerMessage, Snapshot};
+use physics_slice::PhysicsSlice;
+use protocol::{ClientMessage, EditRejection, PlayerSnapshot, ServerMessage, Snapshot};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
@@ -18,12 +22,33 @@ use voxel_world::{
 
 const MAX_INPUT_QUEUE: usize = 32;
 const MAX_JOURNAL_BLOCKS: usize = 1_000_000;
+const MAX_QUEUED_STRIKES: usize = 4;
+const STRIKE_QUEUE_TICKS: u64 = 60;
+
+type EditOutcome = Result<Option<f32>, EditRejection>;
+
+#[derive(Clone, Copy, Debug)]
+struct DamageState {
+    material: u8,
+    joules: f32,
+    release: bool,
+}
+
+#[derive(Clone, Copy)]
+struct QueuedStrike {
+    id: u64,
+    request: u64,
+    target: IVec3,
+    revision: u64,
+    expires: u64,
+}
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub seed: u64,
     pub radius: i32,
     pub metrics_every: u64,
+    pub gpu_physics: bool,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -32,21 +57,29 @@ impl Default for ServerConfig {
             seed: 7,
             radius: 3,
             metrics_every: 600,
+            gpu_physics: false,
         }
     }
 }
 pub struct SimulationPlugin {
     config: ServerConfig,
     transport: parking_lot::Mutex<Option<ServerTransport>>,
+    physics: parking_lot::Mutex<Option<PhysicsSlice>>,
 }
 impl SimulationPlugin {
     pub fn bind(mut config: ServerConfig) -> io::Result<Self> {
         config.radius = config.radius.clamp(1, 6);
+        let physics = if config.gpu_physics {
+            Some(PhysicsSlice::new().map_err(io::Error::other)?)
+        } else {
+            None
+        };
         let transport = ServerTransport::bind(config.bind)?;
         config.bind = transport.local_addr()?;
         Ok(Self {
             config,
             transport: parking_lot::Mutex::new(Some(transport)),
+            physics: parking_lot::Mutex::new(physics),
         })
     }
     pub fn local_addr(&self) -> SocketAddr {
@@ -66,6 +99,10 @@ impl Plugin for SimulationPlugin {
                 }
             }
         }
+        let mut physics = self.physics.lock().take();
+        if let Some(physics) = &mut physics {
+            physics.initialize_terrain(&world);
+        }
         app.insert_resource(world)
             .insert_resource(Simulation {
                 config: self.config.clone(),
@@ -73,11 +110,14 @@ impl Plugin for SimulationPlugin {
                 players: HashMap::new(),
                 journal: HashMap::new(),
                 journal_blocks: 0,
+                damage: HashMap::new(),
+                strikes: VecDeque::new(),
                 last_needed: HashMap::new(),
                 tick: 0,
                 metrics: SimulationMetrics::default(),
                 tick_times: VecDeque::new(),
                 needed: HashSet::new(),
+                physics,
             })
             .add_systems(Update, advance);
     }
@@ -92,8 +132,10 @@ struct Player {
     safety: HashSet<IVec3>,
     interest_center: Option<IVec3>,
     last_edit: u64,
-    results: VecDeque<(u64, bool)>,
+    results: VecDeque<(u64, EditOutcome)>,
     highest_request: u64,
+    physics_revision: Option<u64>,
+    body_push_velocity: Vec3,
 }
 impl Player {
     fn new() -> Self {
@@ -109,6 +151,8 @@ impl Player {
             last_edit: 0,
             results: VecDeque::new(),
             highest_request: 0,
+            physics_revision: None,
+            body_push_velocity: Vec3::ZERO,
         }
     }
     fn snapshot(&self, id: u64) -> PlayerSnapshot {
@@ -144,6 +188,8 @@ pub struct SimulationMetrics {
     pub rejected_edits: u64,
     pub disconnected: u64,
     pub snapshot_errors: u64,
+    pub destroyed_blocks: u64,
+    pub rejected_contacts: u64,
 }
 #[derive(Resource)]
 pub struct Simulation {
@@ -157,6 +203,10 @@ pub struct Simulation {
     pub metrics: SimulationMetrics,
     tick_times: VecDeque<u64>,
     needed: HashSet<IVec3>,
+    physics: Option<PhysicsSlice>,
+    /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
+    damage: HashMap<IVec3, DamageState>,
+    strikes: VecDeque<QueuedStrike>,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -188,9 +238,31 @@ impl Simulation {
             percentile(99),
             percentile(100)
         );
+        eprintln!(
+            "damage active={} destroyed={} rejected_contacts={} queued_strikes={}",
+            self.damage.len(),
+            self.metrics.destroyed_blocks,
+            self.metrics.rejected_contacts,
+            self.strikes.len()
+        );
+        if let Some(p) = &self.physics {
+            eprintln!(
+                "physics submissions={} busy_periods={} readback_bytes={} terrain_upload_bytes={} completions={} observed_completion_us_mean={} observed_completion_us_max={} player_upload_bytes={} contact_overflow={}",
+                p.submissions,
+                p.busy_ticks,
+                p.readback_bytes,
+                p.terrain_upload_bytes,
+                p.completions,
+                p.completion_us_total / p.completions.max(1),
+                p.completion_us_max,
+                p.player_upload_bytes,
+                p.contact_overflow()
+            );
+        }
     }
     fn drop_player(&mut self, id: u64) {
         self.transport.disconnect(id);
+        self.strikes.retain(|strike| strike.id != id);
         if self.players.remove(&id).is_some() {
             self.metrics.disconnected += 1;
             eprintln!("disconnect id={id}");
@@ -204,6 +276,50 @@ impl Simulation {
             true
         }
     }
+    fn finish_edit(&mut self, id: u64, request: u64, outcome: EditOutcome) {
+        if let Some(player) = self.players.get_mut(&id) {
+            player.highest_request = player.highest_request.max(request);
+            if outcome.is_ok() {
+                player.last_edit = self.tick;
+                self.metrics.accepted_edits += 1;
+            } else {
+                self.metrics.rejected_edits += 1;
+            }
+            player.results.push_back((request, outcome));
+            if player.results.len() > 64 {
+                player.results.pop_front();
+            }
+        }
+        self.send_edit_result(id, request, outcome);
+    }
+
+    fn send_edit_result(&mut self, id: u64, request: u64, outcome: EditOutcome) {
+        let accepted = outcome.is_ok();
+        let reason = outcome.err();
+        let damage = outcome.ok().flatten();
+        eprintln!(
+            "edit id={id} request={request} accepted={accepted} reason={reason:?} damage={damage:?}"
+        );
+        self.send(
+            id,
+            &ServerMessage::EditResult {
+                request,
+                accepted,
+                reason,
+                damage,
+            },
+        );
+    }
+
+    fn has_journal_space(&self, target: IVec3) -> bool {
+        self.journal_blocks < MAX_JOURNAL_BLOCKS
+            || self
+                .journal
+                .get(&chunk_coord(target))
+                .is_some_and(|j| j.blocks.contains_key(&(index(local_coord(target)) as u16)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn edit(
         &mut self,
         world: &mut VoxelWorld,
@@ -212,112 +328,427 @@ impl Simulation {
         target: IVec3,
         block: u8,
         expected_revision: u64,
+        strike: bool,
     ) {
         let Some(player) = self.players.get(&id) else {
             return;
         };
-        if let Some((_, accepted)) = player.results.iter().find(|(old, _)| *old == request) {
-            let result = ServerMessage::EditResult {
-                request,
-                accepted: *accepted,
-            };
-            self.send(id, &result);
+        if let Some((_, outcome)) = player.results.iter().find(|(old, _)| *old == request) {
+            self.send_edit_result(id, request, *outcome);
             return;
         }
-        let coord = chunk_coord(target);
-        let valid = request > player.highest_request
-            && self.tick >= player.last_edit.saturating_add(6)
-            && block <= 5
-            && target.y > MIN_CHUNK_Y * CHUNK_SIZE
-            && valid_coord(coord)
-            && player.interest.contains(&coord)
-            && player.known.get(&coord) == Some(&expected_revision)
-            && world
-                .chunks
-                .get(&coord)
-                .is_some_and(|chunk| chunk.revision == expected_revision)
-            && world.block(target).is_some_and(|existing| {
-                if block == 0 {
-                    existing != 0
+        if self
+            .strikes
+            .iter()
+            .any(|s| s.id == id && s.request == request)
+        {
+            return;
+        }
+        let validation = validate_player_edit(
+            world,
+            player,
+            self.tick,
+            request,
+            target,
+            block,
+            expected_revision,
+        );
+        if let Err(reason) = validation {
+            self.finish_edit(id, request, Err(reason));
+            return;
+        }
+        if strike {
+            let rejection = self
+                .physics
+                .as_ref()
+                .map_or(Some(EditRejection::PhysicsUnavailable), |p| {
+                    p.detach_rejection(target)
+                });
+            if let Some(reason) = rejection {
+                self.finish_edit(id, request, Err(reason));
+                return;
+            }
+            if self.physics.as_ref().is_some_and(|p| p.is_busy()) {
+                if self.strikes.iter().filter(|s| s.id == id).count() >= MAX_QUEUED_STRIKES {
+                    self.finish_edit(id, request, Err(EditRejection::QueueFull));
                 } else {
-                    existing == 0
+                    self.strikes.push_back(QueuedStrike {
+                        id,
+                        request,
+                        target,
+                        revision: expected_revision,
+                        expires: self.tick.saturating_add(STRIKE_QUEUE_TICKS),
+                    });
+                    self.players.get_mut(&id).unwrap().highest_request = request;
                 }
-            })
-            && (block == 0
-                || !self
-                    .players
-                    .values()
-                    .any(|other| overlaps_block(&other.state, target)))
-            && world
-                .raycast(
-                    player.state.position + Vec3::Y * EYE_HEIGHT,
-                    look_direction(player.input.yaw, player.input.pitch),
-                    6.0,
-                )
-                .is_some_and(|hit| {
-                    if block == 0 {
-                        hit.block == target
-                    } else {
-                        hit.adjacent == target
-                    }
-                })
-            && (self.journal_blocks < MAX_JOURNAL_BLOCKS
-                || self
-                    .journal
-                    .get(&coord)
-                    .is_some_and(|j| j.blocks.contains_key(&(index(local_coord(target)) as u16))));
-        let changed = if valid {
-            world.set_block(target, block)
+                return;
+            }
+        }
+        let outcome = self.execute_edit(world, id, target, block, strike);
+        self.finish_edit(id, request, outcome);
+    }
+
+    fn drain_strikes(&mut self, world: &mut VoxelWorld) {
+        let strikes = std::mem::take(&mut self.strikes);
+        for strike in strikes {
+            let Some(player) = self.players.get(&strike.id) else {
+                continue;
+            };
+            let validation = if self.tick >= strike.expires {
+                Err(EditRejection::Expired)
+            } else {
+                validate_edit_target(world, player, strike.target, 0, strike.revision)
+            };
+            if let Err(reason) = validation {
+                self.finish_edit(strike.id, strike.request, Err(reason));
+                continue;
+            }
+            if self.physics.as_ref().is_some_and(|p| p.is_busy())
+                || self.tick < player.last_edit.saturating_add(6)
+            {
+                self.strikes.push_back(strike);
+                continue;
+            }
+            let outcome = self.execute_edit(world, strike.id, strike.target, 0, true);
+            self.finish_edit(strike.id, strike.request, outcome);
+        }
+    }
+
+    fn execute_edit(
+        &mut self,
+        world: &mut VoxelWorld,
+        id: u64,
+        target: IVec3,
+        block: u8,
+        strike: bool,
+    ) -> EditOutcome {
+        if block == 0 && !strike {
+            let material = world.block(target).ok_or(EditRejection::InvalidTarget)?;
+            return self
+                .apply_contact(world, &tool_contact(target, material))
+                .map(Some);
+        }
+        if !self.has_journal_space(target) {
+            return Err(EditRejection::StorageFull);
+        }
+        if block != 0
+            && (self
+                .players
+                .values()
+                .any(|p| overlaps_block(&p.state, target))
+                || self.physics.as_ref().is_some_and(|p| !p.can_place(target)))
+        {
+            return Err(EditRejection::Occupied);
+        }
+        let detached = if strike {
+            let physics = self
+                .physics
+                .as_ref()
+                .ok_or(EditRejection::PhysicsUnavailable)?;
+            if let Some(reason) = physics.detach_rejection(target) {
+                return Err(reason);
+            }
+            if physics.is_busy() {
+                return Err(EditRejection::PhysicsUnavailable);
+            }
+            let player = &self.players[&id];
+            Some((
+                world.block(target).ok_or(EditRejection::InvalidTarget)?,
+                look_direction(player.input.yaw, player.input.pitch),
+                self.damage.get(&target).map_or(0.0, |state| state.joules),
+            ))
         } else {
             None
         };
-        let accepted = changed.is_some();
-        if let Some(player) = self.players.get_mut(&id) {
-            player.highest_request = player.highest_request.max(request);
-            player.last_edit = self.tick;
-            player.results.push_back((request, accepted));
-            if player.results.len() > 64 {
-                player.results.pop_front();
+        let (from, to) = world
+            .set_block(target, block)
+            .ok_or(EditRejection::RevisionExhausted)?;
+        if let Some((material, direction, damage)) = detached {
+            // F is a debug energy source; material damage is carried into the body.
+            self.physics.as_mut().unwrap().release(
+                target,
+                material,
+                damage,
+                direction * 5.0 + Vec3::Y * 20.0,
+            );
+        }
+        self.record_change(world, target, block, from, to);
+        Ok(None)
+    }
+
+    fn apply_contact(
+        &mut self,
+        world: &mut VoxelWorld,
+        contact: &gpu_physics::TerrainContact,
+    ) -> Result<f32, EditRejection> {
+        let target = IVec3::from_array(contact.target);
+        let journal_space = self.has_journal_space(target);
+        let result =
+            material_damage::apply_to_grid(world, &mut self.damage, contact, journal_space)?;
+        if let Some((from, to)) = result.destroyed_revision {
+            self.record_change(world, target, 0, from, to);
+            self.destroyed(target, contact.material as u8, None);
+        }
+        Ok(result.fraction)
+    }
+
+    /// Common destruction event for grid and loose ownership. Item spawning belongs here.
+    fn destroyed(&mut self, target: IVec3, material: u8, body: Option<u32>) {
+        self.metrics.destroyed_blocks += 1;
+        eprintln!("destroyed target={target} material={material} body={body:?}");
+    }
+    /// One authoritative voxel transaction path for edits, detachment, and settlement.
+    fn record_change(&mut self, _world: &VoxelWorld, target: IVec3, block: u8, from: u64, to: u64) {
+        self.damage.remove(&target);
+        let coord = chunk_coord(target);
+        let local_index = index(local_coord(target)) as u16;
+        let journal = self.journal.entry(coord).or_default();
+        journal.revision = to;
+        if journal.blocks.insert(local_index, block).is_none() {
+            self.journal_blocks += 1;
+        }
+        if let Some(physics) = &mut self.physics {
+            physics.set_voxel(target, block);
+        }
+        let recipients: Vec<_> = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.known.get(&coord) == Some(&from))
+            .map(|(&id, _)| id)
+            .collect();
+        for recipient in recipients {
+            if self.send(
+                recipient,
+                &ServerMessage::Delta {
+                    coord,
+                    from,
+                    to,
+                    local_index,
+                    block,
+                },
+            ) {
+                self.players
+                    .get_mut(&recipient)
+                    .unwrap()
+                    .known
+                    .insert(coord, to);
             }
         }
-        if let Some((from, to)) = changed {
-            self.metrics.accepted_edits += 1;
-            let local_index = index(local_coord(target)) as u16;
-            let journal = self.journal.entry(coord).or_default();
-            journal.revision = to;
-            if journal.blocks.insert(local_index, block).is_none() {
-                self.journal_blocks += 1;
+    }
+
+    /// Finish observed contacts before edits can transfer voxel ownership.
+    fn observe_physics(&mut self, world: &mut VoxelWorld) {
+        let Some(mut physics) = self.physics.take() else {
+            return;
+        };
+        physics.poll();
+        for (id, target, material) in physics.destroyed_bodies() {
+            physics.remove(id);
+            self.destroyed(target, material, Some(id));
+        }
+        let contacts = physics.take_terrain_contacts();
+        self.physics = Some(physics);
+        for contact in contacts {
+            if self.apply_contact(world, &contact).is_err() {
+                self.metrics.rejected_contacts += 1;
             }
-            let recipients: Vec<_> = self
-                .players
-                .iter()
-                .filter(|(_, p)| p.known.get(&coord) == Some(&from))
-                .map(|(&id, _)| id)
-                .collect();
-            for recipient in recipients {
-                if self.send(
-                    recipient,
-                    &ServerMessage::Delta {
-                        coord,
-                        from,
-                        to,
-                        local_index,
-                        block,
-                    },
-                ) {
-                    self.players
-                        .get_mut(&recipient)
-                        .unwrap()
-                        .known
-                        .insert(coord, to);
+        }
+    }
+
+    fn advance_physics(&mut self, world: &mut VoxelWorld) {
+        let Some(mut physics) = self.physics.take() else {
+            return;
+        };
+        // Attachment failure is latched, not a sum of old contact loads. Retry the
+        // ownership transaction when body capacity/readback permits it.
+        let mut releases: Vec<_> = self
+            .damage
+            .iter()
+            .filter(|(_, state)| state.release)
+            .map(|(&target, &state)| (target, state))
+            .collect();
+        releases.sort_unstable_by_key(|(p, _)| (p.y, p.z, p.x));
+        for (target, state) in releases {
+            if world.block(target) == Some(state.material)
+                && physics.can_detach(target)
+                && self.has_journal_space(target)
+                && let Some((from, to)) = world.set_block(target, 0)
+            {
+                // The solver already reacted the collision impulse into the grid.
+                physics.release(target, state.material, state.joules, Vec3::ZERO);
+                physics.set_voxel(target, 0);
+                self.record_change(world, target, 0, from, to);
+            }
+        }
+        // Stable body IDs establish deterministic order for competing cell claims.
+        for (id, target, material) in physics.settling_candidates() {
+            for target in physics.placement_cells(id, target) {
+                let coord = chunk_coord(target);
+                let has_journal_space = self.journal_blocks < MAX_JOURNAL_BLOCKS
+                    || self.journal.get(&coord).is_some_and(|j| {
+                        j.blocks.contains_key(&(index(local_coord(target)) as u16))
+                    });
+                if has_journal_space
+                    && (if physics.failed() {
+                        world.block(target) == Some(0)
+                            && !self
+                                .players
+                                .values()
+                                .any(|p| overlaps_block(&p.state, target))
+                    } else {
+                        can_settle(world, target, self.players.values().map(|p| &p.state))
+                    })
+                    && !physics.overlaps_except(target, id)
+                    && (self.damage.len() < MAX_DAMAGED_BLOCKS
+                        || self.damage.contains_key(&target)
+                        || physics.body_damage(id) == 0.0)
+                    && let Some((from, to)) = world.set_block(target, material)
+                {
+                    let damage = physics.body_damage(id);
+                    physics.remove(id);
+                    physics.set_voxel(target, material);
+                    self.record_change(world, target, material, from, to);
+                    if damage > 0.0 {
+                        self.damage.insert(
+                            target,
+                            DamageState {
+                                material,
+                                joules: damage,
+                                release: false,
+                            },
+                        );
+                    }
+                    break;
                 }
             }
-        } else {
-            self.metrics.rejected_edits += 1;
         }
-        eprintln!("edit id={id} request={request} accepted={accepted} target={target}");
-        self.send(id, &ServerMessage::EditResult { request, accepted });
+        let mut players: Vec<_> = self.players.iter().collect();
+        players.sort_unstable_by_key(|(id, _)| **id);
+        physics.player_colliders(
+            players
+                .into_iter()
+                .enumerate()
+                .map(|(slot, (_, player))| gpu_physics::PlayerCollider {
+                    position: player.state.position.to_array(),
+                    id: slot as u32,
+                    velocity: player.body_push_velocity.to_array(),
+                    padding: 0,
+                })
+                .collect(),
+        );
+        physics.step();
+        if self.tick.is_multiple_of(3) {
+            let revision = physics.revision;
+            let ids: Vec<_> = self
+                .players
+                .iter()
+                .filter(|(_, player)| player.physics_revision != Some(revision))
+                .map(|(&id, _)| id)
+                .collect();
+            if !ids.is_empty() {
+                let message = ServerMessage::Physics {
+                    tick: revision,
+                    bodies: physics.snapshots(),
+                };
+                for id in ids {
+                    if self.send(id, &message) {
+                        self.players.get_mut(&id).unwrap().physics_revision = Some(revision);
+                    }
+                }
+            }
+        }
+        self.physics = Some(physics);
     }
+}
+fn validate_player_edit(
+    world: &VoxelWorld,
+    player: &Player,
+    tick: u64,
+    request: u64,
+    target: IVec3,
+    block: u8,
+    revision: u64,
+) -> Result<(), EditRejection> {
+    if request <= player.highest_request {
+        return Err(EditRejection::OldRequest);
+    }
+    if tick < player.last_edit.saturating_add(6) {
+        return Err(EditRejection::Cooldown);
+    }
+    validate_edit_target(world, player, target, block, revision)
+}
+
+fn validate_edit_target(
+    world: &VoxelWorld,
+    player: &Player,
+    target: IVec3,
+    block: u8,
+    revision: u64,
+) -> Result<(), EditRejection> {
+    let coord = chunk_coord(target);
+    if block > 5
+        || target.y <= MIN_CHUNK_Y * CHUNK_SIZE
+        || !valid_coord(coord)
+        || !player.interest.contains(&coord)
+    {
+        return Err(EditRejection::InvalidTarget);
+    }
+    if player.known.get(&coord) != Some(&revision)
+        || world
+            .chunks
+            .get(&coord)
+            .is_none_or(|c| c.revision != revision)
+    {
+        return Err(EditRejection::StaleRevision);
+    }
+    if !world.block(target).is_some_and(|existing| {
+        if block == 0 {
+            existing != 0
+        } else {
+            existing == 0
+        }
+    }) {
+        return Err(EditRejection::InvalidTarget);
+    }
+    if !world
+        .raycast(
+            player.state.position + Vec3::Y * EYE_HEIGHT,
+            look_direction(player.input.yaw, player.input.pitch),
+            6.0,
+        )
+        .is_some_and(|hit| {
+            if block == 0 {
+                hit.block == target
+            } else {
+                hit.adjacent == target
+            }
+        })
+    {
+        return Err(EditRejection::OutOfReach);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn valid_player_edit(
+    world: &VoxelWorld,
+    player: &Player,
+    tick: u64,
+    request: u64,
+    target: IVec3,
+    block: u8,
+    revision: u64,
+) -> bool {
+    validate_player_edit(world, player, tick, request, target, block, revision).is_ok()
+}
+fn can_settle<'a>(
+    world: &VoxelWorld,
+    target: IVec3,
+    players: impl Iterator<Item = &'a PlayerState>,
+) -> bool {
+    world.block(target) == Some(0)
+        && world.block(target - IVec3::Y).is_some_and(|b| b != 0)
+        && !players.into_iter().any(|p| overlaps_block(p, target))
 }
 fn valid_coord(coord: IVec3) -> bool {
     coord.x.abs_diff(0) <= 1_000_000
@@ -358,6 +789,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     let started = Instant::now();
     let sim = &mut *simulation;
     sim.tick += 1;
+    sim.observe_physics(&mut world);
     let incoming = match sim.transport.poll() {
         Ok(incoming) => incoming,
         Err(error) => {
@@ -391,6 +823,11 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         }
     }
     // Only one command advances each actor per server tick, regardless of packet rate.
+    let bodies = sim
+        .physics
+        .as_ref()
+        .map(|p| p.dynamic_colliders())
+        .unwrap_or_default();
     for player in sim.players.values_mut() {
         let input = if let Some((sequence, input)) = player.pending.pop_first() {
             player.last_input = sequence;
@@ -404,7 +841,16 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             }
         };
         let previous = player.state;
-        step_player(&world, &mut player.state, &input, FIXED_DT);
+        let mut intended = previous;
+        step_player(&world, &mut intended, &input, FIXED_DT);
+        physics::step_player_with_bodies(&world, &mut player.state, &input, FIXED_DT, &bodies);
+        // Preserve attempted horizontal motion when a loose body blocks the character.
+        // The GPU resolves that kinematic push against material mass and terrain.
+        player.body_push_velocity = Vec3::new(
+            intended.velocity.x,
+            player.state.velocity.y,
+            intended.velocity.z,
+        );
         if !player.state.position.is_finite()
             || player.state.position.x.abs() >= 31_999_900.0
             || player.state.position.z.abs() >= 31_999_900.0
@@ -426,7 +872,20 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 target,
                 block,
                 expected_revision,
-            } => sim.edit(&mut world, id, request, target, block, expected_revision),
+            } => sim.edit(
+                &mut world,
+                id,
+                request,
+                target,
+                block,
+                expected_revision,
+                false,
+            ),
+            ClientMessage::Strike {
+                request,
+                target,
+                expected_revision,
+            } => sim.edit(&mut world, id, request, target, 0, expected_revision, true),
             ClientMessage::Resync { coord } => {
                 if let Some(player) = sim.players.get_mut(&id) {
                     // Baseline transmission is already capped at two chunks/tick. Retain
@@ -440,6 +899,8 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             ClientMessage::Hello { .. } => {}
         }
     }
+    sim.drain_strikes(&mut world);
+    sim.advance_physics(&mut world);
     let mut needed = std::mem::take(&mut sim.needed);
     needed.clear();
     // One chunk of safety beyond visible interest ensures swept bodies never reach unloaded edges.
@@ -600,5 +1061,68 @@ mod tests {
         restore(&mut world, coord, Some(&journal));
         assert_eq!(world.block(target), Some(original));
         assert_eq!(world.chunks[&coord].revision, 2);
+    }
+
+    fn empty_world() -> VoxelWorld {
+        let mut world = VoxelWorld::default();
+        world.chunks.insert(
+            IVec3::ZERO,
+            std::sync::Arc::new(Chunk::from_runs(0, &[(32768, 0)]).unwrap()),
+        );
+        world
+    }
+
+    #[test]
+    fn settlement_requires_air_support_and_player_clearance() {
+        let mut world = empty_world();
+        let target = IVec3::new(2, 2, 2);
+        assert!(!can_settle(&world, target, std::iter::empty()));
+        world.set_block(target - IVec3::Y, 3).unwrap();
+        assert!(can_settle(&world, target, std::iter::empty()));
+        let player = PlayerState {
+            position: target.as_vec3() + Vec3::new(0.5, 0.0, 0.5),
+            ..Default::default()
+        };
+        assert!(!can_settle(&world, target, std::iter::once(&player)));
+        world.set_block(target, 2).unwrap();
+        assert!(!can_settle(&world, target, std::iter::empty()));
+    }
+
+    #[test]
+    fn journal_tracks_detachment_and_regridding() {
+        let mut world = empty_world();
+        let source = IVec3::new(2, 2, 2);
+        let destination = IVec3::new(3, 2, 2);
+        world.set_block(source, 5).unwrap();
+        world.set_block(source, 0).unwrap();
+        let (_, to) = world.set_block(destination, 5).unwrap();
+        let journal = Journal {
+            revision: to,
+            blocks: BTreeMap::from([(index(source) as u16, 0), (index(destination) as u16, 5)]),
+        };
+        world.remove(IVec3::ZERO);
+        restore(&mut world, IVec3::ZERO, Some(&journal));
+        assert_eq!(world.block(source), Some(0));
+        assert_eq!(world.block(destination), Some(5));
+        assert_eq!(world.chunks[&IVec3::ZERO].revision, to);
+    }
+
+    #[test]
+    fn edits_validate_revision_ray_request_and_cooldown() {
+        let mut world = empty_world();
+        let target = IVec3::new(2, 3, 2);
+        world.set_block(target, 5).unwrap();
+        let mut player = Player::new();
+        player.state.position = Vec3::new(2.5, 2.0, 5.5);
+        player.interest.insert(IVec3::ZERO);
+        player.known.insert(IVec3::ZERO, 1);
+        assert!(valid_player_edit(&world, &player, 100, 1, target, 0, 1));
+        assert!(!valid_player_edit(&world, &player, 100, 1, target, 0, 0));
+        assert!(!valid_player_edit(&world, &player, 100, 0, target, 0, 1));
+        assert!(!valid_player_edit(&world, &player, 1, 1, target, 0, 1));
+        world.set_block(target + IVec3::Z, 3).unwrap();
+        player.known.insert(IVec3::ZERO, 2);
+        assert!(!valid_player_edit(&world, &player, 100, 1, target, 0, 2));
+        assert_eq!(world.block(target), Some(5));
     }
 }

@@ -1,12 +1,30 @@
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 use physics::{PlayerInput, PlayerState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 4;
+pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_FRAME: usize = 128 * 1024;
+
+/// Authoritative action rejection, also used for completed queued debug strikes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EditRejection {
+    OldRequest,
+    Cooldown,
+    InvalidTarget,
+    StaleRevision,
+    OutOfReach,
+    Occupied,
+    PhysicsUnavailable,
+    BodyCapacity,
+    QueueFull,
+    Expired,
+    StorageFull,
+    RevisionExhausted,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -21,6 +39,11 @@ pub enum ClientMessage {
     },
     Resync {
         coord: IVec3,
+    },
+    Strike {
+        request: u64,
+        target: IVec3,
+        expected_revision: u64,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,10 +72,25 @@ pub enum ServerMessage {
     EditResult {
         request: u64,
         accepted: bool,
+        reason: Option<EditRejection>,
+        /// Accumulated fracture damage / destruction budget for a successful hit.
+        damage: Option<f32>,
     },
     Disconnect {
         reason: String,
     },
+    /// Complete replacement of the bounded dynamic-body set; positions are centers.
+    Physics {
+        tick: u64,
+        bodies: Vec<PhysicsBodySnapshot>,
+    },
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PhysicsBodySnapshot {
+    pub id: u32,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub material: u8,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
@@ -103,5 +141,24 @@ mod tests {
         assert!(decode::<ClientMessage>(&bytes, bytes.len() - 1).is_err());
         bytes.push(0);
         assert!(decode::<ClientMessage>(&bytes, MAX_FRAME).is_err());
+    }
+    #[test]
+    fn bounded_physics_snapshot_round_trips_in_one_reliable_frame() {
+        let bodies = (0..MAX_PHYSICS_BODIES)
+            .map(|id| PhysicsBodySnapshot {
+                id: id as u32,
+                position: Vec3::new(0.5, 20.5, -0.5),
+                velocity: Vec3::new(1.0, -2.0, 3.0),
+                material: 3,
+            })
+            .collect();
+        let bytes = encode(&ServerMessage::Physics { tick: 600, bodies }, MAX_FRAME).unwrap();
+        let ServerMessage::Physics { tick, bodies } = decode(&bytes, MAX_FRAME).unwrap() else {
+            panic!("wrong message")
+        };
+        assert_eq!(tick, 600);
+        assert_eq!(bodies.len(), MAX_PHYSICS_BODIES);
+        assert_eq!(bodies[127].position, Vec3::new(0.5, 20.5, -0.5));
+        assert_eq!(bodies[127].velocity, Vec3::new(1.0, -2.0, 3.0));
     }
 }
