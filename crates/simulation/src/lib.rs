@@ -4,10 +4,12 @@ mod bombardment_tests;
 mod bow;
 mod bow_server;
 mod explosion;
+mod health;
 mod material_damage;
 mod physics_slice;
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
+use gameplay::Health;
 use glam::{IVec3, Vec3};
 use material_damage::{MAX_DAMAGED_BLOCKS, tool_contact};
 use networking::ServerTransport;
@@ -138,6 +140,7 @@ impl Plugin for SimulationPlugin {
 }
 struct Player {
     state: PlayerState,
+    health: Health,
     last_input: u64,
     input: PlayerInput,
     pending: BTreeMap<u64, PlayerInput>,
@@ -157,6 +160,7 @@ impl Player {
     fn new() -> Self {
         Self {
             state: PlayerState::default(),
+            health: Health::default(),
             last_input: 0,
             input: PlayerInput::default(),
             pending: BTreeMap::new(),
@@ -178,6 +182,7 @@ impl Player {
             id,
             last_input: self.last_input,
             state: self.state,
+            health: self.health,
             yaw: self.input.yaw,
         }
     }
@@ -854,6 +859,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     for (id, session) in incoming.connected {
         let player = Player::new();
         let spawn = player.state;
+        let health = player.health;
         sim.players.insert(id, player);
         sim.send(
             id,
@@ -862,6 +868,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 session,
                 seed: sim.config.seed,
                 spawn,
+                health,
             },
         );
         eprintln!("connect id={id}");

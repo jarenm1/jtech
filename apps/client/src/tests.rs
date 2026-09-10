@@ -21,6 +21,104 @@ fn arena() -> VoxelWorld {
 }
 
 #[test]
+fn reconciliation_copies_authoritative_health_without_predicting_damage() {
+    let world = arena();
+    let start = PlayerState {
+        position: Vec3::new(0.5, 0.0, 0.5),
+        velocity: Vec3::ZERO,
+        grounded: true,
+    };
+    let mut client = ClientSession {
+        state: start,
+        ..default()
+    };
+    let mut health = Health::default();
+    health.damage(35);
+    let mut snapshot = Snapshot {
+        tick: 1,
+        you: PlayerSnapshot {
+            id: 1,
+            last_input: 0,
+            state: start,
+            health,
+            yaw: 0.0,
+        },
+        players: vec![],
+    };
+    client.pending.push_back(PlayerInput {
+        sequence: 1,
+        movement: [1.0, 0.0],
+        ..default()
+    });
+    reconcile(&mut client, &world, &snapshot, &[]);
+    assert_eq!(client.health, health);
+    assert!(client.state.position.x > start.position.x);
+
+    snapshot.tick += 1;
+    snapshot.you.health.damage(u16::MAX);
+    reconcile(&mut client, &world, &snapshot, &[]);
+    assert!(client.health.is_depleted());
+
+    snapshot.tick += 1;
+    snapshot.you.health.heal(20);
+    reconcile(&mut client, &world, &snapshot, &[]);
+    assert_eq!(client.health, snapshot.you.health);
+}
+
+#[test]
+fn movement_prediction_preserves_replicated_health() {
+    let world = arena();
+    for damage in [35, 100] {
+        let mut health = Health::default();
+        health.damage(damage);
+        let mut client = ClientSession {
+            state: PlayerState {
+                position: Vec3::new(0.5, 0.0, 0.5),
+                velocity: Vec3::ZERO,
+                grounded: true,
+            },
+            health,
+            ..default()
+        };
+        let start = client.state;
+        for sequence in 1..=20 {
+            client.predict_input(
+                &world,
+                PlayerInput {
+                    sequence,
+                    movement: [1.0, 0.0],
+                    ..default()
+                },
+                &[],
+            );
+        }
+        assert_eq!(client.health, health);
+        assert!(client.state.position.x > start.position.x);
+        assert_eq!(client.pending.len(), 20);
+    }
+}
+
+#[test]
+fn health_hud_bar_tracks_authoritative_fraction() {
+    let mut app = App::new();
+    app.init_resource::<ClientSession>()
+        .add_systems(Startup, |mut commands: Commands| {
+            health_hud::spawn(&mut commands)
+        })
+        .add_systems(Update, health_hud::update);
+    for (damage, expected_width) in [(0, 100.0), (35, 65.0), (65, 0.0)] {
+        app.world_mut()
+            .resource_mut::<ClientSession>()
+            .health
+            .damage(damage);
+        app.update();
+        let world = app.world_mut();
+        let mut fills = world.query_filtered::<&Node, With<health_hud::HealthFill>>();
+        assert_eq!(fills.single(world).unwrap().width, percent(expected_width));
+    }
+}
+
+#[test]
 fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_physics() {
     let world = arena();
     let start = PlayerState {
@@ -54,6 +152,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
             id: 1,
             last_input: 10,
             state: acknowledged,
+            health: Health::default(),
             yaw: 0.0,
         },
         players: vec![],
@@ -74,6 +173,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
                 id: 1,
                 last_input: 30,
                 state: expected,
+                health: Health::default(),
                 yaw: 0.0,
             },
             players: vec![],
@@ -118,6 +218,7 @@ fn terrain_changes_are_used_when_replaying_prediction() {
                 id: 1,
                 last_input: 0,
                 state: start,
+                health: Health::default(),
                 yaw: 0.0,
             },
             players: vec![],
@@ -163,6 +264,7 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
                 id: 1,
                 last_input: 0,
                 state: start,
+                health: Health::default(),
                 yaw: 0.0,
             },
             players: vec![],

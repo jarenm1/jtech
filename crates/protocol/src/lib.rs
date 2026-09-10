@@ -1,9 +1,10 @@
+pub use gameplay::Health;
 use glam::{IVec3, Vec3};
 use physics::{PlayerInput, PlayerState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -61,6 +62,7 @@ pub enum ServerMessage {
         session: u64,
         seed: u64,
         spawn: PlayerState,
+        health: Health,
     },
     Chunk {
         coord: IVec3,
@@ -123,6 +125,7 @@ pub struct PlayerSnapshot {
     pub id: u64,
     pub last_input: u64,
     pub state: PlayerState,
+    pub health: Health,
     pub yaw: f32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,6 +164,78 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_health_round_trips_in_welcome_and_snapshot() {
+        let mut health = Health::default();
+        health.damage(37);
+        let welcome = ServerMessage::Welcome {
+            id: 1,
+            session: 2,
+            seed: 7,
+            spawn: PlayerState::default(),
+            health,
+        };
+        let bytes = encode(&welcome, MAX_FRAME).unwrap();
+        let ServerMessage::Welcome {
+            health: decoded, ..
+        } = decode(&bytes, MAX_FRAME).unwrap()
+        else {
+            panic!("wrong message")
+        };
+        assert_eq!(decoded, health);
+        let player = PlayerSnapshot {
+            id: 1,
+            last_input: 3,
+            state: PlayerState::default(),
+            health,
+            yaw: 0.0,
+        };
+        let snapshot = Snapshot {
+            tick: 9,
+            you: player.clone(),
+            players: vec![player],
+        };
+        let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
+        let decoded: Snapshot = decode(&bytes, MAX_DATAGRAM).unwrap();
+        assert_eq!(decoded.you.health.current(), 63);
+        assert_eq!(decoded.players[0].health, health);
+    }
+
+    #[test]
+    fn health_decode_rejects_invalid_bounds() {
+        // Field order matches Health's serialized current/maximum pair.
+        for values in [(1_u16, 0_u16), (101, 100)] {
+            let bytes = encode(&values, MAX_DATAGRAM).unwrap();
+            assert!(decode::<Health>(&bytes, MAX_DATAGRAM).is_err());
+        }
+        let bytes = encode(&(0_u16, 100_u16), MAX_DATAGRAM).unwrap();
+        assert!(
+            decode::<Health>(&bytes, MAX_DATAGRAM)
+                .unwrap()
+                .is_depleted()
+        );
+    }
+
+    #[test]
+    fn maximum_player_snapshot_fits_one_datagram_with_health() {
+        let player = PlayerSnapshot {
+            id: u64::MAX,
+            last_input: u64::MAX,
+            state: PlayerState::default(),
+            health: Health::new(u16::MAX).unwrap(),
+            yaw: 1.0,
+        };
+        let snapshot = Snapshot {
+            tick: u64::MAX,
+            you: player.clone(),
+            players: vec![player; MAX_PLAYERS - 1],
+        };
+        let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
+        let decoded: Snapshot = decode(&bytes, MAX_DATAGRAM).unwrap();
+        assert_eq!(decoded.players.len(), MAX_PLAYERS - 1);
+        assert_eq!(decoded.you.health.maximum(), u16::MAX);
+    }
     #[test]
     fn strict_decode_rejects_trailing_bytes_and_size_limit() {
         let mut bytes = encode(&ClientMessage::Hello { version: 1 }, MAX_FRAME).unwrap();

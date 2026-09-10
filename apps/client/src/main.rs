@@ -1,3 +1,4 @@
+mod health_hud;
 mod loose_blocks;
 mod projectiles;
 use std::{
@@ -17,7 +18,7 @@ use bevy::{
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerInput, PlayerState, look_direction};
 use protocol::{
-    ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, InputPacket, ServerMessage, Snapshot,
+    ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, Health, InputPacket, ServerMessage, Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, WorldPlugin, chunk_coord};
@@ -85,6 +86,8 @@ struct ClientSession {
     id: Option<u64>,
     session: u64,
     state: PlayerState,
+    // Replicated independently of movement prediction.
+    health: Health,
     pending: VecDeque<PlayerInput>,
     sequence: u64,
     last_tick: u64,
@@ -139,6 +142,7 @@ impl Default for ClientSession {
             id: None,
             session: 0,
             state: PlayerState::default(),
+            health: Health::default(),
             pending: VecDeque::with_capacity(256),
             sequence: 0,
             last_tick: 0,
@@ -164,6 +168,15 @@ impl Default for ClientSession {
 }
 
 impl ClientSession {
+    fn predict_input(
+        &mut self,
+        world: &VoxelWorld,
+        input: PlayerInput,
+        bodies: &[physics::DynamicCollider],
+    ) {
+        physics::step_player_with_bodies(world, &mut self.state, &input, FIXED_DT, bodies);
+        self.pending.push_back(input);
+    }
     fn receive_action(&mut self, result: ActionResult) {
         if result.accepted {
             self.accepted_edits += 1;
@@ -246,6 +259,7 @@ impl Plugin for ClientPlugin {
                     select_voxel,
                     update_hud,
                     update_hotbar,
+                    health_hud::update,
                     capture_screenshot,
                     record_metrics,
                 )
@@ -401,6 +415,7 @@ fn setup(
         BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.8)),
         Hotbar,
     ));
+    health_hud::spawn(&mut commands);
 }
 
 #[allow(clippy::too_many_arguments)] // Independent Bevy presentation resources.
@@ -435,11 +450,13 @@ fn receive_network(
                 session: token,
                 seed,
                 spawn,
+                health,
             } => {
                 projectiles.clear(&mut commands);
                 session.id = Some(id);
                 session.session = token;
                 session.state = spawn;
+                session.health = health;
                 world.seed = seed;
                 session.status = format!("Connected | player {id}");
                 info!("WELCOME player={id} seed={seed}");
@@ -602,6 +619,7 @@ fn reconcile(
     }
     let previous = session.state.position;
     session.state = snapshot.you.state;
+    session.health = snapshot.you.health;
     for input in &session.pending {
         physics::step_player_with_bodies(world, &mut session.state, input, FIXED_DT, bodies);
     }
@@ -705,10 +723,7 @@ fn predict(
             pitch: session.pitch,
             jump,
         };
-        let mut state = session.state;
-        physics::step_player_with_bodies(&world, &mut state, &input, FIXED_DT, loose.colliders());
-        session.state = state;
-        session.pending.push_back(input);
+        session.predict_input(&world, input, loose.colliders());
     }
     if !session.pending.is_empty() {
         let inputs = session

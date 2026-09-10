@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc", "use-std"] }
 voxel_world = { path = "crates/voxel_world" }
 physics = { path = "crates/physics" }
+gameplay = { path = "crates/gameplay" }
 protocol = { path = "crates/protocol" }
 networking = { path = "crates/networking" }
 simulation = { path = "crates/simulation" }
