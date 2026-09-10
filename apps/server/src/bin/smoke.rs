@@ -2,10 +2,10 @@ use bevy_app::App;
 use glam::{IVec3, Vec3};
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, step_player};
-use protocol::{ClientMessage, EditRejection, InputPacket, ServerMessage};
+use protocol::{ArrowSnapshot, ClientMessage, EditRejection, InputPacket, ServerMessage};
 use simulation::{ServerConfig, Simulation, SimulationPlugin};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     net::SocketAddr,
     time::Duration,
@@ -29,6 +29,8 @@ struct Bot {
     edits: HashMap<u64, bool>,
     damage: HashMap<u64, f32>,
     rejections: HashMap<u64, EditRejection>,
+    flights: Vec<(u64, Vec<ArrowSnapshot>)>,
+    explosions: Vec<(u32, Vec3, f32)>,
     chunks: usize,
     deltas: usize,
     forgotten: usize,
@@ -54,6 +56,8 @@ impl Bot {
             edits: HashMap::new(),
             damage: HashMap::new(),
             rejections: HashMap::new(),
+            flights: Vec::new(),
+            explosions: Vec::new(),
             chunks: 0,
             deltas: 0,
             forgotten: 0,
@@ -133,6 +137,14 @@ impl Bot {
                     }
                 }
                 ServerMessage::Physics { .. } => {}
+                ServerMessage::Projectiles { tick, arrows } => self.flights.push((tick, arrows)),
+                ServerMessage::Explosion {
+                    id,
+                    position,
+                    radius,
+                } => {
+                    self.explosions.push((id, position, radius));
+                }
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
             }
         }
@@ -346,6 +358,186 @@ fn break_block(
         }
     }
     Err("material did not break within 64 accepted hits".into())
+}
+/// A separate CPU-only world keeps blast damage out of the movement/edit scenarios.
+fn explosive_bow() -> Result<()> {
+    let plugin = SimulationPlugin::bind(ServerConfig {
+        bind: "127.0.0.1:0".parse()?,
+        radius: 1,
+        metrics_every: 0,
+        gpu_physics: false,
+        ..Default::default()
+    })?;
+    let address = plugin.local_addr();
+    let mut app = App::new();
+    app.add_plugins(plugin);
+    let mut first = Bot::connect(address, false)?;
+    let mut second = Bot::connect(address, false)?;
+    drive(&mut app, &mut [&mut first, &mut second], 180, [0.0; 2], 0.0)?;
+    require(
+        first.id != 0 && second.id != 0,
+        "bow peers were not admitted",
+    )?;
+    require(first.authority.grounded, "bow shooter did not settle")?;
+    let muzzle = first.authority.position + Vec3::Y * EYE_HEIGHT;
+    let base = muzzle.floor().as_ivec3();
+    let mut wall = Vec::new();
+    let mut repairs = HashSet::new();
+    // Author a clear twelve-metre lane and a stone impact wall before firing.
+    // Preserve the ground under the shooter; resync both clients to this fixture.
+    {
+        let mut world = app.world_mut().resource_mut::<VoxelWorld>();
+        for x in 1..=12 {
+            for y in -1..=2 {
+                for z in -1..=1 {
+                    let target = base + IVec3::new(x, y, z);
+                    require(world.block(target).is_some(), "bow fixture is not loaded")?;
+                    let block = if x == 12 { 3 } else { 0 };
+                    if world.set_block(target, block).is_some() {
+                        repairs.insert(chunk_coord(target));
+                    }
+                    if x == 12 {
+                        wall.push(target);
+                    }
+                }
+            }
+        }
+    }
+    for coord in repairs {
+        for bot in [&mut first, &mut second] {
+            bot.net.send(ClientMessage::Resync { coord })?;
+        }
+    }
+    drive(&mut app, &mut [&mut first, &mut second], 60, [0.0; 2], 0.0)?;
+    for bot in [&first, &second] {
+        require(
+            wall.iter().all(|&cell| bot.world.block(cell) == Some(3)),
+            "bow wall baseline did not replicate",
+        )?;
+    }
+    let yaw = -std::f32::consts::FRAC_PI_2;
+    let shot = ClientMessage::FireBow {
+        request: 1,
+        yaw,
+        pitch: 0.0,
+    };
+    first.net.send(shot.clone())?;
+    first.net.send(shot.clone())?;
+    first.net.send(ClientMessage::FireBow {
+        request: 2,
+        yaw,
+        pitch: 0.0,
+    })?;
+    drive(&mut app, &mut [&mut first, &mut second], 120, [0.0; 2], 0.0)?;
+    require(first.edits.get(&1) == Some(&true), "bow shot was rejected")?;
+    require(
+        first.edits.get(&2) == Some(&false)
+            && first.rejections.get(&2) == Some(&EditRejection::Cooldown),
+        "bow rapid-fire request was not rejected by cooldown",
+    )?;
+    require(
+        first.explosions.len() == 1 && first.explosions == second.explosions,
+        "bow impact did not replicate exactly once to both clients",
+    )?;
+    let (id, position, radius) = first.explosions[0];
+    require(
+        position.is_finite()
+            && radius > 0.0
+            && (position.x - (base.x + 12) as f32).abs() < 0.05
+            && position.distance(muzzle) > 6.0,
+        "bow did not impact the distant wall",
+    )?;
+    for bot in [&first, &second] {
+        let visible: Vec<_> = bot
+            .flights
+            .iter()
+            .flat_map(|(_, arrows)| arrows)
+            .filter(|arrow| arrow.id == id)
+            .collect();
+        require(
+            visible.len() >= 2
+                && visible
+                    .iter()
+                    .all(|arrow| arrow.position.is_finite() && arrow.velocity.is_finite())
+                && visible.last().unwrap().position.x > visible[0].position.x + 1.0,
+            "bow moving arrow was not visible before impact",
+        )?;
+        require(
+            bot.flights
+                .iter()
+                .all(|(_, arrows)| arrows.iter().all(|arrow| arrow.id == id))
+                && bot
+                    .flights
+                    .last()
+                    .is_some_and(|(_, arrows)| arrows.is_empty()),
+            "bow replay spawned another arrow or impact left an active arrow",
+        )?;
+    }
+    let destroyed: Vec<_> = wall
+        .iter()
+        .copied()
+        .filter(|&cell| app.world().resource::<VoxelWorld>().block(cell) == Some(0))
+        .collect();
+    require(
+        !destroyed.is_empty(),
+        "bow impact caused no terrain destruction",
+    )?;
+    for bot in [&first, &second] {
+        require(
+            bot.deltas > 0
+                && destroyed
+                    .iter()
+                    .all(|&cell| bot.world.block(cell) == Some(0)),
+            "bow terrain destruction did not replicate to both clients",
+        )?;
+    }
+    // Replay after the cooldown expires, requiring a fresh reply, not the old map entry.
+    let deltas = [first.deltas, second.deltas];
+    first.edits.remove(&1);
+    first.edits.remove(&2);
+    first.net.send(shot)?;
+    first.net.send(ClientMessage::FireBow {
+        request: 2,
+        yaw,
+        pitch: 0.0,
+    })?;
+    drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
+    require(
+        first.edits.get(&1) == Some(&true)
+            && first.edits.get(&2) == Some(&false)
+            && first.rejections.get(&2) == Some(&EditRejection::Cooldown),
+        "bow replay did not preserve accepted and rejected results",
+    )?;
+    for (bot, before) in [&first, &second].into_iter().zip(deltas) {
+        require(
+            bot.explosions.len() == 1
+                && bot.deltas == before
+                && bot
+                    .flights
+                    .iter()
+                    .all(|(_, arrows)| arrows.iter().all(|arrow| arrow.id == id)),
+            "bow replay repeated flight, explosion, or terrain damage",
+        )?;
+    }
+    first.net.send(ClientMessage::FireBow {
+        request: 3,
+        yaw,
+        pitch: 0.5,
+    })?;
+    drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
+    require(
+        first.edits.get(&3) == Some(&true),
+        "bow cooldown did not permit a later fresh shot",
+    )?;
+    for bot in [&first, &second] {
+        require(
+            bot.flights
+                .iter()
+                .any(|(_, arrows)| arrows.iter().any(|arrow| arrow.id != id)),
+            "later bow shot did not replicate to both clients",
+        )?;
+    }
+    Ok(())
 }
 fn main() -> Result<()> {
     let plugin = SimulationPlugin::bind(ServerConfig {
@@ -575,8 +767,9 @@ fn main() -> Result<()> {
     app.world()
         .resource::<Simulation>()
         .print_metrics(app.world().resource::<VoxelWorld>().chunks.len());
+    explosive_bow()?;
     println!(
-        "SMOKE PASS: two real TCP/UDP clients; accumulating fracture/replay protection/destruction; reliable edits/revisions/rejection/resync; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect"
+        "SMOKE PASS: two real TCP/UDP clients; accumulating fracture/replay protection/destruction; reliable edits/revisions/rejection/resync; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect; CPU explosive bow flight/impact/destruction/cooldown/replay on both clients"
     );
     Ok(())
 }

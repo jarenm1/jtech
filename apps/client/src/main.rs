@@ -1,4 +1,5 @@
 mod loose_blocks;
+mod projectiles;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
@@ -15,7 +16,9 @@ use bevy::{
 };
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerInput, PlayerState, look_direction};
-use protocol::{ClientMessage, EditRejection, InputPacket, ServerMessage, Snapshot};
+use protocol::{
+    ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, InputPacket, ServerMessage, Snapshot,
+};
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, WorldPlugin, chunk_coord};
 
@@ -64,7 +67,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump | left/right click hit/place | F debug launch (GPU server) | 1-5 material | Esc release/capture mouse | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump | left/right click hit/place (bow: shoot) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc release/capture mouse | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -222,6 +225,8 @@ struct PlayerCamera;
 struct Hud;
 #[derive(Component)]
 struct Selection;
+#[derive(Component)]
+struct Hotbar;
 
 struct ClientPlugin;
 
@@ -240,6 +245,7 @@ impl Plugin for ClientPlugin {
                     present_players,
                     select_voxel,
                     update_hud,
+                    update_hotbar,
                     capture_screenshot,
                     record_metrics,
                 )
@@ -276,6 +282,7 @@ fn main() {
             VoxelRenderPlugin,
             ClientPlugin,
             loose_blocks::LooseBlocksPlugin,
+            projectiles::ProjectilesPlugin,
         ))
         .run();
 }
@@ -378,13 +385,25 @@ fn setup(
         },
     ));
     commands.spawn((
-        Text::new("WASD  MOVE    SPACE  JUMP    MOUSE  LOOK\nLMB  HIT    RMB  PLACE    F  DEBUG LAUNCH    1-5  MATERIAL    ESC  CURSOR    F12  CAPTURE"),
-        TextFont { font_size: 14.0, ..default() }, TextShadow::default(),
-        Node { position_type: PositionType::Absolute, bottom: px(18), left: px(20), padding: UiRect::all(px(10)), ..default() },
+        Text::new(""),
+        TextFont {
+            font_size: 14.0,
+            ..default()
+        },
+        TextShadow::default(),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: px(18),
+            left: px(20),
+            padding: UiRect::all(px(10)),
+            ..default()
+        },
         BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.8)),
+        Hotbar,
     ));
 }
 
+#[allow(clippy::too_many_arguments)] // Independent Bevy presentation resources.
 fn receive_network(
     mut commands: Commands,
     mut session: ResMut<ClientSession>,
@@ -393,6 +412,8 @@ fn receive_network(
     assets: Res<ActorAssets>,
     mut loose: ResMut<loose_blocks::LooseBlocks>,
     loose_assets: Res<loose_blocks::LooseBlockAssets>,
+    mut projectiles: ResMut<projectiles::Projectiles>,
+    projectile_assets: Res<projectiles::ProjectileAssets>,
 ) {
     let Some(transport) = &mut session.transport else {
         return;
@@ -415,6 +436,7 @@ fn receive_network(
                 seed,
                 spawn,
             } => {
+                projectiles.clear(&mut commands);
                 session.id = Some(id);
                 session.session = token;
                 session.state = spawn;
@@ -486,6 +508,29 @@ fn receive_network(
             }
             ServerMessage::Physics { tick, bodies } => {
                 loose.receive(tick, &bodies, &mut commands, &loose_assets);
+            }
+            ServerMessage::Projectiles { tick, arrows } => {
+                projectiles.receive(
+                    tick,
+                    &arrows,
+                    &mut commands,
+                    &projectile_assets,
+                    Instant::now(),
+                );
+            }
+            ServerMessage::Explosion {
+                id,
+                position,
+                radius,
+            } => {
+                projectiles.explode(
+                    id,
+                    position,
+                    radius,
+                    &mut commands,
+                    &projectile_assets,
+                    Instant::now(),
+                );
             }
             ServerMessage::Disconnect { reason } => {
                 session.disconnect(reason);
@@ -588,19 +633,24 @@ fn controls(
         session.yaw = (session.yaw - mouse.delta.x * 0.0025) % std::f32::consts::TAU;
         session.pitch = (session.pitch - mouse.delta.y * 0.0025).clamp(-1.54, 1.54);
     }
-    for (key, block) in [
-        (KeyCode::Digit1, 1),
-        (KeyCode::Digit2, 2),
-        (KeyCode::Digit3, 3),
-        (KeyCode::Digit4, 4),
-        (KeyCode::Digit5, 5),
-    ] {
-        if keys.just_pressed(key) {
-            session.selected = block;
-        }
-    }
+    session.selected = selected_slot(&keys).unwrap_or(session.selected);
 }
 
+fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
+    [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(_, key)| keys.just_pressed(*key))
+    .map(|(index, _)| index as u8 + 1)
+    .next_back()
+}
 fn predict(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -689,39 +739,60 @@ fn edit_blocks(
     if cursor.visible || session.transport.is_none() || session.id.is_none() {
         return;
     }
-    let strike = keys.just_pressed(KeyCode::KeyF);
-    let block = if strike || buttons.just_pressed(MouseButton::Left) {
+    if let Some(message) = block_action(
+        &mut session,
+        &world,
+        keys.just_pressed(KeyCode::KeyF),
+        buttons.just_pressed(MouseButton::Left),
+        buttons.just_pressed(MouseButton::Right),
+    ) {
+        session.send(message);
+    }
+}
+
+fn block_action(
+    session: &mut ClientSession,
+    world: &VoxelWorld,
+    strike: bool,
+    hit: bool,
+    secondary: bool,
+) -> Option<ClientMessage> {
+    // Bow shots do not need a nearby grid target. The server owns the arrow origin.
+    if !strike && !hit && secondary && session.selected == EXPLOSIVE_BOW_SLOT {
+        session.request += 1;
+        return Some(ClientMessage::FireBow {
+            request: session.request,
+            yaw: session.yaw,
+            pitch: session.pitch,
+        });
+    }
+    let block = if strike || hit {
         0
-    } else if buttons.just_pressed(MouseButton::Right) {
+    } else if secondary && (1..=voxel_world::WOOD).contains(&session.selected) {
         session.selected
     } else {
-        return;
+        return None;
     };
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
-    let Some(hit) = world.raycast(origin, look_direction(session.yaw, session.pitch), 6.0) else {
-        return;
-    };
+    let hit = world.raycast(origin, look_direction(session.yaw, session.pitch), 6.0)?;
     let target = if block == 0 { hit.block } else { hit.adjacent };
-    let Some(chunk) = world.chunks.get(&chunk_coord(target)) else {
-        return;
-    };
-    let expected_revision = chunk.revision;
+    let expected_revision = world.chunks.get(&chunk_coord(target))?.revision;
     session.request += 1;
     let request = session.request;
-    if strike {
-        session.send(ClientMessage::Strike {
+    Some(if strike {
+        ClientMessage::Strike {
             request,
             target,
             expected_revision,
-        });
+        }
     } else {
-        session.send(ClientMessage::Edit {
+        ClientMessage::Edit {
             request,
             target,
             block,
             expected_revision,
-        });
-    }
+        }
+    })
 }
 
 fn present_players(
@@ -781,13 +852,13 @@ fn update_hud(
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|value| value.smoothed())
         .unwrap_or(0.0);
-    let material = ["Air", "Grass", "Dirt", "Stone", "Sand", "Wood"][usize::from(session.selected)];
+    let material = slot_name(session.selected);
     let action = session
         .last_action
         .map(|result| result.to_string())
         .unwrap_or_default();
     **hud = Text::new(format!(
-        "VOXEL / MULTIPLAYER LAB\n{}\n{fps:.0} fps | {} chunks | {} triangles\n{} mesh jobs | {} remote players | {} loose blocks\nxyz {:.1} / {:.1} / {:.1} | tick {}\n{} unacked inputs | actions {} accepted / {} rejected\n{action}\nMATERIAL {} / {material}",
+        "VOXEL / MULTIPLAYER LAB\n{}\n{fps:.0} fps | {} chunks | {} triangles\n{} mesh jobs | {} remote players | {} loose blocks\nxyz {:.1} / {:.1} / {:.1} | tick {}\n{} unacked inputs | actions {} accepted / {} rejected\n{action}\nEQUIPPED {} / {material}",
         session.status,
         world.chunks.len(),
         stats.triangles,
@@ -805,6 +876,42 @@ fn update_hud(
     ));
 }
 
+fn slot_name(slot: u8) -> &'static str {
+    match slot {
+        1 => "Grass",
+        2 => "Dirt",
+        3 => "Stone",
+        4 => "Sand",
+        5 => "Wood",
+        EXPLOSIVE_BOW_SLOT => "Explosive Bow",
+        _ => "Empty",
+    }
+}
+
+fn update_hotbar(session: Res<ClientSession>, mut bar: Single<&mut Text, With<Hotbar>>) {
+    if !session.is_changed() {
+        return;
+    }
+    let slots = (1..=EXPLOSIVE_BOW_SLOT)
+        .map(|slot| {
+            let label = format!("{slot} {}", slot_name(slot));
+            if slot == session.selected {
+                format!("[ {label} ]")
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("    ");
+    let secondary = if session.selected == EXPLOSIVE_BOW_SLOT {
+        "SHOOT"
+    } else {
+        "PLACE"
+    };
+    **bar = Text::new(format!(
+        "{slots}\nWASD MOVE    SPACE JUMP    MOUSE LOOK    LMB HIT    RMB {secondary}\nF DEBUG LAUNCH    ESC CURSOR    F12 CAPTURE"
+    ));
+}
 fn capture_screenshot(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,

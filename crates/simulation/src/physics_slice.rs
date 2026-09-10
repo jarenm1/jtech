@@ -1,17 +1,16 @@
-//! Server-side lifecycle around the bounded GPU backend. CPU copies are observations,
-//! never re-uploaded between lifecycle edits. Six 120 Hz substeps share one readback.
+//! Body lifecycle and asynchronous submission, independent of terrain residency.
+//! CPU copies are observations; only lifecycle edits and external loads replace them.
+use super::active_terrain::{self, ActiveTerrain};
 use glam::{IVec3, Vec3};
-use gpu_physics::{Body, GpuPhysics, PlayerCollider, Terrain, TerrainContact};
+use gpu_physics::{Body, GpuPhysics, PlayerCollider, TerrainContact};
 use protocol::{MAX_PHYSICS_BODIES, PhysicsBodySnapshot};
-use voxel_world::VoxelWorld;
-
-const ORIGIN: IVec3 = IVec3::new(-16, -8, -16);
-const SIZE: IVec3 = IVec3::new(32, 48, 32);
+use std::collections::HashSet;
+use voxel_world::{CHUNK_SIZE, MAX_CHUNK_Y, MIN_CHUNK_Y, VoxelWorld, chunk_coord};
 
 pub(super) struct PhysicsSlice {
     // wgpu map completion uses an mpsc Receiver, so protect it for Bevy's Sync bound.
     gpu: parking_lot::Mutex<GpuPhysics>,
-    terrain: Terrain,
+    terrain: ActiveTerrain,
     bodies: Vec<Body>,
     ids: Vec<u32>,
     origins: Vec<IVec3>,
@@ -19,8 +18,7 @@ pub(super) struct PhysicsSlice {
     impulses: Vec<(u32, [f32; 3])>,
     players: Vec<PlayerCollider>,
     bodies_dirty: bool,
-    terrain_dirty: bool,
-    dirty_cells: std::collections::BTreeSet<usize>,
+    dirty_cells: HashSet<IVec3>,
     contacts: Vec<TerrainContact>,
     failed: bool,
     tick: u64,
@@ -35,23 +33,21 @@ pub(super) struct PhysicsSlice {
     pub readback_bytes: u64,
     pub terrain_upload_bytes: u64,
     pub player_upload_bytes: u64,
+    pub terrain_wait_ticks: u64,
 }
 
 impl PhysicsSlice {
     pub fn new() -> Result<Self, String> {
-        let terrain = Terrain {
-            origin: ORIGIN.to_array(),
-            size: SIZE.as_uvec3().to_array(),
-            cells: vec![0; (SIZE.x * SIZE.y * SIZE.z) as usize],
-        };
-        let gpu = GpuPhysics::new(terrain.clone())?;
+        let gpu = GpuPhysics::new_sparse()?;
         eprintln!(
-            "GPU physics: {} region={:?} size={:?} body_cap={} step_hz=120 readback_hz=20",
-            gpu.adapter_name, ORIGIN, SIZE, MAX_PHYSICS_BODIES
+            "GPU physics: {} active_chunks={} body_cap={} step_hz=120 readback_hz=20",
+            gpu.adapter_name,
+            gpu_physics::MAX_TERRAIN_CHUNKS,
+            MAX_PHYSICS_BODIES
         );
         Ok(Self {
             gpu: parking_lot::Mutex::new(gpu),
-            terrain,
+            terrain: ActiveTerrain::default(),
             bodies: Vec::new(),
             ids: Vec::new(),
             origins: Vec::new(),
@@ -59,7 +55,6 @@ impl PhysicsSlice {
             impulses: Vec::new(),
             players: Vec::new(),
             bodies_dirty: false,
-            terrain_dirty: false,
             dirty_cells: Default::default(),
             failed: false,
             contacts: Vec::new(),
@@ -74,24 +69,26 @@ impl PhysicsSlice {
             readback_bytes: 0,
             terrain_upload_bytes: 0,
             player_upload_bytes: 0,
+            terrain_wait_ticks: 0,
         })
     }
 
-    pub fn initialize_terrain(&mut self, world: &VoxelWorld) {
-        for y in 0..SIZE.y {
-            for z in 0..SIZE.z {
-                for x in 0..SIZE.x {
-                    let local = IVec3::new(x, y, z);
-                    let i = self.terrain.index(x as u32, y as u32, z as u32);
-                    self.terrain.cells[i] = world.block(ORIGIN + local).unwrap_or(3) as u32;
-                }
-            }
-        }
-        self.terrain_dirty = true;
+    /// Pin collision halos independently of player interest, and source cells for recovery.
+    pub fn needed_chunks(&self) -> HashSet<IVec3> {
+        let mut chunks = active_terrain::needed_chunks(&self.bodies);
+        chunks.extend(self.origins.iter().copied().map(chunk_coord));
+        chunks
     }
 
-    fn in_region(target: IVec3) -> bool {
-        target.cmpge(ORIGIN + IVec3::ONE).all() && target.cmplt(ORIGIN + SIZE - IVec3::ONE).all()
+    pub fn resident_chunks(&self) -> usize {
+        self.terrain.resident_count()
+    }
+
+    fn valid_target(target: IVec3) -> bool {
+        target.y > MIN_CHUNK_Y * CHUNK_SIZE
+            && target.y < (MAX_CHUNK_Y + 1) * CHUNK_SIZE
+            && target.x.unsigned_abs() < 31_999_900
+            && target.z.unsigned_abs() < 31_999_900
     }
 
     pub fn is_busy(&self) -> bool {
@@ -102,7 +99,7 @@ impl PhysicsSlice {
         use protocol::EditRejection;
         if self.failed {
             Some(EditRejection::PhysicsUnavailable)
-        } else if !Self::in_region(target) {
+        } else if !Self::valid_target(target) {
             Some(EditRejection::InvalidTarget)
         } else if self.bodies.len() >= MAX_PHYSICS_BODIES || self.next_id == u32::MAX {
             Some(EditRejection::BodyCapacity)
@@ -136,14 +133,61 @@ impl PhysicsSlice {
         self.bodies_dirty = true;
     }
 
-    pub fn set_voxel(&mut self, target: IVec3, material: u8) {
-        let p = target - ORIGIN;
-        if p.cmpge(IVec3::ZERO).all() && p.cmplt(SIZE).all() {
-            let i = self.terrain.index(p.x as u32, p.y as u32, p.z as u32);
-            if self.terrain.cells[i] != material as u32 {
-                self.terrain.cells[i] = material as u32;
-                self.dirty_cells.insert(i);
-            }
+    /// Apply one reserved blast share while idle, carrying fractional fracture work
+    /// and including queued momentum in the kinetic-energy calculation.
+    pub fn apply_blast(
+        &mut self,
+        id: u32,
+        load: &super::explosion::BlastLoad,
+    ) -> Option<(IVec3, u8)> {
+        assert!(!self.is_busy() && !self.failed);
+        let slot = self.ids.iter().position(|&old| old == id)?;
+        let body = &mut self.bodies[slot];
+        let material = gpu_physics::material(body.material);
+        body.set_damage_joules(
+            body.damage_joules()
+                + material.damage_energy(
+                    load.contact.dissipated_energy,
+                    load.contact.force,
+                    load.contact.area,
+                ),
+        );
+        self.bodies_dirty = true;
+        if body.destroyed() {
+            let event = (
+                Vec3::from_array(body.position).floor().as_ivec3(),
+                body.material as u8,
+            );
+            self.remove(id);
+            return Some(event);
+        }
+        // Do not regrid a sleeping body before its reserved blast impulse runs.
+        body.damage_sleep &= 0xffff;
+        let pending: Vec3 = self
+            .impulses
+            .iter()
+            .filter(|(old, _)| *old == id)
+            .map(|(_, impulse)| Vec3::from_array(*impulse))
+            .sum();
+        let velocity = Vec3::from_array(body.velocity) + pending / material.density;
+        let impulse = super::explosion::kinetic_impulse(
+            material.density,
+            velocity,
+            load.direction,
+            load.kinetic_energy,
+        );
+        if let Some((_, queued)) = self.impulses.iter_mut().find(|(old, _)| *old == id) {
+            *queued = (Vec3::from_array(*queued) + impulse).to_array();
+        } else {
+            self.impulses.push((id, impulse.to_array()));
+        }
+        None
+    }
+
+    /// Mark edits made after submission so stale contact observations can be rejected.
+    pub fn set_voxel(&mut self, target: IVec3, _material: u8) {
+        if self.is_busy() || !self.contacts.is_empty() {
+            self.dirty_cells.insert(target);
         }
     }
 
@@ -196,18 +240,19 @@ impl PhysicsSlice {
     }
 
     /// Ignore contact observations from a terrain version replaced during the batch.
-    pub fn take_terrain_contacts(&mut self) -> Vec<TerrainContact> {
-        std::mem::take(&mut self.contacts)
+    pub fn take_terrain_contacts(&mut self, world: &VoxelWorld) -> Vec<TerrainContact> {
+        let contacts = std::mem::take(&mut self.contacts)
             .into_iter()
             .filter(|contact| {
-                let p = IVec3::from_array(contact.target) - ORIGIN;
-                if p.cmplt(IVec3::ZERO).any() || p.cmpge(SIZE).any() {
-                    return false;
-                }
-                let i = self.terrain.index(p.x as u32, p.y as u32, p.z as u32);
-                !self.dirty_cells.contains(&i) && self.terrain.cells[i] == contact.material
+                let target = IVec3::from_array(contact.target);
+                !self.dirty_cells.contains(&target)
+                    && world.block(target) == Some(contact.material as u8)
             })
-            .collect()
+            .collect();
+        if !self.is_busy() {
+            self.dirty_cells.clear();
+        }
+        contacts
     }
 
     pub fn destroyed_bodies(&self) -> Vec<(u32, IVec3, u8)> {
@@ -237,8 +282,9 @@ impl PhysicsSlice {
 
     /// A placement cannot use stale CPU observations while a GPU batch is in flight.
     pub fn can_place(&self, target: IVec3) -> bool {
-        let inside = target.cmpge(ORIGIN).all() && target.cmplt(ORIGIN + SIZE).all();
-        !(self.overlaps(target) || inside && self.gpu.lock().is_busy())
+        !(self.overlaps(target)
+            || self.is_busy()
+                && active_terrain::needed_chunks(&self.bodies).contains(&chunk_coord(target)))
     }
     pub fn failed(&self) -> bool {
         self.failed
@@ -266,11 +312,7 @@ impl PhysicsSlice {
                 let target = (Vec3::from_array(body.position) - Vec3::splat(0.5))
                     .round()
                     .as_ivec3();
-                (target.cmpge(ORIGIN).all() && target.cmplt(ORIGIN + SIZE).all()).then_some((
-                    id,
-                    target,
-                    body.material as u8,
-                ))
+                Self::valid_target(target).then_some((id, target, body.material as u8))
             })
             .collect()
     }
@@ -289,6 +331,7 @@ impl PhysicsSlice {
         if let Some(slot) = self.ids.iter().position(|&old| old == id) {
             self.ids.remove(slot);
             self.bodies.remove(slot);
+            self.impulses.retain(|(body_id, _)| *body_id != id);
             self.origins.remove(slot);
             self.revision += 1;
             self.bodies_dirty = true;
@@ -328,7 +371,7 @@ impl PhysicsSlice {
             .collect()
     }
 
-    pub fn step(&mut self) {
+    pub fn step(&mut self, world: &VoxelWorld) {
         self.tick += 1;
         if self.failed || !self.tick.is_multiple_of(3) {
             return;
@@ -339,23 +382,11 @@ impl PhysicsSlice {
         }
         let result = (|| -> Result<(), String> {
             let gpu = self.gpu.get_mut();
-            if self.terrain_dirty {
-                gpu.update_terrain(&self.terrain.cells)?;
-                self.terrain_upload_bytes += (self.terrain.cells.len() * 4) as u64;
-                self.terrain_dirty = false;
-            } else {
-                // Coalesce adjacent changes: one 4-byte cell upload for a lone edit.
-                let mut dirty = self.dirty_cells.iter().copied().peekable();
-                while let Some(start) = dirty.next() {
-                    let mut end = start + 1;
-                    while dirty.peek() == Some(&end) {
-                        dirty.next();
-                        end += 1;
-                    }
-                    gpu.update_terrain_range(start, &self.terrain.cells[start..end])?;
-                    self.terrain_upload_bytes += ((end - start) * 4) as u64;
-                }
-            }
+            let Some(bytes) = self.terrain.sync(world, &self.bodies, gpu)? else {
+                self.terrain_wait_ticks += 1;
+                return Ok(());
+            };
+            self.terrain_upload_bytes += bytes;
             self.dirty_cells.clear();
             if self.bodies_dirty {
                 gpu.set_bodies(&self.bodies)?;
@@ -394,8 +425,7 @@ fn nearby_cells(position: Vec3) -> Vec<IVec3> {
         for z in -1..=1 {
             for x in -1..=1 {
                 let cell = nearest + IVec3::new(x, y, z);
-                if cell.cmpge(ORIGIN).all()
-                    && cell.cmplt(ORIGIN + SIZE).all()
+                if PhysicsSlice::valid_target(cell)
                     && (cell.as_vec3() + Vec3::splat(0.5)).distance_squared(position) <= 2.25
                 {
                     cells.push(cell);
@@ -413,8 +443,25 @@ fn nearby_cells(position: Vec3) -> Vec<IVec3> {
 }
 
 #[cfg(test)]
+pub(super) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    fn empty_test_world() -> VoxelWorld {
+        let mut world = VoxelWorld::default();
+        for y in MIN_CHUNK_Y..=MAX_CHUNK_Y {
+            for z in -1..=1 {
+                for x in -1..=1 {
+                    world.insert(
+                        IVec3::new(x, y, z),
+                        voxel_world::Chunk::from_runs(0, &[(32768, 0)]).unwrap(),
+                    );
+                }
+            }
+        }
+        world
+    }
     #[test]
     fn neighboring_snap_cells_are_local_ordered_and_allow_blocked_nearest_fallback() {
         let position = Vec3::new(0.5, 10.5, 0.5);
@@ -434,20 +481,190 @@ mod tests {
                 .all(|cell| (cell.as_vec3() + Vec3::splat(0.5)).distance(position) <= 1.5)
         );
         assert!(
-            nearby_cells(ORIGIN.as_vec3())
-                .iter()
-                .all(|cell| cell.cmpge(ORIGIN).all())
+            nearby_cells(Vec3::new(1000.5, 10.5, -1000.5)).contains(&IVec3::new(1000, 10, -1001))
         );
     }
     #[test]
-    fn region_bounds_leave_a_solid_margin() {
-        assert!(PhysicsSlice::in_region(IVec3::new(0, 20, 0)));
-        assert!(!PhysicsSlice::in_region(ORIGIN));
-        assert!(!PhysicsSlice::in_region(ORIGIN + SIZE));
-        assert!(!PhysicsSlice::in_region(IVec3::new(1000, 20, 0)));
+    fn detachment_and_settlement_accept_remote_cells_within_world_bounds() {
+        assert!(PhysicsSlice::valid_target(IVec3::new(1000, 20, -1000)));
+        assert!(!PhysicsSlice::valid_target(IVec3::new(
+            0,
+            MIN_CHUNK_Y * CHUNK_SIZE,
+            0
+        )));
+        assert!(!PhysicsSlice::valid_target(IVec3::new(i32::MIN, 20, 0)));
     }
 
-    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::GPU_TEST_LOCK;
+    #[test]
+    #[ignore = "requires a headless GPU adapter"]
+    fn surface_blast_releases_multiple_blocks_and_moves_them_on_gpu() {
+        use super::super::{explosion, material_damage};
+        let _guard = GPU_TEST_LOCK.lock().unwrap();
+        let mut world = empty_test_world();
+        world.insert(
+            IVec3::ZERO,
+            voxel_world::Chunk::from_runs(0, &[(32768, 0)]).unwrap(),
+        );
+        for y in 8..=9 {
+            for z in 1..=11 {
+                for x in 1..=11 {
+                    world.set_block(IVec3::new(x, y, z), 3).unwrap();
+                }
+            }
+        }
+        let center = Vec3::new(6.5, 10.02, 6.5);
+        let mut slice = PhysicsSlice::new().unwrap();
+        // Upload the intact floor first, so this also exercises terrain patches.
+        slice
+            .terrain
+            .sync(
+                &world,
+                &[Body::new([6.5, 9.5, 6.5], 3)],
+                slice.gpu.get_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        let mut damage = std::collections::HashMap::new();
+        let mut launches = Vec::new();
+        for load in explosion::plan(&world, &[], center) {
+            let explosion::Target::Grid(cell) = load.target else {
+                unreachable!()
+            };
+            material_damage::apply_to_grid(&mut world, &mut damage, &load.contact, true).unwrap();
+            if world.block(cell) == Some(0) {
+                slice.set_voxel(cell, 0);
+            } else if let Some(state) = damage.remove(&cell).filter(|state| state.release) {
+                let impulse = explosion::kinetic_impulse(
+                    3.0,
+                    Vec3::ZERO,
+                    load.direction,
+                    load.kinetic_energy,
+                );
+                slice.release(cell, 3, state.joules, impulse);
+                world.set_block(cell, 0).unwrap();
+                slice.set_voxel(cell, 0);
+                launches.push((
+                    slice.ids[slice.ids.len() - 1],
+                    cell.as_vec3() + Vec3::splat(0.5),
+                    state.joules,
+                    load.direction,
+                ));
+            }
+        }
+        assert!(launches.len() >= 8);
+        assert_eq!(world.block(IVec3::new(6, 9, 6)), Some(0));
+        assert_eq!(world.block(IVec3::new(6, 8, 6)), Some(3));
+        for _ in 0..15 {
+            slice.step(&world);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while slice.is_busy() {
+                slice.poll();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "GPU completion timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        assert!(!slice.failed());
+        let mut moved = 0;
+        let mut lifted = 0;
+        for (id, start, damage, direction) in &launches {
+            let slot = slice.ids.iter().position(|body_id| body_id == id).unwrap();
+            let body = &slice.bodies[slot];
+            assert!(body.damage_joules() >= *damage);
+            let displacement = Vec3::from_array(body.position) - *start;
+            if !body.destroyed() && displacement.y > 0.5 {
+                lifted += 1;
+            }
+            if !body.destroyed() && displacement.dot(*direction) > 0.1 {
+                moved += 1;
+            }
+        }
+        eprintln!(
+            "surface blast GPU: {} released, {moved} moved, {lifted} lifted >0.5m",
+            launches.len()
+        );
+        assert!(
+            moved >= 8,
+            "surviving blocks must actually move after detachment"
+        );
+        assert!(
+            lifted >= 4,
+            "the blast should visibly eject multiple surviving blocks"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a headless GPU adapter"]
+    fn blast_wakes_settlement_candidate_and_submits_reserved_energy_once() {
+        let _guard = GPU_TEST_LOCK.lock().unwrap();
+        let mut world = empty_test_world();
+        world.insert(
+            IVec3::ZERO,
+            voxel_world::Chunk::from_runs(0, &[(32768, 0)]).unwrap(),
+        );
+        let mut slice = PhysicsSlice::new().unwrap();
+        slice.release(IVec3::new(4, 20, 4), 3, 6.0, Vec3::ZERO);
+        let id = slice.ids[0];
+        slice.bodies[0].damage_sleep |= 100 << 16;
+        assert_eq!(slice.settling_candidates().len(), 1);
+        let load = super::super::explosion::BlastLoad {
+            target: super::super::explosion::Target::Body(id),
+            contact: TerrainContact {
+                target: [0; 3],
+                material: 3,
+                dissipated_energy: 4.0,
+                force: 5000.0,
+                area: 1.0,
+            },
+            direction: Vec3::X,
+            kinetic_energy: 12.0,
+        };
+        assert_eq!(slice.apply_blast(id, &load), None);
+        assert_eq!(slice.apply_blast(id, &load), None);
+        assert!(slice.settling_candidates().is_empty());
+        assert_eq!(slice.body_damage(id), 10.0);
+        assert_eq!(slice.impulses.len(), 1);
+        let momentum = Vec3::from_array(slice.impulses[0].1);
+        assert!((momentum.length_squared() / (2.0 * 3.0) - 24.0).abs() < 0.001);
+        // Two wall ticks before the upload must not offer this body for regridding.
+        for _ in 0..2 {
+            slice.step(&world);
+            assert!(slice.settling_candidates().is_empty());
+            assert_eq!(slice.impulses.len(), 1);
+        }
+        slice.step(&world);
+        assert!(slice.impulses.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slice.is_busy() {
+            slice.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GPU completion timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!slice.failed());
+        assert_eq!(slice.completions, 1);
+        assert_eq!(slice.body_damage(id), 10.0);
+        assert!((slice.bodies[0].velocity[0] - 4.0).abs() < 0.01);
+        assert!(slice.bodies[0].position[0] > 4.6);
+        assert!(slice.settling_candidates().is_empty());
+
+        let destructive = super::super::explosion::BlastLoad {
+            contact: TerrainContact {
+                dissipated_energy: 200.0,
+                ..load.contact
+            },
+            ..load
+        };
+        assert!(slice.apply_blast(id, &destructive).is_some());
+        assert!(slice.snapshots().is_empty());
+        assert!(slice.apply_blast(id, &destructive).is_none());
+    }
+
     #[test]
     #[ignore = "requires a headless GPU adapter"]
     fn lifecycle_uses_sparse_uploads_and_retains_failed_bodies_for_restore() {
@@ -467,18 +684,16 @@ mod tests {
             .unwrap();
         let material = world.block(target).unwrap();
         let mut slice = PhysicsSlice::new().unwrap();
-        slice.initialize_terrain(&world);
         for _ in 0..3 {
-            slice.step();
+            slice.step(&world);
         }
-        let initial_bytes = slice.terrain_upload_bytes;
         slice.release(target, material, 6.0, Vec3::Y * 5.0);
         let id = slice.ids[0];
         world.set_block(target, 0).unwrap();
         slice.set_voxel(target, 0);
         let mut settled = false;
         for _ in 0..600 {
-            slice.step();
+            slice.step(&world);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while slice.gpu.get_mut().is_busy() {
                 slice.poll();
@@ -497,7 +712,7 @@ mod tests {
             settled,
             "detached block should land and become a grid candidate"
         );
-        assert_eq!(slice.terrain_upload_bytes - initial_bytes, 4);
+        assert!(slice.terrain_upload_bytes > 0 && slice.resident_chunks() > 0);
         assert!(slice.completions > 0);
         assert!(
             slice.body_damage(id) >= 6.0,
@@ -539,7 +754,6 @@ mod tests {
         let target = IVec3::new(1, 0, 0);
         world.set_block(target, 3).unwrap();
         let mut slice = PhysicsSlice::new().unwrap();
-        slice.initialize_terrain(&world);
         slice.detach(target, 3, Vec3::ZERO);
         slice.impulses.clear(); // Start resting; only walking should move this body.
         world.set_block(target, 0).unwrap();
@@ -569,7 +783,7 @@ mod tests {
                 velocity: [intended.velocity.x, player.velocity.y, intended.velocity.z],
                 padding: 0,
             }]);
-            slice.step();
+            slice.step(&world);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while slice.gpu.get_mut().is_busy() {
                 slice.poll();
