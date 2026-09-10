@@ -6,6 +6,8 @@ mod bow_server;
 mod explosion;
 mod health;
 mod material_damage;
+#[cfg(test)]
+mod noclip_tests;
 mod physics_slice;
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
@@ -153,7 +155,8 @@ struct Player {
     highest_request: u64,
     physics_revision: Option<u64>,
     body_push_velocity: Vec3,
-    next_bow_tick: u64,
+    // Deadline in 1/(60 * bow shots per second) seconds for fractional-tick cadence.
+    next_bow_time: u64,
     arrow_revision: Option<u64>,
 }
 impl Player {
@@ -173,7 +176,7 @@ impl Player {
             highest_request: 0,
             physics_revision: None,
             body_push_velocity: Vec3::ZERO,
-            next_bow_tick: 0,
+            next_bow_time: 0,
             arrow_revision: None,
         }
     }
@@ -680,6 +683,7 @@ impl Simulation {
         physics.player_colliders(
             players
                 .into_iter()
+                .filter(|(_, player)| !player.state.noclip)
                 .enumerate()
                 .map(|(slot, (_, player))| gpu_physics::PlayerCollider {
                     position: player.state.position.to_array(),
@@ -895,6 +899,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             PlayerInput {
                 movement: [0.0; 2],
                 jump: false,
+                descend: false,
                 ..player.input
             }
         };
@@ -909,6 +914,9 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             player.state.velocity.y,
             intended.velocity.z,
         );
+        if player.state.noclip {
+            player.body_push_velocity = Vec3::ZERO;
+        }
         if !player.state.position.is_finite()
             || player.state.position.x.abs() >= 31_999_900.0
             || player.state.position.z.abs() >= 31_999_900.0

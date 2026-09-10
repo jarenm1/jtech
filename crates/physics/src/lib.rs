@@ -1,3 +1,4 @@
+mod noclip;
 use bevy_app::{App, FixedUpdate, Plugin};
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use glam::{IVec3, Vec3};
@@ -25,6 +26,7 @@ pub struct PlayerState {
     pub position: Vec3,
     pub velocity: Vec3,
     pub grounded: bool,
+    pub noclip: bool,
 }
 impl Default for PlayerState {
     fn default() -> Self {
@@ -32,6 +34,7 @@ impl Default for PlayerState {
             position: Vec3::new(0.5, 24.0, 0.5),
             velocity: Vec3::ZERO,
             grounded: false,
+            noclip: false,
         }
     }
 }
@@ -42,6 +45,9 @@ pub struct PlayerInput {
     pub yaw: f32,
     pub pitch: f32,
     pub jump: bool,
+    pub descend: bool,
+    /// Desired mode, not a toggle edge, so input replay is idempotent.
+    pub noclip: bool,
 }
 
 /// Hosts may place input ingestion, shared movement, and replication in these ordered sets.
@@ -77,6 +83,9 @@ fn bounds(position: Vec3) -> (Vec3, Vec3) {
     )
 }
 pub fn overlaps_block(state: &PlayerState, block: IVec3) -> bool {
+    if state.noclip {
+        return false;
+    }
     let (min, max) = bounds(state.position);
     let block_min = block.as_vec3();
     min.cmplt(block_min + Vec3::ONE).all() && max.cmpgt(block_min).all()
@@ -265,6 +274,9 @@ pub fn step_player_with_bodies(
     }
     // Bounded catch-up prevents pathological caller timesteps and unbounded collision work.
     let dt = dt.min(0.25);
+    if noclip::step(world, state, input, dt, bodies) {
+        return;
+    }
     let yaw = finite(input.yaw);
     let (sy, cy) = yaw.sin_cos();
     let right = Vec3::new(cy, 0.0, -sy);
@@ -326,7 +338,7 @@ pub fn step_player_with_bodies(
 mod tests {
     use super::*;
     use voxel_world::{Chunk, STONE};
-    fn arena() -> VoxelWorld {
+    pub(super) fn arena() -> VoxelWorld {
         let mut world = VoxelWorld::default();
         for x in -1..=0 {
             for z in -1..=0 {
@@ -347,6 +359,7 @@ mod tests {
             position,
             velocity: Vec3::ZERO,
             grounded: false,
+            noclip: false,
         }
     }
     #[test]

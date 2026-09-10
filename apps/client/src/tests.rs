@@ -27,6 +27,7 @@ fn reconciliation_copies_authoritative_health_without_predicting_damage() {
         position: Vec3::new(0.5, 0.0, 0.5),
         velocity: Vec3::ZERO,
         grounded: true,
+        ..default()
     };
     let mut client = ClientSession {
         state: start,
@@ -76,6 +77,7 @@ fn movement_prediction_preserves_replicated_health() {
                 position: Vec3::new(0.5, 0.0, 0.5),
                 velocity: Vec3::ZERO,
                 grounded: true,
+                ..default()
             },
             health,
             ..default()
@@ -125,6 +127,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
         position: Vec3::new(0.5, 0.0, 0.5),
         velocity: Vec3::ZERO,
         grounded: true,
+        ..default()
     };
     let mut client = ClientSession {
         state: start,
@@ -191,6 +194,7 @@ fn terrain_changes_are_used_when_replaying_prediction() {
         position: Vec3::new(0.5, 0.0, 0.5),
         velocity: Vec3::ZERO,
         grounded: true,
+        ..default()
     };
     let mut client = ClientSession {
         state: start,
@@ -236,6 +240,7 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
         position: Vec3::new(0.5, 0.0, 0.5),
         velocity: Vec3::ZERO,
         grounded: true,
+        ..default()
     };
     let mut client = ClientSession {
         state: start,
@@ -392,4 +397,101 @@ fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
     }
     client.selected = 7;
     assert!(block_action(&mut client, &world, false, false, true).is_none());
+}
+
+#[test]
+fn held_bow_repeats_at_25_hz_across_frame_rates() {
+    for fps in [30, 60, 144] {
+        let mut next = None;
+        let shots = (0..fps * 10)
+            .filter(|frame| repeat_bow(&mut next, f64::from(*frame) / f64::from(fps), true))
+            .count();
+        assert_eq!(shots, 250, "frame rate {fps}");
+    }
+}
+
+#[test]
+fn bow_release_cancels_repeat_and_stalls_do_not_queue_bursts() {
+    let mut next = None;
+    assert!(repeat_bow(&mut next, 0.0, true));
+    assert!(!repeat_bow(&mut next, 0.01, true));
+    assert!(!repeat_bow(&mut next, 0.02, false));
+    assert_eq!(next, None);
+    assert!(repeat_bow(&mut next, 1.0, true));
+    assert!(repeat_bow(&mut next, 10.0, true));
+    assert!(!repeat_bow(&mut next, 10.0, true));
+    assert!(!repeat_bow(&mut next, 10.01, true));
+    assert!(repeat_bow(&mut next, 10.04, true));
+}
+
+#[test]
+fn reconciliation_replays_flight_mode_and_returns_to_walking() {
+    let world = arena();
+    let mut client = ClientSession {
+        state: PlayerState {
+            position: Vec3::new(0.5, 4.0, 0.5),
+            ..default()
+        },
+        noclip_requested: true,
+        ..default()
+    };
+    let mut server = client.state;
+    let mut acknowledged = server;
+    for sequence in 1..=10 {
+        let input = PlayerInput {
+            sequence,
+            noclip: true,
+            jump: true,
+            ..default()
+        };
+        client.predict_input(&world, input, &[]);
+        step_player(&world, &mut server, &input, FIXED_DT);
+        if sequence == 5 {
+            acknowledged = server;
+        }
+    }
+    let mut snapshot = Snapshot {
+        tick: 5,
+        you: PlayerSnapshot {
+            id: 1,
+            last_input: 5,
+            state: acknowledged,
+            health: Health::default(),
+            yaw: 0.0,
+        },
+        players: vec![],
+    };
+    reconcile(&mut client, &world, &snapshot, &[]);
+    assert_eq!(client.state, server);
+    assert!(client.state.noclip);
+    assert!(client.noclip_requested);
+    client.noclip_requested = false;
+    let input = PlayerInput {
+        sequence: 11,
+        noclip: false,
+        ..default()
+    };
+    client.predict_input(&world, input, &[]);
+    step_player(&world, &mut server, &input, FIXED_DT);
+    // Replaying an older flying snapshot includes the later exit command.
+    snapshot.tick = 10;
+    snapshot.you.last_input = 10;
+    snapshot.you.state = acknowledged;
+    for sequence in 6..=10 {
+        step_player(
+            &world,
+            &mut snapshot.you.state,
+            &PlayerInput {
+                sequence,
+                noclip: true,
+                jump: true,
+                ..default()
+            },
+            FIXED_DT,
+        );
+    }
+    reconcile(&mut client, &world, &snapshot, &[]);
+    assert_eq!(client.state, server);
+    assert!(!client.state.noclip);
+    assert!(client.state.velocity.y < 0.0);
 }
