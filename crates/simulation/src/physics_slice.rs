@@ -762,6 +762,7 @@ mod tests {
             position: Vec3::new(0.5, 0.0, 0.5),
             velocity: Vec3::ZERO,
             grounded: true,
+            ..Default::default()
         };
         let input = physics::PlayerInput {
             movement: [1.0, 0.0],

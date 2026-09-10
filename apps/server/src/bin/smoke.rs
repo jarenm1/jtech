@@ -199,6 +199,7 @@ impl Bot {
             yaw: 0.0,
             pitch,
             jump: movement != [0.0; 2],
+            ..Default::default()
         };
         step_player(&self.world, &mut self.state, &input, FIXED_DT);
         self.history.push_back(input);

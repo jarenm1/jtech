@@ -4,13 +4,14 @@ use physics::{PlayerInput, PlayerState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_ARROWS: usize = 32;
 pub const EXPLOSIVE_BOW_SLOT: u8 = 6;
+pub const EXPLOSIVE_BOW_SHOTS_PER_SECOND: u32 = 25;
 
 /// Authoritative action rejection, also used for completed queued debug strikes.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

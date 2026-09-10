@@ -1,12 +1,12 @@
 //! Bow request admission, projectile replication, and authoritative blast transactions.
 use super::{
     Simulation,
-    bow::{Arrow, Flight, SHOT_COOLDOWN_TICKS},
+    bow::{Arrow, Flight},
     explosion::{self, Target},
 };
 use glam::Vec3;
 use physics::{EYE_HEIGHT, look_direction};
-use protocol::{EditRejection, MAX_ARROWS, ServerMessage};
+use protocol::{EXPLOSIVE_BOW_SHOTS_PER_SECOND, EditRejection, MAX_ARROWS, ServerMessage};
 use voxel_world::VoxelWorld;
 
 impl Simulation {
@@ -33,9 +33,11 @@ impl Simulation {
             return;
         }
         let origin = player.state.position + Vec3::Y * EYE_HEIGHT;
+        let subticks_per_tick = u64::from(EXPLOSIVE_BOW_SHOTS_PER_SECOND);
+        let now = self.tick.saturating_mul(subticks_per_tick);
         let rejection = if request <= player.highest_request {
             Some(EditRejection::OldRequest)
-        } else if self.tick < player.next_bow_tick {
+        } else if now < player.next_bow_time {
             Some(EditRejection::Cooldown)
         } else if !yaw.is_finite()
             || !pitch.is_finite()
@@ -65,8 +67,13 @@ impl Simulation {
         self.next_arrow += 1;
         self.arrow_revision += 1;
         self.metrics.bow_shots += 1;
-        self.players.get_mut(&id).unwrap().next_bow_tick =
-            self.tick.saturating_add(SHOT_COOLDOWN_TICKS);
+        let deadline = &mut self.players.get_mut(&id).unwrap().next_bow_time;
+        // Carry sub-tick rounding forward: 25 Hz at fixed60 needs 2/3-tick gaps.
+        // After idle time, start a new cadence rather than banking burst shots.
+        if now.saturating_sub(*deadline) >= subticks_per_tick {
+            *deadline = now;
+        }
+        *deadline = deadline.saturating_add(60);
         self.finish_edit(id, request, Ok(None));
     }
 
@@ -189,5 +196,52 @@ impl Simulation {
             }
         }
         self.physics = physics;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Player, ServerConfig, SimulationPlugin};
+    use bevy_app::App;
+    use glam::IVec3;
+    use voxel_world::Chunk;
+
+    #[test]
+    fn bow_admits_25_shots_per_second_without_idle_or_replay_bursts() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        sim.players.insert(1, Player::new());
+        let mut request = 0;
+        for tick in 0..600 {
+            sim.tick = tick;
+            // Retire projectiles here to isolate admission from the active-arrow cap.
+            sim.arrows.clear();
+            request += 1;
+            sim.fire_bow(&world, 1, request, 0.0, 0.0);
+            let shots = sim.metrics.bow_shots;
+            sim.fire_bow(&world, 1, request, 0.0, 0.0);
+            assert_eq!(sim.metrics.bow_shots, shots);
+            if tick % 60 == 59 {
+                assert_eq!(shots, (tick / 60 + 1) * 25);
+            }
+        }
+        sim.tick = 1200;
+        sim.arrows.clear();
+        request += 1;
+        sim.fire_bow(&world, 1, request, 0.0, 0.0);
+        assert_eq!(sim.metrics.bow_shots, 251);
+        for tick in 1200..1203 {
+            sim.tick = tick;
+            request += 1;
+            sim.fire_bow(&world, 1, request, 0.0, 0.0);
+            assert_eq!(sim.metrics.bow_shots, 251);
+        }
+        sim.tick = 1203;
+        sim.fire_bow(&world, 1, request + 1, 0.0, 0.0);
+        assert_eq!(sim.metrics.bow_shots, 252);
     }
 }

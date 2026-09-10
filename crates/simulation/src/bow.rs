@@ -3,7 +3,6 @@ use glam::Vec3;
 use protocol::{ArrowSnapshot, PhysicsBodySnapshot};
 use voxel_world::VoxelWorld;
 
-pub(super) const SHOT_COOLDOWN_TICKS: u64 = 24;
 const ARROW_SPEED: f32 = 36.0;
 const ARROW_GRAVITY: f32 = 3.0;
 const MAX_TRAVEL: f32 = 64.0;

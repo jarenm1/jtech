@@ -68,7 +68,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump | left/right click hit/place (bow: shoot) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc release/capture mouse | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc release/capture mouse | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -88,6 +88,7 @@ struct ClientSession {
     state: PlayerState,
     // Replicated independently of movement prediction.
     health: Health,
+    noclip_requested: bool,
     pending: VecDeque<PlayerInput>,
     sequence: u64,
     last_tick: u64,
@@ -143,6 +144,7 @@ impl Default for ClientSession {
             session: 0,
             state: PlayerState::default(),
             health: Health::default(),
+            noclip_requested: false,
             pending: VecDeque::with_capacity(256),
             sequence: 0,
             last_tick: 0,
@@ -456,6 +458,7 @@ fn receive_network(
                 session.id = Some(id);
                 session.session = token;
                 session.state = spawn;
+                session.noclip_requested = spawn.noclip;
                 session.health = health;
                 world.seed = seed;
                 session.status = format!("Connected | player {id}");
@@ -681,9 +684,14 @@ fn predict(
     if session.id.is_none() || session.transport.is_none() {
         return;
     }
-    if world
-        .block(session.state.position.floor().as_ivec3())
-        .is_none()
+    if !options.bot && !cursor.visible && keys.just_pressed(KeyCode::KeyV) {
+        session.noclip_requested = !session.noclip_requested;
+    }
+    if !session.noclip_requested
+        && !session.state.noclip
+        && world
+            .block(session.state.position.floor().as_ivec3())
+            .is_none()
     {
         session.accumulator = 0.0;
         return;
@@ -699,6 +707,7 @@ fn predict(
         session.sequence += 1;
         let mut movement = [0.0, 0.0];
         let mut jump = false;
+        let mut descend = false;
         if options.bot {
             // Reproducible traversal for profiling the real rendered client.
             let phase = (session.sequence / 240) % 4;
@@ -715,6 +724,7 @@ fn predict(
             movement[1] = f32::from(u8::from(keys.pressed(KeyCode::KeyW)))
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyS)));
             jump = keys.pressed(KeyCode::Space);
+            descend = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
         }
         let input = PlayerInput {
             sequence: session.sequence,
@@ -722,6 +732,8 @@ fn predict(
             yaw: session.yaw,
             pitch: session.pitch,
             jump,
+            descend,
+            noclip: session.noclip_requested,
         };
         session.predict_input(&world, input, loose.colliders());
     }
@@ -750,19 +762,50 @@ fn edit_blocks(
     cursor: Single<&CursorOptions>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
+    time: Res<Time>,
+    mut next_bow_shot: Local<Option<f64>>,
 ) {
     if cursor.visible || session.transport.is_none() || session.id.is_none() {
+        *next_bow_shot = None;
         return;
     }
-    if let Some(message) = block_action(
-        &mut session,
-        &world,
-        keys.just_pressed(KeyCode::KeyF),
-        buttons.just_pressed(MouseButton::Left),
-        buttons.just_pressed(MouseButton::Right),
-    ) {
+    let strike = keys.just_pressed(KeyCode::KeyF);
+    let hit = buttons.just_pressed(MouseButton::Left);
+    let bow_shot = repeat_bow(
+        &mut next_bow_shot,
+        time.elapsed_secs_f64(),
+        session.selected == EXPLOSIVE_BOW_SLOT
+            && buttons.pressed(MouseButton::Right)
+            && !strike
+            && !hit,
+    );
+    let secondary = if session.selected == EXPLOSIVE_BOW_SLOT {
+        bow_shot
+    } else {
+        buttons.just_pressed(MouseButton::Right)
+    };
+    if let Some(message) = block_action(&mut session, &world, strike, hit, secondary) {
         session.send(message);
     }
+}
+
+/// Repeat while held, preserving fractional-frame cadence without catch-up bursts.
+fn repeat_bow(next: &mut Option<f64>, now: f64, held: bool) -> bool {
+    if !held {
+        *next = None;
+        return false;
+    }
+    let interval = 1.0 / f64::from(protocol::EXPLOSIVE_BOW_SHOTS_PER_SECOND);
+    let deadline = next.unwrap_or(now);
+    if now + 1e-9 < deadline {
+        return false;
+    }
+    *next = Some(if now - deadline < interval {
+        deadline + interval
+    } else {
+        now + interval
+    });
+    true
 }
 
 fn block_action(
@@ -872,8 +915,17 @@ fn update_hud(
         .last_action
         .map(|result| result.to_string())
         .unwrap_or_default();
+    let mode = if session.state.noclip {
+        if session.noclip_requested {
+            "NOCLIP | Space up / Ctrl down"
+        } else {
+            "NOCLIP | Move clear to exit"
+        }
+    } else {
+        "WALK | V noclip"
+    };
     **hud = Text::new(format!(
-        "VOXEL / MULTIPLAYER LAB\n{}\n{fps:.0} fps | {} chunks | {} triangles\n{} mesh jobs | {} remote players | {} loose blocks\nxyz {:.1} / {:.1} / {:.1} | tick {}\n{} unacked inputs | actions {} accepted / {} rejected\n{action}\nEQUIPPED {} / {material}",
+        "VOXEL / MULTIPLAYER LAB\n{}\n{mode}\n{fps:.0} fps | {} chunks | {} triangles\n{} mesh jobs | {} remote players | {} loose blocks\nxyz {:.1} / {:.1} / {:.1} | tick {}\n{} unacked inputs | actions {} accepted / {} rejected\n{action}\nEQUIPPED {} / {material}",
         session.status,
         world.chunks.len(),
         stats.triangles,
