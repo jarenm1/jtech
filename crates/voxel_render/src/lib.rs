@@ -9,10 +9,10 @@ use bevy::{
 };
 use voxel_world::{AIR, CHUNK_SIZE, ChunkNeighborhood, VoxelWorld, block_color};
 
-const MAX_JOBS: usize = 4;
-const STARTS_PER_FRAME: usize = 2;
-const UPLOADS_PER_FRAME: usize = 2;
-const UPLOAD_BYTES_PER_FRAME: usize = 4 * 1024 * 1024;
+const MAX_JOBS: usize = 16;
+const STARTS_PER_FRAME: usize = 8;
+const UPLOADS_PER_FRAME: usize = 8;
+const UPLOAD_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
 type Stamp = [Option<u64>; 7];
 
 #[derive(Resource, Default)]
@@ -243,7 +243,7 @@ fn update_chunks(
         }
         let size = data.byte_len();
         // A pathological checkerboard chunk may exceed the byte budget: upload it alone
-        // rather than starving it forever. Ready results still occupy one of four slots.
+        // rather than starving it forever. Ready results still occupy bounded job slots.
         if uploaded >= UPLOADS_PER_FRAME || (uploaded > 0 && bytes + size > UPLOAD_BYTES_PER_FRAME)
         {
             i += 1;

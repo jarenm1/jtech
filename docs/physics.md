@@ -16,7 +16,7 @@ cargo run --release -p voxel-client
 
 Aim at a highlighted grid block and click **M1** repeatedly. Watch its fracture percentage in the HUD; at 100%, the block is destroyed. Use **1–5** and **right click** to place blocks. Press **6** to equip the **Explosive Bow**, then hold **right click** to fire explosive arrows at **25 shots per second**. Aim beyond the highlighted-block range or at loose blocks. Press **F** for a debug launch. A chipped block carries its damage while loose and after settling into another grid cell.
 
-Rebuild and restart both processes for protocol version **7**, including replicated noclip flight. Press **V** to toggle flight, **Space** to rise, and **Ctrl** to descend. Connect a second client to observe authoritative arrows, explosions, destruction, loose-body motion, and settlement.
+Rebuild and restart both processes for protocol version **9**, including bow power presets and player blast momentum. Press **V** to toggle flight, **Space** to rise, and **Ctrl** to descend. Connect a second client to observe authoritative arrows, explosions, destruction, loose-body motion, and settlement.
 
 For player contacts, launch stone and wood blocks and walk against them. With the same walking force, the heavier stone accelerates more slowly. Jump onto a loose block, stand on it, and jump off. Moving blocks can displace the character; terrain clearance takes priority when the character is trapped.
 
@@ -32,11 +32,24 @@ Players use the shared CPU swept-AABB character controller on server and client.
 
 Test arrows are unlimited, with a **0.04-second** successful-shot interval (**25 shots per second**). At fixed60, carry fractional-tick timing forward using alternating two- and three-tick gaps. Hold right click for repeat fire; release it to stop. The server derives the muzzle from the player's eye and validates aim, loaded air, request order, and capacity. Replayed requests return their cached result. Arrows travel at **36 m/s** under **3 m/s²** gravity, sweep against terrain and loose unit cubes, and detonate on the first impact. Expire them after **64 m** of travel, **3 seconds**, or leaving loaded terrain. Admit at most **32** flying arrows and queued detonations combined; process at most **two explosions per tick**.
 
-Each explosion has a **4 m radius** and a shared **6,000 J** charge: **35% absorbed work**, **65% reserved kinetic energy**. Sample facing cube-face centers for exposure against terrain and loose blocks before editing any receivers. Weight by `(1 - distance / radius)² / (distance² + 0.25)` using cube-center distance, and normalize by at least one. Occluded blocks receive no share; low-coverage energy is lost to the air. The protected bottom layer is excluded.
+While the bow is equipped, press **R** to cycle **0.5x → 1x → 2x → 4x** power. Alternatively, release the cursor with **Esc** and click the power button. Start at **1x**; switching weapons preserves the selection. Each arrow keeps the power selected when fired, including through delayed physics readback and queued detonations.
 
-Estimate load from the reserved rest-mass impulse over a **0.75 ms** pulse and **1 m²** effective area. The short pulse and motion-heavy energy split provide a wider band of surviving attachment failures around central destruction. Apply absorbed work through material pressure gating and attachment strength. Spend reserved kinetic energy only on a successful immediate detachment or a surviving loose body. Calculate impulse from current velocity plus queued momentum, so successive blasts add only their assigned change in kinetic energy. Unspent launch energy is discarded. GPU-disabled servers apply terrain damage; loose-block launch requires `--gpu-physics`.
+| Power | Charge | Radius |
+| --- | --- | --- |
+| 0.5x | 3,000 J | 3 m |
+| 1x | 6,000 J | 4 m |
+| 2x | 12,000 J | 5 m |
+| 4x | 24,000 J | 6 m |
+
+Each charge allocates **35% absorbed work** and **65% reserved kinetic energy**. Sample facing cube-face centers for exposure against terrain and loose blocks before editing any receivers. Weight by `(1 - distance / radius)² / (distance² + 0.25)` using cube-center distance, and normalize by at least one. Occluded blocks receive no share; low-coverage energy is lost to the air. The protected bottom layer is excluded.
+
+Estimate material load from the reserved rest-mass impulse over a **0.75 ms** pulse and **1 m²** effective area. The short pulse and motion-heavy energy split provide a wider band of surviving attachment failures around central destruction. Apply absorbed work through material pressure gating and attachment strength. Spend reserved material kinetic energy on a successful immediate detachment or a surviving loose body. Calculate impulse from current velocity plus queued momentum, so successive blasts add only their assigned change in kinetic energy. Unspent launch energy is discarded. GPU-disabled servers apply terrain damage and player knockback; loose-block launch requires `--gpu-physics`.
 
 For released terrain, use an authored crater-ejection direction: normalize the radial direction plus twice the exposed-surface normal. Weight visible face normals by the corresponding absolute component of the center offset, then normalize their sum. This directs floor fragments up and wall fragments out into air rather than back into their support. Compute the impulse magnitude from the reserved kinetic budget after choosing direction. Existing loose bodies receive radial impulses.
+
+Player knockback uses a separate per-actor gameplay budget, independent of debris count and other players. For an **80 kg** player, use `0.5 * mass * 18² * power_multiplier * exposure * (1 - distance / radius)²` joules of launch energy, then compute the radial impulse from current velocity. This gives a resting player up to **18 m/s** at standard power before falloff. Sample three heights above the feet against pre-blast terrain and loose bodies; use the exposed fraction and torso-center distance. Apply once per queued detonation, including to the shooter. In the flat stone-floor fixture, standard power lifts the player about **2.35 m** when aiming steeply down, or **0.48 m** at roughly 45°. Higher presets give stronger launches.
+
+Replicate horizontal external velocity separately from the walking motor so input replay preserves momentum. Apply drag and collision response in the shared CPU controller; noclip ignores blasts. Player launch also works without GPU physics.
 
 The flat, two-layer surface fixture yields **16–24** surviving attachment failures across the five materials, with central destruction in every case. The stone-floor GPU test exercises terrain patches and simultaneous releases; after **0.25 seconds**, **27** surviving blocks moved and **17** rose more than **0.5 m**. These are fixture results, not guaranteed counts for arbitrary geometry.
 
@@ -46,7 +59,7 @@ Repeated explosions include newly detached and already moving bodies as receiver
 
 ## Active terrain and reusable kernels
 
-`active_terrain.rs` computes a **16 m collision halo per body**, independent of player visibility. The halo covers one 50 ms batch: at most 1.5 m of integration, 12 m of bounded contact projections, and the half-metre cube extent. Pin these chunks and detached source cells for recovery. Prioritize missing physics chunks in the existing two-chunks-per-tick world generation queue. Postpone submission until the collision halo is loaded, preserving queued loads; track these waits separately from GPU backpressure.
+`active_terrain.rs` computes a **16 m collision halo per body**, independent of player visibility. The halo covers one 50 ms batch: at most 1.5 m of integration, 12 m of bounded contact projections, and the half-metre cube extent. Pin these chunks and detached source cells for recovery. Prioritize missing physics chunks in the eight-chunks-per-tick world generation queue. Postpone submission until the collision halo is loaded, preserving queued loads; track these waits separately from GPU backpressure.
 
 Upload only new or changed chunk snapshots. Evict GPU pages when bodies no longer need them; retain stable body identities and velocities as the page set changes. Source cells remain pinned until their bodies settle or are destroyed. World chunk eviction uses the ordinary idle timeout once neither players nor physics need a chunk.
 

@@ -1,12 +1,18 @@
+mod impulse;
+#[cfg(test)]
+mod impulse_tests;
+pub use impulse::apply_player_impulse;
 mod noclip;
 use bevy_app::{App, FixedUpdate, Plugin};
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 use voxel_world::{AIR, VoxelWorld};
 
 pub const PLAYER_RADIUS: f32 = 0.3;
 pub const PLAYER_HEIGHT: f32 = 1.8;
+/// Player mass in kilograms, used to convert impulses into velocity changes.
+pub const PLAYER_MASS: f32 = 80.0;
 pub const EYE_HEIGHT: f32 = 1.6;
 pub const FIXED_DT: f32 = 1.0 / 60.0;
 const SPEED: f32 = 6.0;
@@ -25,6 +31,8 @@ pub struct DynamicCollider {
 pub struct PlayerState {
     pub position: Vec3,
     pub velocity: Vec3,
+    /// Horizontal momentum from external impulses, separate from movement input.
+    pub external_velocity: Vec2,
     pub grounded: bool,
     pub noclip: bool,
 }
@@ -33,6 +41,7 @@ impl Default for PlayerState {
         Self {
             position: Vec3::new(0.5, 24.0, 0.5),
             velocity: Vec3::ZERO,
+            external_velocity: Vec2::ZERO,
             grounded: false,
             noclip: false,
         }
@@ -240,6 +249,11 @@ fn separate_bodies(world: &VoxelWorld, state: &mut PlayerState, bodies: &[Dynami
                 if state.velocity[axis] * distance < 0.0 {
                     state.velocity[axis] = 0.0;
                 }
+                if let Some(component) = impulse::horizontal_component(axis)
+                    && state.external_velocity[component] * distance < 0.0
+                {
+                    state.external_velocity[component] = 0.0;
+                }
                 corrected = true;
             }
         }
@@ -272,6 +286,7 @@ pub fn step_player_with_bodies(
     if !state.velocity.is_finite() {
         state.velocity = Vec3::ZERO;
     }
+    state.external_velocity = impulse::bounded_horizontal(state.external_velocity);
     // Bounded catch-up prevents pathological caller timesteps and unbounded collision work.
     let dt = dt.min(0.25);
     if noclip::step(world, state, input, dt, bodies) {
@@ -287,8 +302,9 @@ pub fn step_player_with_bodies(
     )
     .clamp_length_max(1.0);
     let horizontal = (right * movement.x + forward * movement.y) * SPEED;
+    let horizontal = Vec2::new(horizontal.x, horizontal.z) + state.external_velocity;
     state.velocity.x = horizontal.x;
-    state.velocity.z = horizontal.z;
+    state.velocity.z = horizontal.y;
     separate_bodies(world, state, bodies);
     let mut probe = state.position;
     state.grounded =
@@ -307,6 +323,7 @@ pub fn step_player_with_bodies(
         None,
     ) {
         state.velocity.x = 0.0;
+        state.external_velocity.x = 0.0;
     }
     if sweep_with_bodies(
         world,
@@ -317,6 +334,7 @@ pub fn step_player_with_bodies(
         None,
     ) {
         state.velocity.z = 0.0;
+        state.external_velocity.y = 0.0;
     }
     let downward = state.velocity.y < 0.0;
     if sweep_with_bodies(
@@ -332,6 +350,13 @@ pub fn step_player_with_bodies(
     } else {
         state.grounded = false;
     }
+    // Exponential drag gives the same momentum decay across different tick sizes.
+    let drag = if state.grounded { 8.0 } else { 1.0 };
+    let previous = state.external_velocity;
+    state.external_velocity *= (-drag * dt).exp();
+    let change = state.external_velocity - previous;
+    state.velocity.x += change.x;
+    state.velocity.z += change.y;
 }
 
 #[cfg(test)]
@@ -358,6 +383,7 @@ mod tests {
         PlayerState {
             position,
             velocity: Vec3::ZERO,
+            external_velocity: Vec2::ZERO,
             grounded: false,
             noclip: false,
         }

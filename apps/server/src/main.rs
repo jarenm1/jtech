@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..6] [--ticks N] [--metrics-every 600] [--gpu-physics]"
+                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..64 (default 16)] [--ticks N] [--metrics-every 600] [--gpu-physics]"
             );
             return Ok(());
         }
@@ -27,12 +27,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         match arg.as_str() {
             "--bind" => config.bind = value.parse()?,
             "--seed" => config.seed = value.parse()?,
-            "--radius" => config.radius = value.parse::<i32>()?.clamp(1, 6),
+            "--radius" => {
+                config.radius = value.parse()?;
+                if !(1..=protocol::MAX_VIEW_RADIUS).contains(&config.radius) {
+                    return Err(
+                        format!("--radius must be 1..={}", protocol::MAX_VIEW_RADIUS).into(),
+                    );
+                }
+            }
             "--ticks" => ticks = Some(value.parse::<u64>()?),
             "--metrics-every" => config.metrics_every = value.parse()?,
             _ => return Err(format!("unknown argument {arg}").into()),
         }
     }
+    println!(
+        "view radius={} chunks ({}m), columns={}",
+        config.radius,
+        config.radius * voxel_world::CHUNK_SIZE,
+        (2 * config.radius + 1).pow(2)
+    );
     let plugin = SimulationPlugin::bind(config)?;
     println!(
         "server listening {} TCP+UDP authoritative_hz=60",

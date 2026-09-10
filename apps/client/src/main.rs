@@ -1,3 +1,4 @@
+mod bow_power_hud;
 mod health_hud;
 mod loose_blocks;
 mod projectiles;
@@ -18,7 +19,8 @@ use bevy::{
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerInput, PlayerState, look_direction};
 use protocol::{
-    ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, Health, InputPacket, ServerMessage, Snapshot,
+    BowPower, ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, Health, InputPacket, ServerMessage,
+    Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, WorldPlugin, chunk_coord};
@@ -68,7 +70,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc release/capture mouse | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc release/capture mouse (click bow power button) | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -97,6 +99,7 @@ struct ClientSession {
     pitch: f32,
     correction: Vec3,
     selected: u8,
+    bow_power: BowPower,
     request: u64,
     accepted_edits: u64,
     rejected_edits: u64,
@@ -153,6 +156,7 @@ impl Default for ClientSession {
             pitch: -0.25,
             correction: Vec3::ZERO,
             selected: 3,
+            bow_power: BowPower::default(),
             request: 0,
             accepted_edits: 0,
             rejected_edits: 0,
@@ -255,6 +259,7 @@ impl Plugin for ClientPlugin {
                 (
                     receive_network,
                     controls,
+                    bow_power_hud::cycle_on_click,
                     predict,
                     edit_blocks,
                     present_players,
@@ -262,6 +267,7 @@ impl Plugin for ClientPlugin {
                     update_hud,
                     update_hotbar,
                     health_hud::update,
+                    bow_power_hud::update,
                     capture_screenshot,
                     record_metrics,
                 )
@@ -328,7 +334,10 @@ fn setup(
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: 75.0_f32.to_radians(),
-            far: 384.0,
+            // Cover the far diagonal of the largest server interest square.
+            far: (protocol::MAX_VIEW_RADIUS + 2) as f32
+                * CHUNK_SIZE as f32
+                * std::f32::consts::SQRT_2,
             ..default()
         }),
         Transform::from_translation(session.state.position + Vec3::Y * EYE_HEIGHT),
@@ -418,6 +427,7 @@ fn setup(
         Hotbar,
     ));
     health_hud::spawn(&mut commands);
+    bow_power_hud::spawn(&mut commands);
 }
 
 #[allow(clippy::too_many_arguments)] // Independent Bevy presentation resources.
@@ -655,6 +665,13 @@ fn controls(
         session.pitch = (session.pitch - mouse.delta.y * 0.0025).clamp(-1.54, 1.54);
     }
     session.selected = selected_slot(&keys).unwrap_or(session.selected);
+    if !options.bot
+        && !cursor.visible
+        && session.selected == EXPLOSIVE_BOW_SLOT
+        && keys.just_pressed(KeyCode::KeyR)
+    {
+        session.bow_power = session.bow_power.next();
+    }
 }
 
 fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
@@ -822,6 +839,7 @@ fn block_action(
             request: session.request,
             yaw: session.yaw,
             pitch: session.pitch,
+            power: session.bow_power,
         });
     }
     let block = if strike || hit {
@@ -961,7 +979,11 @@ fn update_hotbar(session: Res<ClientSession>, mut bar: Single<&mut Text, With<Ho
     }
     let slots = (1..=EXPLOSIVE_BOW_SLOT)
         .map(|slot| {
-            let label = format!("{slot} {}", slot_name(slot));
+            let label = if slot == EXPLOSIVE_BOW_SLOT {
+                format!("{slot} {} {}", slot_name(slot), session.bow_power.label())
+            } else {
+                format!("{slot} {}", slot_name(slot))
+            };
             if slot == session.selected {
                 format!("[ {label} ]")
             } else {
@@ -971,7 +993,7 @@ fn update_hotbar(session: Res<ClientSession>, mut bar: Single<&mut Text, With<Ho
         .collect::<Vec<_>>()
         .join("    ");
     let secondary = if session.selected == EXPLOSIVE_BOW_SLOT {
-        "SHOOT"
+        "SHOOT    R POWER"
     } else {
         "PLACE"
     };
