@@ -1,3 +1,9 @@
+mod active_terrain;
+#[cfg(test)]
+mod bombardment_tests;
+mod bow;
+mod bow_server;
+mod explosion;
 mod material_damage;
 mod physics_slice;
 use bevy_app::{App, Plugin, Update};
@@ -67,18 +73,25 @@ pub struct SimulationPlugin {
     physics: parking_lot::Mutex<Option<PhysicsSlice>>,
 }
 impl SimulationPlugin {
-    pub fn bind(mut config: ServerConfig) -> io::Result<Self> {
+    pub fn bind(config: ServerConfig) -> io::Result<Self> {
+        let mut plugin = Self::headless(config)?;
+        let transport = ServerTransport::bind(plugin.config.bind)?;
+        plugin.config.bind = transport.local_addr()?;
+        *plugin.transport.get_mut() = Some(transport);
+        Ok(plugin)
+    }
+
+    /// Run the same authoritative simulation without socket IO, for embedding and tests.
+    pub fn headless(mut config: ServerConfig) -> io::Result<Self> {
         config.radius = config.radius.clamp(1, 6);
         let physics = if config.gpu_physics {
             Some(PhysicsSlice::new().map_err(io::Error::other)?)
         } else {
             None
         };
-        let transport = ServerTransport::bind(config.bind)?;
-        config.bind = transport.local_addr()?;
         Ok(Self {
             config,
-            transport: parking_lot::Mutex::new(Some(transport)),
+            transport: parking_lot::Mutex::new(None),
             physics: parking_lot::Mutex::new(physics),
         })
     }
@@ -99,19 +112,20 @@ impl Plugin for SimulationPlugin {
                 }
             }
         }
-        let mut physics = self.physics.lock().take();
-        if let Some(physics) = &mut physics {
-            physics.initialize_terrain(&world);
-        }
+        let physics = self.physics.lock().take();
         app.insert_resource(world)
             .insert_resource(Simulation {
                 config: self.config.clone(),
-                transport: self.transport.lock().take().expect("plugin added twice"),
+                transport: self.transport.lock().take(),
                 players: HashMap::new(),
                 journal: HashMap::new(),
                 journal_blocks: 0,
                 damage: HashMap::new(),
                 strikes: VecDeque::new(),
+                arrows: Vec::new(),
+                detonations: VecDeque::new(),
+                next_arrow: 1,
+                arrow_revision: 0,
                 last_needed: HashMap::new(),
                 tick: 0,
                 metrics: SimulationMetrics::default(),
@@ -136,6 +150,8 @@ struct Player {
     highest_request: u64,
     physics_revision: Option<u64>,
     body_push_velocity: Vec3,
+    next_bow_tick: u64,
+    arrow_revision: Option<u64>,
 }
 impl Player {
     fn new() -> Self {
@@ -153,6 +169,8 @@ impl Player {
             highest_request: 0,
             physics_revision: None,
             body_push_velocity: Vec3::ZERO,
+            next_bow_tick: 0,
+            arrow_revision: None,
         }
     }
     fn snapshot(&self, id: u64) -> PlayerSnapshot {
@@ -190,11 +208,13 @@ pub struct SimulationMetrics {
     pub snapshot_errors: u64,
     pub destroyed_blocks: u64,
     pub rejected_contacts: u64,
+    pub bow_shots: u64,
+    pub explosions: u64,
 }
 #[derive(Resource)]
 pub struct Simulation {
     config: ServerConfig,
-    transport: ServerTransport,
+    transport: Option<ServerTransport>,
     players: HashMap<u64, Player>,
     journal: HashMap<IVec3, Journal>,
     journal_blocks: usize,
@@ -207,6 +227,10 @@ pub struct Simulation {
     /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
     damage: HashMap<IVec3, DamageState>,
     strikes: VecDeque<QueuedStrike>,
+    arrows: Vec<bow::Arrow>,
+    detonations: VecDeque<(u32, Vec3)>,
+    next_arrow: u32,
+    arrow_revision: u64,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -230,9 +254,15 @@ impl Simulation {
             self.journal_blocks,
             self.metrics.accepted_edits,
             self.metrics.rejected_edits,
-            self.transport.stats.received_bytes,
-            self.transport.stats.sent_bytes,
-            self.transport.stats.rejected_datagrams,
+            self.transport
+                .as_ref()
+                .map_or(0, |net| net.stats.received_bytes),
+            self.transport
+                .as_ref()
+                .map_or(0, |net| net.stats.sent_bytes),
+            self.transport
+                .as_ref()
+                .map_or(0, |net| net.stats.rejected_datagrams),
             percentile(50),
             percentile(95),
             percentile(99),
@@ -244,6 +274,13 @@ impl Simulation {
             self.metrics.destroyed_blocks,
             self.metrics.rejected_contacts,
             self.strikes.len()
+        );
+        eprintln!(
+            "bow shots={} explosions={} flying={} pending_blasts={}",
+            self.metrics.bow_shots,
+            self.metrics.explosions,
+            self.arrows.len(),
+            self.detonations.len()
         );
         if let Some(p) = &self.physics {
             eprintln!(
@@ -258,10 +295,17 @@ impl Simulation {
                 p.player_upload_bytes,
                 p.contact_overflow()
             );
+            eprintln!(
+                "physics resident_chunks={} terrain_wait_periods={}",
+                p.resident_chunks(),
+                p.terrain_wait_ticks
+            );
         }
     }
     fn drop_player(&mut self, id: u64) {
-        self.transport.disconnect(id);
+        if let Some(net) = &mut self.transport {
+            net.disconnect(id);
+        }
         self.strikes.retain(|strike| strike.id != id);
         if self.players.remove(&id).is_some() {
             self.metrics.disconnected += 1;
@@ -269,7 +313,11 @@ impl Simulation {
         }
     }
     fn send(&mut self, id: u64, message: &ServerMessage) -> bool {
-        if self.transport.send(id, message).is_err() {
+        if self
+            .transport
+            .as_mut()
+            .is_some_and(|net| net.send(id, message).is_err())
+        {
             self.drop_player(id);
             false
         } else {
@@ -546,7 +594,7 @@ impl Simulation {
             physics.remove(id);
             self.destroyed(target, material, Some(id));
         }
-        let contacts = physics.take_terrain_contacts();
+        let contacts = physics.take_terrain_contacts(world);
         self.physics = Some(physics);
         for contact in contacts {
             if self.apply_contact(world, &contact).is_err() {
@@ -636,7 +684,7 @@ impl Simulation {
                 })
                 .collect(),
         );
-        physics.step();
+        physics.step(world);
         if self.tick.is_multiple_of(3) {
             let revision = physics.revision;
             let ids: Vec<_> = self
@@ -790,7 +838,10 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     let sim = &mut *simulation;
     sim.tick += 1;
     sim.observe_physics(&mut world);
-    let incoming = match sim.transport.poll() {
+    let incoming = match sim.transport.as_mut().map_or_else(
+        || Ok(networking::ServerIncoming::default()),
+        |net| net.poll(),
+    ) {
         Ok(incoming) => incoming,
         Err(error) => {
             eprintln!("transport poll failed: {error}");
@@ -886,6 +937,11 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 target,
                 expected_revision,
             } => sim.edit(&mut world, id, request, target, 0, expected_revision, true),
+            ClientMessage::FireBow {
+                request,
+                yaw,
+                pitch,
+            } => sim.fire_bow(&world, id, request, yaw, pitch),
             ClientMessage::Resync { coord } => {
                 if let Some(player) = sim.players.get_mut(&id) {
                     // Baseline transmission is already capped at two chunks/tick. Retain
@@ -900,6 +956,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         }
     }
     sim.drain_strikes(&mut world);
+    sim.advance_bow(&mut world);
     sim.advance_physics(&mut world);
     let mut needed = std::mem::take(&mut sim.needed);
     needed.clear();
@@ -907,6 +964,13 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     for player in sim.players.values() {
         needed.extend(player.safety.iter().copied());
     }
+    // Body collision residency is independent of visible/player interest.
+    let physics_needed = sim
+        .physics
+        .as_ref()
+        .map(PhysicsSlice::needed_chunks)
+        .unwrap_or_default();
+    needed.extend(physics_needed.iter().copied());
     // Keep spawn warm for reconnects without admitting actors over unloaded terrain.
     for y in MIN_CHUNK_Y..=MAX_CHUNK_Y {
         for z in -1..=1 {
@@ -924,14 +988,17 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         .filter(|coord| !world.chunks.contains_key(coord))
         .collect();
     missing.sort_unstable_by_key(|coord| {
-        sim.players
-            .values()
-            .map(|p| {
-                let delta = *coord - chunk_coord(p.state.position.floor().as_ivec3());
-                delta.as_vec3().length_squared() as u64
-            })
-            .min()
-            .unwrap_or(0)
+        (
+            !physics_needed.contains(coord),
+            sim.players
+                .values()
+                .map(|p| {
+                    let delta = *coord - chunk_coord(p.state.position.floor().as_ivec3());
+                    delta.as_vec3().length_squared() as u64
+                })
+                .min()
+                .unwrap_or(0),
+        )
     });
     for coord in missing.into_iter().take(2) {
         restore(&mut world, coord, sim.journal.get(&coord));
@@ -1025,7 +1092,11 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                     .map(|(&id, p)| p.snapshot(id))
                     .collect(),
             };
-            if sim.transport.snapshot(id, &snapshot).is_err() {
+            if sim
+                .transport
+                .as_mut()
+                .is_some_and(|net| net.snapshot(id, &snapshot).is_err())
+            {
                 sim.metrics.snapshot_errors += 1;
             }
         }

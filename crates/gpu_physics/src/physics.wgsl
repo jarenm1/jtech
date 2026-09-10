@@ -1,5 +1,5 @@
 struct Body { position: vec3<f32>, material: u32, velocity: vec3<f32>, damage_sleep: u32, fracture_damage: f32, pad0: f32, pad1: f32, pad2: f32 }
-struct Params { origin: vec3<i32>, count: u32, size: vec3<u32>, dt: f32, player_count: u32, pad0: u32, pad1: u32, pad2: u32 }
+struct Params { origin: vec3<i32>, count: u32, size: vec3<u32>, dt: f32, player_count: u32, terrain_mode: u32, pad1: u32, pad2: u32 }
 struct PlayerCollider { position: vec3<f32>, id: u32, velocity: vec3<f32>, padding: u32 }
 @group(0) @binding(0) var<storage, read> src: array<Body>;
 @group(0) @binding(1) var<storage, read_write> dst: array<Body>;
@@ -13,35 +13,6 @@ struct TerrainContact { cell: vec3<i32>, material: u32, dissipated_energy: f32, 
 struct TerrainEvents { count: atomic<u32>, pad0: u32, pad1: u32, pad2: u32, contacts: array<TerrainContact> }
 @group(0) @binding(8) var<storage, read_write> events: TerrainEvents;
 const END = 0xffffffffu;
-fn grid_size() -> vec3<u32> { return (params.size + vec3(1u)) / 2u; }
-fn grid_cell(position: vec3<f32>) -> vec3<i32> {
-    // Clamping retains even out-of-region input bodies in the broadphase.
-    return clamp(vec3<i32>(floor((position-vec3<f32>(params.origin))*0.5)),
-                 vec3(0), vec3<i32>(grid_size())-vec3(1));
-}
-fn grid_index(cell: vec3<i32>) -> u32 {
-    let c=vec3<u32>(cell); let size=grid_size();
-    return c.x + size.x*(c.z + size.z*c.y);
-}
-@compute @workgroup_size(64)
-fn clear_grid(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x < arrayLength(&heads) { atomicStore(&heads[id.x], END); }
-}
-@compute @workgroup_size(64)
-fn build_grid(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i=id.x;
-    if i>=params.count || src[i].material==0u { return; }
-    let cell=grid_index(grid_cell(src[i].position));
-    // Exactly one link per active body; no per-cell capacity or overflow.
-    next_body[i]=atomicExchange(&heads[cell],i);
-}
-fn terrain_material(cell: vec3<i32>) -> u32 {
-    let p = cell - params.origin;
-    if any(p < vec3(0)) || any(p >= vec3<i32>(params.size)) { return 3u; }
-    let q = vec3<u32>(p);
-    return terrain[q.x + params.size.x * (q.z + params.size.z*q.y)];
-}
-fn solid(cell: vec3<i32>) -> bool { return terrain_material(cell) != 0u; }
 fn overlaps(p: vec3<f32>) -> bool {
     let lo = vec3<i32>(floor(p-vec3(0.4999)));
     let hi = vec3<i32>(floor(p+vec3(0.4999)));
@@ -69,8 +40,7 @@ fn contact_area(p: vec3<f32>, cell: vec3<i32>, axis: u32) -> f32 {
     return area;
 }
 fn emit_terrain(cell: vec3<i32>, mat: u32, energy: f32, force: f32, area: f32) {
-    let local=cell-params.origin;
-    if any(local<vec3(0)) || any(local>=vec3<i32>(params.size)) { return; }
+    if terrain_cell_index(cell)==END { return; }
     let m=MATERIALS[mat];
     // One unit support face is the conservative attachment limit. CPU revalidates support.
     if area<=0. || (force/area<=m.damage_onset && force<=m.attachment_strength) { return; }
@@ -202,7 +172,6 @@ fn pair_contacts(@builtin(global_invocation_id) id: vec3<u32>) {
     let cell=grid_cell(b.position);
     for (var y=-1; y<=1; y++) { for (var z=-1; z<=1; z++) { for (var x=-1; x<=1; x++) {
       let neighbor=cell+vec3(x,y,z);
-      if any(neighbor<vec3(0)) || any(neighbor>=vec3<i32>(grid_size())) { continue; }
       var link=atomicLoad(&heads[grid_index(neighbor)]);
       loop {
         if link==END { break; }
@@ -210,6 +179,7 @@ fn pair_contacts(@builtin(global_invocation_id) id: vec3<u32>) {
         link=next_body[j];
         if i==j { continue; }
         let other=src[j];
+        if any(grid_cell(other.position)!=neighbor) { continue; }
         let delta=b.position-other.position;
         let depth=vec3(1.)-abs(delta);
         if any(depth < vec3(-0.002)) { continue; }
@@ -322,13 +292,13 @@ fn finalize(@builtin(global_invocation_id) id: vec3<u32>) {
     let cell=grid_cell(b.position);
     for (var y=-1; y<=1; y++) { for (var z=-1; z<=1; z++) { for (var x=-1; x<=1; x++) {
         let neighbor=cell+vec3(x,y,z);
-        if any(neighbor<vec3(0)) || any(neighbor>=vec3<i32>(grid_size())) { continue; }
         var link=atomicLoad(&heads[grid_index(neighbor)]);
         loop {
             if link==END { break; }
             let j=link; link=next_body[j];
             if i==j { continue; }
             let other=src[j]; let delta=b.position-other.position;
+            if any(grid_cell(other.position)!=neighbor) { continue; }
             // Require support history rooted at terrain, not just a co-falling pair.
             let rooted=terrain_support(other.position) || (other.damage_sleep>>16u)>0u;
             if rooted && delta.y>0.8 && delta.y<1.006 && abs(delta.x)<0.99 && abs(delta.z)<0.99 && abs(other.velocity.y)<0.6 {

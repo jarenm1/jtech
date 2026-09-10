@@ -230,3 +230,64 @@ fn delayed_launch_result_does_not_replace_newer_hit_feedback() {
     assert_eq!(client.accepted_edits, 1);
     assert_eq!(client.rejected_edits, 1);
 }
+
+#[test]
+fn bow_slot_selection_and_untargeted_shot_routing() {
+    let mut keys = ButtonInput::<KeyCode>::default();
+    keys.press(KeyCode::Digit6);
+    assert_eq!(selected_slot(&keys), Some(EXPLOSIVE_BOW_SLOT));
+    let mut client = ClientSession {
+        selected: selected_slot(&keys).unwrap(),
+        yaw: 0.75,
+        pitch: 1.0,
+        ..default()
+    };
+    // Empty/unloaded terrain and sky aiming must not suppress bow shots.
+    let world = VoxelWorld::default();
+    assert!(matches!(
+        block_action(&mut client, &world, false, false, true),
+        Some(ClientMessage::FireBow {
+            request: 1,
+            yaw: 0.75,
+            pitch: 1.0
+        })
+    ));
+    assert!(block_action(&mut client, &world, false, false, false).is_none());
+    assert!(block_action(&mut client, &world, false, true, false).is_none());
+    assert_eq!(client.request, 1);
+    keys.reset_all();
+    keys.press(KeyCode::Digit3);
+    client.selected = selected_slot(&keys).unwrap();
+    assert!(block_action(&mut client, &world, false, false, true).is_none());
+}
+
+#[test]
+fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
+    let mut client = ClientSession {
+        selected: EXPLOSIVE_BOW_SLOT,
+        pitch: -1.0,
+        state: PlayerState {
+            position: Vec3::new(0.5, 0.0, 0.5),
+            ..default()
+        },
+        ..default()
+    };
+    let world = arena();
+    assert!(matches!(
+        block_action(&mut client, &world, false, true, true),
+        Some(ClientMessage::Edit { block: 0, .. })
+    ));
+    assert!(matches!(
+        block_action(&mut client, &world, true, false, true),
+        Some(ClientMessage::Strike { .. })
+    ));
+    for selected in 1..=5 {
+        client.selected = selected;
+        assert!(
+            matches!(block_action(&mut client, &world, false, false, true),
+            Some(ClientMessage::Edit { block, .. }) if block == selected)
+        );
+    }
+    client.selected = 7;
+    assert!(block_action(&mut client, &world, false, false, true).is_none());
+}

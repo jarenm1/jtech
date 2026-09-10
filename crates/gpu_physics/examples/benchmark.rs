@@ -1,4 +1,4 @@
-//! cargo run --release -p gpu_physics --example benchmark
+//! cargo run --release -p gpu_physics --example benchmark -- --sparse-terrain
 use gpu_physics::{Body, GpuPhysics, PlayerCollider, TERRAIN_EVENT_READBACK_BYTES, Terrain};
 use std::time::{Duration, Instant};
 fn percentile(values: &mut [Duration], p: f32) -> f64 {
@@ -18,10 +18,26 @@ fn main() -> Result<(), String> {
         }
     }
     let start = Instant::now();
-    let mut gpu = GpuPhysics::new(terrain)?;
+    let sparse = std::env::args().any(|arg| arg == "--sparse-terrain");
+    let mut gpu = if sparse {
+        let mut gpu = GpuPhysics::new_sparse()?;
+        let mut chunks = Vec::new();
+        for z in 0..2 {
+            for x in 0..2 {
+                let mut cells = vec![0; 32 * 32 * 32];
+                cells[..32 * 32].fill(3);
+                chunks.push(([x, 0, z], cells));
+            }
+        }
+        gpu.set_terrain_chunks(&chunks)?;
+        gpu
+    } else {
+        GpuPhysics::new(terrain)?
+    };
     println!(
-        "adapter={} init_ms={:.2}",
+        "adapter={} terrain={} init_ms={:.2}",
         gpu.adapter_name,
+        if sparse { "paged" } else { "dense" },
         start.elapsed().as_secs_f64() * 1000.
     );
     println!(

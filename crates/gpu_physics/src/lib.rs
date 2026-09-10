@@ -1,10 +1,13 @@
-//! Bounded headless GPU physics slice. Positions are cube centers in world coordinates.
+//! Headless GPU cube physics with dense or sparse chunk terrain in world coordinates.
 //! Bodies stay resident between steps. One submission/readback may be in flight;
 //! `try_readback` polls without waiting. Terrain changes and body edits require idle state.
-//! GPU-built uniform grid broadphase with unbounded per-cell linked lists.
+//! World-space hashed broadphase with unbounded per-bucket linked lists.
 use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc::{self, Receiver};
 use wgpu::util::DeviceExt;
+
+mod sparse;
+pub use sparse::{MAX_TERRAIN_CHUNKS, TERRAIN_CHUNK_SIZE};
 
 pub const MAX_BODIES: usize = 1024;
 /// 0.2 seconds of supported low-speed motion at 120 Hz.
@@ -150,6 +153,13 @@ fn shader_source() -> String {
         ));
     }
     source.push_str(&format!(");\nconst PLAYER_PUSH_FORCE: f32 = {PLAYER_PUSH_FORCE:?};\nconst CONTACT_DT: f32 = {CONTACT_DT:?};\n"));
+    source.push_str(&format!(
+        "const TERRAIN_TABLE_CAPACITY: u32 = {}u;\nconst BROADPHASE_BUCKETS: u32 = {}u;\n",
+        sparse::TABLE_CAPACITY,
+        sparse::BROADPHASE_BUCKETS
+    ));
+    source.push_str(include_str!("broadphase.wgsl"));
+    source.push_str(include_str!("terrain.wgsl"));
     source.push_str(include_str!("physics.wgsl"));
     source
 }
@@ -233,7 +243,8 @@ struct Params {
     size: [u32; 3],
     dt: f32,
     player_count: u32,
-    padding: [u32; 3],
+    terrain_mode: u32,
+    padding: [u32; 2],
 }
 
 pub struct GpuPhysics {
@@ -262,11 +273,23 @@ pub struct GpuPhysics {
     build_grid: wgpu::ComputePipeline,
     grid_count: u32,
     terrain_info: Terrain,
+    sparse_terrain: Option<sparse::SparseTerrain>,
     count: usize,
     pending_impulses: Vec<[f32; 4]>,
     pending: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 impl GpuPhysics {
+    /// Start with no resident chunks. Nonresident terrain is solid.
+    pub fn new_sparse() -> Result<Self, String> {
+        pollster::block_on(Self::create(
+            Terrain {
+                origin: [0; 3],
+                size: [0; 3],
+                cells: vec![],
+            },
+            true,
+        ))
+    }
     pub fn new(terrain: Terrain) -> Result<Self, String> {
         pollster::block_on(Self::new_async(terrain))
     }
@@ -274,6 +297,9 @@ impl GpuPhysics {
         if !terrain_info.valid() {
             return Err("terrain dimensions must be 1..=128 with matching cells".into());
         }
+        Self::create(terrain_info, false).await
+    }
+    async fn create(terrain_info: Terrain, sparse: bool) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -323,11 +349,21 @@ impl GpuPhysics {
             (MAX_PLAYERS * 32) as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
-        let terrain = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain"),
-            contents: bytemuck::cast_slice(&terrain_info.cells),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        let terrain = if sparse {
+            // Four bits per cell: 4096 pages plus metadata fit below a 128 MiB binding.
+            // WebGPU initializes storage to zero, including the empty hash table.
+            buffer(
+                "sparse terrain",
+                sparse::BUFFER_BYTES,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            )
+        } else {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dense terrain"),
+                contents: bytemuck::cast_slice(&terrain_info.cells),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
         let params = buffer(
             "parameters",
             48,
@@ -339,11 +375,7 @@ impl GpuPhysics {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
         let terrain_events = buffer("terrain contact events", EVENT_BYTES as u64, body_usage);
-        let grid_count = terrain_info
-            .size
-            .iter()
-            .map(|n| n.div_ceil(2))
-            .product::<u32>();
+        let grid_count = sparse::BROADPHASE_BUCKETS;
         let grid_heads = buffer(
             "grid heads",
             u64::from(grid_count) * 4,
@@ -455,6 +487,7 @@ impl GpuPhysics {
             build_grid,
             grid_count,
             terrain_info,
+            sparse_terrain: sparse.then(sparse::SparseTerrain::default),
             count: 0,
             pending_impulses: vec![[0.; 4]; MAX_BODIES],
             pending: None,
@@ -462,6 +495,45 @@ impl GpuPhysics {
     }
     pub fn is_busy(&self) -> bool {
         self.pending.is_some()
+    }
+    /// Replace the complete resident chunk set. Cells are x-fastest, then z, then y.
+    /// Returns bytes uploaded, including hash metadata. All input is validated before writes.
+    pub fn set_terrain_chunks(&mut self, chunks: &[([i32; 3], Vec<u32>)]) -> Result<u64, String> {
+        let retained: Vec<_> = chunks.iter().map(|(coord, _)| *coord).collect();
+        self.update_sparse_terrain(&retained, chunks)
+    }
+    /// Set authoritative residency and upload only changed chunk replacements.
+    /// Every new resident coordinate must occur in `changed`. Existing slots are reused.
+    /// Busy and invalid requests leave CPU/GPU terrain untouched.
+    pub fn update_sparse_terrain(
+        &mut self,
+        retained: &[[i32; 3]],
+        changed: &[([i32; 3], Vec<u32>)],
+    ) -> Result<u64, String> {
+        if self.is_busy() {
+            return Err("physics submission in flight".into());
+        }
+        let state = self
+            .sparse_terrain
+            .as_ref()
+            .ok_or("requires sparse terrain backend")?;
+        let plan = state.plan(retained, changed)?;
+        let mut bytes = 0;
+        for (slot, page) in plan.pages {
+            self.queue.write_buffer(
+                &self.terrain,
+                ((sparse::TABLE_WORDS + slot * sparse::PAGE_WORDS) * 4) as u64,
+                bytemuck::cast_slice(&page),
+            );
+            bytes += (page.len() * 4) as u64;
+        }
+        if let Some(table) = plan.table {
+            self.queue
+                .write_buffer(&self.terrain, 0, bytemuck::cast_slice(&table));
+            bytes += (table.len() * 4) as u64;
+        }
+        self.sparse_terrain = Some(plan.next);
+        Ok(bytes)
     }
     /// Upload bounded kinematic input while idle. No additional GPU readback.
     pub fn set_players(&mut self, players: &[PlayerCollider]) -> Result<(), String> {
@@ -510,6 +582,9 @@ impl GpuPhysics {
         if self.is_busy() {
             return Err("physics submission in flight".into());
         }
+        if self.sparse_terrain.is_some() {
+            return Err("requires dense terrain backend".into());
+        }
         if cells.len() != self.terrain_info.cells.len() {
             return Err("terrain size mismatch".into());
         }
@@ -526,6 +601,9 @@ impl GpuPhysics {
     pub fn update_terrain_range(&mut self, start: usize, cells: &[u32]) -> Result<(), String> {
         if self.is_busy() {
             return Err("physics submission in flight".into());
+        }
+        if self.sparse_terrain.is_some() {
+            return Err("requires dense terrain backend".into());
         }
         let end = start
             .checked_add(cells.len())
@@ -570,7 +648,8 @@ impl GpuPhysics {
             count: self.count as u32,
             dt,
             player_count: self.player_count as u32,
-            padding: [0; 3],
+            terrain_mode: u32::from(self.sparse_terrain.is_some()),
+            padding: [0; 2],
         };
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
@@ -676,10 +755,12 @@ impl GpuPhysics {
 }
 
 #[cfg(test)]
+mod sparse_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     // Mesa's software adapter may crash during concurrent instance initialization.
-    static GPU_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static GPU_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn layouts() {
         assert_eq!(std::mem::size_of::<Body>(), 48);

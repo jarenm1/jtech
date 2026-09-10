@@ -3,11 +3,13 @@ use physics::{PlayerInput, PlayerState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_FRAME: usize = 128 * 1024;
+pub const MAX_ARROWS: usize = 32;
+pub const EXPLOSIVE_BOW_SLOT: u8 = 6;
 
 /// Authoritative action rejection, also used for completed queued debug strikes.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +46,12 @@ pub enum ClientMessage {
         request: u64,
         target: IVec3,
         expected_revision: u64,
+    },
+    /// Aim only: the server authors the muzzle, velocity, charge, and cooldown.
+    FireBow {
+        request: u64,
+        yaw: f32,
+        pitch: f32,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,6 +92,17 @@ pub enum ServerMessage {
         tick: u64,
         bodies: Vec<PhysicsBodySnapshot>,
     },
+    /// Complete replacement of the bounded projectile set, at 20 Hz.
+    Projectiles {
+        tick: u64,
+        arrows: Vec<ArrowSnapshot>,
+    },
+    /// Authoritative detonation. Clients use this only for presentation.
+    Explosion {
+        id: u32,
+        position: Vec3,
+        radius: f32,
+    },
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PhysicsBodySnapshot {
@@ -92,6 +111,13 @@ pub struct PhysicsBodySnapshot {
     pub velocity: Vec3,
     pub material: u8,
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ArrowSnapshot {
+    pub id: u32,
+    pub position: Vec3,
+    pub velocity: Vec3,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub id: u64,
