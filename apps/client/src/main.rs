@@ -1,3 +1,4 @@
+mod loose_blocks;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
@@ -13,10 +14,8 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions, PresentMode},
 };
 use networking::ClientTransport;
-use physics::{
-    EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerInput, PlayerState, look_direction, step_player,
-};
-use protocol::{ClientMessage, InputPacket, ServerMessage, Snapshot};
+use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerInput, PlayerState, look_direction};
+use protocol::{ClientMessage, EditRejection, InputPacket, ServerMessage, Snapshot};
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, WorldPlugin, chunk_coord};
 
@@ -65,7 +64,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump | left/right click break/place | 1-5 material | Esc release/capture mouse | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump | left/right click hit/place | F debug launch (GPU server) | 1-5 material | Esc release/capture mouse | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -94,6 +93,7 @@ struct ClientSession {
     request: u64,
     accepted_edits: u64,
     rejected_edits: u64,
+    last_action: Option<ActionResult>,
     resyncing: HashSet<IVec3>,
     last_packet: Instant,
     started: Instant,
@@ -102,6 +102,30 @@ struct ClientSession {
     frame_times: Vec<f64>,
     next_metrics: Instant,
     max_correction: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ActionResult {
+    request: u64,
+    accepted: bool,
+    reason: Option<EditRejection>,
+    damage: Option<f32>,
+}
+
+impl std::fmt::Display for ActionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Action #{}: ", self.request)?;
+        if !self.accepted {
+            match self.reason {
+                Some(reason) => write!(f, "rejected ({reason:?})"),
+                None => write!(f, "rejected"),
+            }
+        } else if let Some(damage) = self.damage {
+            write!(f, "fracture {:.0}%", damage * 100.0)
+        } else {
+            write!(f, "accepted")
+        }
+    }
 }
 
 impl Default for ClientSession {
@@ -123,6 +147,7 @@ impl Default for ClientSession {
             request: 0,
             accepted_edits: 0,
             rejected_edits: 0,
+            last_action: None,
             resyncing: HashSet::new(),
             last_packet: Instant::now(),
             started: Instant::now(),
@@ -136,6 +161,21 @@ impl Default for ClientSession {
 }
 
 impl ClientSession {
+    fn receive_action(&mut self, result: ActionResult) {
+        if result.accepted {
+            self.accepted_edits += 1;
+        } else {
+            self.rejected_edits += 1;
+        }
+        // Queued debug launches may complete after newer actions. Terrain changes
+        // come only from Delta/Chunk messages, including for accepted partial hits.
+        if self
+            .last_action
+            .is_none_or(|last| result.request >= last.request)
+        {
+            self.last_action = Some(result);
+        }
+    }
     fn disconnect(&mut self, reason: impl std::fmt::Display) {
         self.status = format!("Disconnected: {reason}");
         error!("{}", self.status);
@@ -235,6 +275,7 @@ fn main() {
             WorldPlugin,
             VoxelRenderPlugin,
             ClientPlugin,
+            loose_blocks::LooseBlocksPlugin,
         ))
         .run();
 }
@@ -337,7 +378,7 @@ fn setup(
         },
     ));
     commands.spawn((
-        Text::new("WASD  MOVE    SPACE  JUMP    MOUSE  LOOK\nLMB  BREAK    RMB  PLACE    1-5  MATERIAL    ESC  CURSOR    F12  CAPTURE"),
+        Text::new("WASD  MOVE    SPACE  JUMP    MOUSE  LOOK\nLMB  HIT    RMB  PLACE    F  DEBUG LAUNCH    1-5  MATERIAL    ESC  CURSOR    F12  CAPTURE"),
         TextFont { font_size: 14.0, ..default() }, TextShadow::default(),
         Node { position_type: PositionType::Absolute, bottom: px(18), left: px(20), padding: UiRect::all(px(10)), ..default() },
         BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.8)),
@@ -350,6 +391,8 @@ fn receive_network(
     mut world: ResMut<VoxelWorld>,
     mut remotes: ResMut<RemotePlayers>,
     assets: Res<ActorAssets>,
+    mut loose: ResMut<loose_blocks::LooseBlocks>,
+    loose_assets: Res<loose_blocks::LooseBlockAssets>,
 ) {
     let Some(transport) = &mut session.transport else {
         return;
@@ -425,13 +468,24 @@ fn receive_network(
                 world.remove(coord);
                 session.resyncing.remove(&coord);
             }
-            ServerMessage::EditResult { request, accepted } => {
-                if accepted {
-                    session.accepted_edits += 1;
-                } else {
-                    session.rejected_edits += 1;
-                }
-                info!("EDIT_RESULT request={request} accepted={accepted}");
+            ServerMessage::EditResult {
+                request,
+                accepted,
+                reason,
+                damage,
+            } => {
+                session.receive_action(ActionResult {
+                    request,
+                    accepted,
+                    reason,
+                    damage,
+                });
+                info!(
+                    "EDIT_RESULT request={request} accepted={accepted} reason={reason:?} damage={damage:?}"
+                );
+            }
+            ServerMessage::Physics { tick, bodies } => {
+                loose.receive(tick, &bodies, &mut commands, &loose_assets);
             }
             ServerMessage::Disconnect { reason } => {
                 session.disconnect(reason);
@@ -443,7 +497,7 @@ fn receive_network(
         if snapshot.tick <= session.last_tick || Some(snapshot.you.id) != session.id {
             continue;
         }
-        reconcile(&mut session, &world, &snapshot);
+        reconcile(&mut session, &world, &snapshot, loose.colliders());
         let now = Instant::now();
         remotes.0.retain(|id, remote| {
             if snapshot.players.iter().any(|player| player.id == *id) {
@@ -487,7 +541,12 @@ fn receive_network(
     }
 }
 
-fn reconcile(session: &mut ClientSession, world: &VoxelWorld, snapshot: &Snapshot) {
+fn reconcile(
+    session: &mut ClientSession,
+    world: &VoxelWorld,
+    snapshot: &Snapshot,
+    bodies: &[physics::DynamicCollider],
+) {
     session.last_tick = snapshot.tick;
     while session
         .pending
@@ -499,7 +558,7 @@ fn reconcile(session: &mut ClientSession, world: &VoxelWorld, snapshot: &Snapsho
     let previous = session.state.position;
     session.state = snapshot.you.state;
     for input in &session.pending {
-        step_player(world, &mut session.state, input, FIXED_DT);
+        physics::step_player_with_bodies(world, &mut session.state, input, FIXED_DT, bodies);
     }
     let difference = previous - session.state.position;
     session.max_correction = session.max_correction.max(difference.length());
@@ -549,6 +608,7 @@ fn predict(
     options: Res<Options>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
+    loose: Res<loose_blocks::LooseBlocks>,
 ) {
     if session.id.is_none() || session.transport.is_none() {
         return;
@@ -596,7 +656,7 @@ fn predict(
             jump,
         };
         let mut state = session.state;
-        step_player(&world, &mut state, &input, FIXED_DT);
+        physics::step_player_with_bodies(&world, &mut state, &input, FIXED_DT, loose.colliders());
         session.state = state;
         session.pending.push_back(input);
     }
@@ -621,6 +681,7 @@ fn predict(
 
 fn edit_blocks(
     buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     cursor: Single<&CursorOptions>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
@@ -628,7 +689,8 @@ fn edit_blocks(
     if cursor.visible || session.transport.is_none() || session.id.is_none() {
         return;
     }
-    let block = if buttons.just_pressed(MouseButton::Left) {
+    let strike = keys.just_pressed(KeyCode::KeyF);
+    let block = if strike || buttons.just_pressed(MouseButton::Left) {
         0
     } else if buttons.just_pressed(MouseButton::Right) {
         session.selected
@@ -646,12 +708,20 @@ fn edit_blocks(
     let expected_revision = chunk.revision;
     session.request += 1;
     let request = session.request;
-    session.send(ClientMessage::Edit {
-        request,
-        target,
-        block,
-        expected_revision,
-    });
+    if strike {
+        session.send(ClientMessage::Strike {
+            request,
+            target,
+            expected_revision,
+        });
+    } else {
+        session.send(ClientMessage::Edit {
+            request,
+            target,
+            block,
+            expected_revision,
+        });
+    }
 }
 
 fn present_players(
@@ -691,12 +761,14 @@ fn select_voxel(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Independent Bevy system resources.
 fn update_hud(
     mut next_update: Local<Option<Instant>>,
     session: Res<ClientSession>,
     world: Res<VoxelWorld>,
     stats: Res<VoxelRenderStats>,
     remotes: Res<RemotePlayers>,
+    loose: Res<loose_blocks::LooseBlocks>,
     diagnostics: Res<DiagnosticsStore>,
     mut hud: Single<&mut Text, With<Hud>>,
 ) {
@@ -710,13 +782,18 @@ fn update_hud(
         .and_then(|value| value.smoothed())
         .unwrap_or(0.0);
     let material = ["Air", "Grass", "Dirt", "Stone", "Sand", "Wood"][usize::from(session.selected)];
+    let action = session
+        .last_action
+        .map(|result| result.to_string())
+        .unwrap_or_default();
     **hud = Text::new(format!(
-        "VOXEL / MULTIPLAYER LAB\n{}\n{fps:.0} fps | {} chunks | {} triangles\n{} mesh jobs | {} remote players\nxyz {:.1} / {:.1} / {:.1} | tick {}\n{} unacked inputs | edits {} accepted / {} rejected\nMATERIAL {} / {material}",
+        "VOXEL / MULTIPLAYER LAB\n{}\n{fps:.0} fps | {} chunks | {} triangles\n{} mesh jobs | {} remote players | {} loose blocks\nxyz {:.1} / {:.1} / {:.1} | tick {}\n{} unacked inputs | actions {} accepted / {} rejected\n{action}\nMATERIAL {} / {material}",
         session.status,
         world.chunks.len(),
         stats.triangles,
         stats.pending_jobs,
         remotes.0.len(),
+        loose.count(),
         session.state.position.x,
         session.state.position.y,
         session.state.position.z,

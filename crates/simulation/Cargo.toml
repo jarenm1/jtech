@@ -13,3 +13,4 @@ voxel_world.workspace = true
 protocol.workspace = true
 networking.workspace = true
 parking_lot = "0.12"
+gpu_physics = { path = "../gpu_physics" }

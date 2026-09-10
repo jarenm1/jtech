@@ -13,6 +13,13 @@ const GRAVITY: f32 = 24.0;
 const JUMP_SPEED: f32 = 8.0;
 const EPSILON: f32 = 0.0001;
 
+/// Latest observed unit cube, centered at `position`; callers own snapshot timing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicCollider {
+    pub id: u32,
+    pub position: Vec3,
+    pub velocity: Vec3,
+}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PlayerState {
     pub position: Vec3,
@@ -133,7 +140,120 @@ fn sweep_axis(world: &VoxelWorld, position: &mut Vec3, axis: usize, distance: f3
     false
 }
 
+/// Sweep against terrain and observed loose cubes without extrapolating snapshots.
+fn sweep_with_bodies(
+    world: &VoxelWorld,
+    position: &mut Vec3,
+    axis: usize,
+    distance: f32,
+    bodies: &[DynamicCollider],
+    ignore: Option<usize>,
+) -> bool {
+    if distance == 0.0 {
+        return false;
+    }
+    let start = *position;
+    let mut hit = sweep_axis(world, position, axis, distance);
+    let mut allowed = position[axis] - start[axis];
+    let (min, max) = bounds(start);
+    let a = (axis + 1) % 3;
+    let b = (axis + 2) % 3;
+    for (index, body) in bodies.iter().enumerate() {
+        if ignore == Some(index) || !body.position.is_finite() {
+            continue;
+        }
+        let lo = body.position - Vec3::splat(0.5);
+        let hi = body.position + Vec3::splat(0.5);
+        if max[a] <= lo[a] + EPSILON
+            || min[a] >= hi[a] - EPSILON
+            || max[b] <= lo[b] + EPSILON
+            || min[b] >= hi[b] - EPSILON
+        {
+            continue;
+        }
+        let gap = if distance > 0.0 {
+            lo[axis] - max[axis]
+        } else {
+            hi[axis] - min[axis]
+        };
+        if distance > 0.0 && gap >= -EPSILON && gap <= allowed {
+            allowed = gap.max(0.0);
+            hit = true;
+        } else if distance < 0.0 && gap <= EPSILON && gap >= allowed {
+            allowed = gap.min(0.0);
+            hit = true;
+        }
+    }
+    position[axis] = start[axis] + allowed;
+    hit
+}
+
+/// Correct snapshot overlap using bounded, terrain-swept translations. If crushed
+/// with no clear escape, tolerate body overlap rather than crossing solid terrain.
+fn separate_bodies(world: &VoxelWorld, state: &mut PlayerState, bodies: &[DynamicCollider]) {
+    let mut budget = 1.0_f32;
+    for _ in 0..4 {
+        let mut corrected = false;
+        for (index, body) in bodies.iter().enumerate() {
+            if !body.position.is_finite() {
+                continue;
+            }
+            let (min, max) = bounds(state.position);
+            let lo = body.position - Vec3::splat(0.5);
+            let hi = body.position + Vec3::splat(0.5);
+            if !(min.cmplt(hi - Vec3::splat(EPSILON)).all()
+                && max.cmpgt(lo + Vec3::splat(EPSILON)).all())
+            {
+                continue;
+            }
+            let mut best: Option<(f32, usize, f32, Vec3)> = None;
+            for axis in 0..3 {
+                for distance in [lo[axis] - max[axis], hi[axis] - min[axis]] {
+                    if distance.abs() > budget {
+                        continue;
+                    }
+                    let mut candidate = state.position;
+                    sweep_with_bodies(world, &mut candidate, axis, distance, bodies, Some(index));
+                    if (candidate[axis] - state.position[axis] - distance).abs() > EPSILON {
+                        continue;
+                    }
+                    // Near ties favor displacement in the body's travel direction.
+                    let opposing = finite(body.velocity[axis]) * distance < 0.0;
+                    let score = distance.abs() + if opposing { 0.25 } else { 0.0 };
+                    if best.is_none_or(|previous| score < previous.0) {
+                        best = Some((score, axis, distance, candidate));
+                    }
+                }
+            }
+            if let Some((_, axis, distance, candidate)) = best {
+                state.position = candidate;
+                budget -= distance.abs();
+                if state.velocity[axis] * distance < 0.0 {
+                    state.velocity[axis] = 0.0;
+                }
+                corrected = true;
+            }
+        }
+        if !corrected || budget <= EPSILON {
+            break;
+        }
+    }
+}
+
 pub fn step_player(world: &VoxelWorld, state: &mut PlayerState, input: &PlayerInput, dt: f32) {
+    step_player_with_bodies(world, state, input, dt, &[]);
+}
+
+/// Shared authoritative/predicted character movement against voxel terrain and
+/// loose cubes. Snapshot displacement, not repeated velocity impulses, pushes the
+/// character; unchanged snapshots never repeatedly carry or launch the player.
+pub fn step_player_with_bodies(
+    world: &VoxelWorld,
+    state: &mut PlayerState,
+    input: &PlayerInput,
+    dt: f32,
+    bodies: &[DynamicCollider],
+) {
     if !dt.is_finite() || dt <= 0.0 {
         return;
     }
@@ -157,21 +277,44 @@ pub fn step_player(world: &VoxelWorld, state: &mut PlayerState, input: &PlayerIn
     let horizontal = (right * movement.x + forward * movement.y) * SPEED;
     state.velocity.x = horizontal.x;
     state.velocity.z = horizontal.z;
+    separate_bodies(world, state, bodies);
     let mut probe = state.position;
-    state.grounded = state.velocity.y <= 0.0 && sweep_axis(world, &mut probe, 1, -0.002);
+    state.grounded =
+        state.velocity.y <= 0.0 && sweep_with_bodies(world, &mut probe, 1, -0.002, bodies, None);
     if input.jump && state.grounded {
         state.velocity.y = JUMP_SPEED;
         state.grounded = false;
     }
     state.velocity.y = (state.velocity.y - GRAVITY * dt).clamp(-60.0, 60.0);
-    if sweep_axis(world, &mut state.position, 0, state.velocity.x * dt) {
+    if sweep_with_bodies(
+        world,
+        &mut state.position,
+        0,
+        state.velocity.x * dt,
+        bodies,
+        None,
+    ) {
         state.velocity.x = 0.0;
     }
-    if sweep_axis(world, &mut state.position, 2, state.velocity.z * dt) {
+    if sweep_with_bodies(
+        world,
+        &mut state.position,
+        2,
+        state.velocity.z * dt,
+        bodies,
+        None,
+    ) {
         state.velocity.z = 0.0;
     }
     let downward = state.velocity.y < 0.0;
-    if sweep_axis(world, &mut state.position, 1, state.velocity.y * dt) {
+    if sweep_with_bodies(
+        world,
+        &mut state.position,
+        1,
+        state.velocity.y * dt,
+        bodies,
+        None,
+    ) {
         state.velocity.y = 0.0;
         state.grounded = downward;
     } else {
@@ -296,5 +439,141 @@ mod tests {
         assert!(
             (look_direction(std::f32::consts::FRAC_PI_2, 0.0) - Vec3::NEG_X).length() < 0.00001
         );
+    }
+
+    fn body(position: Vec3, velocity: Vec3) -> DynamicCollider {
+        DynamicCollider {
+            id: 1,
+            position,
+            velocity,
+        }
+    }
+
+    #[test]
+    fn loose_cube_sweeps_stop_side_top_and_ceiling() {
+        let world = arena();
+        let bodies = [body(Vec3::new(1.5, 0.5, 0.5), Vec3::ZERO)];
+        let mut state = player(Vec3::new(0.5, 0.0, 0.5));
+        let input = PlayerInput {
+            movement: [1.0, 0.0],
+            ..Default::default()
+        };
+        step_player_with_bodies(&world, &mut state, &input, 0.25, &bodies);
+        assert!((state.position.x - 0.7).abs() < EPSILON);
+        assert_eq!(state.velocity.x, 0.0);
+
+        state = player(Vec3::new(1.5, 10.0, 0.5));
+        state.velocity.y = -60.0;
+        step_player_with_bodies(&world, &mut state, &PlayerInput::default(), 0.25, &bodies);
+        assert!((state.position.y - 1.0).abs() < EPSILON);
+        assert!(state.grounded);
+
+        let ceiling = [body(Vec3::new(0.5, 2.5, 0.5), Vec3::ZERO)];
+        state = player(Vec3::new(0.5, 0.0, 0.5));
+        let jump = PlayerInput {
+            jump: true,
+            ..Default::default()
+        };
+        step_player_with_bodies(&world, &mut state, &jump, 0.1, &ceiling);
+        assert!((state.position.y - 0.2).abs() < EPSILON);
+        assert_eq!(state.velocity.y, 0.0);
+        assert!(!state.grounded);
+    }
+
+    #[test]
+    fn loose_support_is_stable_and_allows_jump_without_snapshot_drift() {
+        let world = arena();
+        let bodies = [body(Vec3::new(0.5, 0.5, 0.5), Vec3::new(4.0, 2.0, 0.0))];
+        let mut state = player(Vec3::new(0.5, 1.0, 0.5));
+        for _ in 0..60 {
+            step_player_with_bodies(
+                &world,
+                &mut state,
+                &PlayerInput::default(),
+                FIXED_DT,
+                &bodies,
+            );
+            assert!(state.grounded);
+            assert_eq!(state.position, Vec3::new(0.5, 1.0, 0.5));
+        }
+        let jump = PlayerInput {
+            jump: true,
+            ..Default::default()
+        };
+        step_player_with_bodies(&world, &mut state, &jump, FIXED_DT, &bodies);
+        assert!(state.position.y > 1.0 && state.velocity.y > 0.0 && !state.grounded);
+    }
+
+    #[test]
+    fn updated_body_snapshot_pushes_once_and_cannot_cross_terrain() {
+        let mut world = arena();
+        let mut bodies = [body(Vec3::new(0.5, 0.5, 0.5), Vec3::X * 5.0)];
+        let mut state = player(Vec3::new(1.3, 0.0, 0.5));
+        bodies[0].position.x += 0.2;
+        step_player_with_bodies(
+            &world,
+            &mut state,
+            &PlayerInput::default(),
+            FIXED_DT,
+            &bodies,
+        );
+        assert!((state.position.x - 1.5).abs() < EPSILON);
+        let pushed = state.position;
+        for _ in 0..10 {
+            step_player_with_bodies(
+                &world,
+                &mut state,
+                &PlayerInput::default(),
+                FIXED_DT,
+                &bodies,
+            );
+            assert_eq!(state.position, pushed);
+        }
+        for y in 0..3 {
+            for z in -2..=2 {
+                world.set_block(IVec3::new(2, y, z), STONE);
+            }
+        }
+        bodies[0].position.x = 1.2;
+        step_player_with_bodies(
+            &world,
+            &mut state,
+            &PlayerInput::default(),
+            FIXED_DT,
+            &bodies,
+        );
+        assert!(state.position.x <= 2.0 - PLAYER_RADIUS + EPSILON);
+        assert!(state.position.y >= 0.0);
+        for y in 0..3 {
+            for z in -2..=2 {
+                assert!(!overlaps_block(&state, IVec3::new(2, y, z)));
+            }
+        }
+    }
+
+    #[test]
+    fn falling_body_overlap_does_not_push_character_through_floor() {
+        let world = arena();
+        let bodies = [body(Vec3::new(0.5, 2.0, 0.5), Vec3::NEG_Y * 10.0)];
+        let mut state = player(Vec3::new(0.5, 0.0, 0.5));
+        for _ in 0..10 {
+            step_player_with_bodies(
+                &world,
+                &mut state,
+                &PlayerInput::default(),
+                FIXED_DT,
+                &bodies,
+            );
+            assert!(state.position.y >= 0.0);
+            let (min, max) = bounds(state.position);
+            assert!(
+                !(min
+                    .cmplt(bodies[0].position + Vec3::splat(0.5 - EPSILON))
+                    .all()
+                    && max
+                        .cmpgt(bodies[0].position - Vec3::splat(0.5 - EPSILON))
+                        .all())
+            );
+        }
     }
 }

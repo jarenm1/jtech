@@ -2,7 +2,7 @@ use bevy_app::App;
 use glam::{IVec3, Vec3};
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, step_player};
-use protocol::{ClientMessage, InputPacket, ServerMessage};
+use protocol::{ClientMessage, EditRejection, InputPacket, ServerMessage};
 use simulation::{ServerConfig, Simulation, SimulationPlugin};
 use std::{
     collections::{HashMap, VecDeque},
@@ -27,6 +27,8 @@ struct Bot {
     snapshot_tick: u64,
     remotes: usize,
     edits: HashMap<u64, bool>,
+    damage: HashMap<u64, f32>,
+    rejections: HashMap<u64, EditRejection>,
     chunks: usize,
     deltas: usize,
     forgotten: usize,
@@ -50,6 +52,8 @@ impl Bot {
             snapshot_tick: 0,
             remotes: 0,
             edits: HashMap::new(),
+            damage: HashMap::new(),
+            rejections: HashMap::new(),
             chunks: 0,
             deltas: 0,
             forgotten: 0,
@@ -114,9 +118,21 @@ impl Bot {
                     self.world.remove(coord);
                     self.forgotten += 1;
                 }
-                ServerMessage::EditResult { request, accepted } => {
+                ServerMessage::EditResult {
+                    request,
+                    accepted,
+                    reason,
+                    damage,
+                } => {
                     self.edits.insert(request, accepted);
+                    if let Some(damage) = damage {
+                        self.damage.insert(request, damage);
+                    }
+                    if let Some(reason) = reason {
+                        self.rejections.insert(request, reason);
+                    }
                 }
+                ServerMessage::Physics { .. } => {}
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
             }
         }
@@ -238,6 +254,99 @@ fn require(condition: bool, message: &str) -> Result<()> {
         Err(message.into())
     }
 }
+/// Exercise repeated M1 contacts without treating their acknowledgements as deltas.
+fn break_block(
+    app: &mut App,
+    bots: &mut [&mut Bot],
+    target: IVec3,
+    pitch: f32,
+    request: &mut u64,
+    replay_first: bool,
+) -> Result<()> {
+    let coord = chunk_coord(target);
+    let revision = bots[0].world.chunks[&coord].revision;
+    let material = bots[0].world.block(target);
+    let deltas: Vec<_> = bots.iter().map(|bot| bot.deltas).collect();
+    let mut per_hit = 0.0;
+    for hit_index in 0..64 {
+        *request += 1;
+        let edit = ClientMessage::Edit {
+            request: *request,
+            target,
+            block: 0,
+            expected_revision: bots[0].world.chunks[&coord].revision,
+        };
+        bots[0].net.send(edit.clone())?;
+        // Thirty fixed ticks exceed the successful-action cooldown and allow TCP
+        // delivery before the next request reads the authoritative revision.
+        drive(app, bots, 30, [0.0; 2], pitch)?;
+        require(
+            bots[0].edits.get(request) == Some(&true),
+            &format!(
+                "valid material hit {request} rejected: {:?}",
+                bots[0].rejections.get(request)
+            ),
+        )?;
+        let damage = *bots[0]
+            .damage
+            .get(request)
+            .ok_or("accepted hit omitted damage")?;
+        require(
+            damage.is_finite() && damage > 0.0 && damage <= 1.0,
+            "invalid fracture fraction",
+        )?;
+        if hit_index == 0 {
+            per_hit = damage;
+            require(damage < 1.0, "material was destroyed by a single M1 hit")?;
+        }
+        require(
+            (damage - (per_hit * (hit_index + 1) as f32).min(1.0)).abs() < 0.0001,
+            "fracture accumulation differed from accepted hits (possible replay damage)",
+        )?;
+        if damage == 1.0 {
+            for (bot, before_deltas) in bots.iter().zip(&deltas) {
+                require(
+                    bot.world.block(target) == Some(0),
+                    "destroyed block did not replicate",
+                )?;
+                require(
+                    bot.world.chunks[&coord].revision == revision + 1,
+                    "destruction revision mismatch",
+                )?;
+                require(
+                    bot.deltas == before_deltas + 1,
+                    "destruction did not replicate exactly once",
+                )?;
+            }
+            return Ok(());
+        }
+        for (bot, before_deltas) in bots.iter().zip(&deltas) {
+            require(
+                bot.world.block(target) == material,
+                "partial hit changed terrain",
+            )?;
+            require(
+                bot.world.chunks[&coord].revision == revision,
+                "partial hit changed chunk revision",
+            )?;
+            require(
+                bot.deltas == *before_deltas,
+                "partial hit emitted a terrain delta",
+            )?;
+        }
+        if replay_first && hit_index == 0 {
+            bots[0].edits.remove(request);
+            bots[0].net.send(edit)?;
+            drive(app, bots, 30, [0.0; 2], pitch)?;
+            require(
+                bots[0].edits.get(request) == Some(&true)
+                    && bots[0].damage.get(request) == Some(&per_hit),
+                "duplicate hit did not replay the original result",
+            )?;
+        }
+    }
+    Err("material did not break within 64 accepted hits".into())
+}
 fn main() -> Result<()> {
     let plugin = SimulationPlugin::bind(ServerConfig {
         bind: "127.0.0.1:0".parse()?,
@@ -283,50 +392,38 @@ fn main() -> Result<()> {
         .ok_or("no editable ground in reach")?;
     let coord = chunk_coord(hit.block);
     let before = first.world.chunks[&coord].revision;
-    let edit = ClientMessage::Edit {
-        request: 1,
-        target: hit.block,
-        block: 0,
-        expected_revision: before,
-    };
-    first.net.send(edit.clone())?;
-    drive(&mut app, &mut [&mut first, &mut second], 30, [0.0; 2], -1.5)?;
-    require(
-        first.edits.get(&1) == Some(&true),
-        "valid edit was rejected",
+    let mut request = 0;
+    break_block(
+        &mut app,
+        &mut [&mut first, &mut second],
+        hit.block,
+        -1.5,
+        &mut request,
+        true,
     )?;
-    require(
-        first.deltas == 1 && second.deltas == 1,
-        "edit was not replicated once to both baselines",
-    )?;
-    require(
-        first.world.chunks[&coord].revision == before + 1
-            && second.world.chunks[&coord].revision == before + 1,
-        "clients disagree on terrain revision",
-    )?;
-    first.net.send(edit)?;
-    drive(&mut app, &mut [&mut first, &mut second], 12, [0.0; 2], -1.5)?;
-    require(first.deltas == 1, "duplicate request applied a second edit")?;
+    request += 1;
     first.net.send(ClientMessage::Edit {
-        request: 2,
+        request,
         target: hit.block,
         block: 3,
         expected_revision: before,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 12, [0.0; 2], -1.5)?;
     require(
-        first.edits.get(&2) == Some(&false),
+        first.edits.get(&request) == Some(&false)
+            && first.rejections.get(&request) == Some(&EditRejection::StaleRevision),
         "stale edit revision was accepted",
     )?;
+    request += 1;
     first.net.send(ClientMessage::Edit {
-        request: 3,
+        request,
         target: hit.block + IVec3::X * 1000,
         block: 255,
         expected_revision: before + 1,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 12, [0.0; 2], -1.5)?;
     require(
-        first.edits.get(&3) == Some(&false),
+        first.edits.get(&request) == Some(&false),
         "invalid out-of-reach edit was accepted",
     )?;
     // Deliberately discard a baseline then request authoritative replacement.
@@ -378,8 +475,9 @@ fn main() -> Result<()> {
     )?;
     let placement_coord = chunk_coord(placement);
     let placement_revision = first.world.chunks[&placement_coord].revision;
+    request += 1;
     first.net.send(ClientMessage::Edit {
-        request: 4,
+        request,
         target: placement,
         block: 5,
         expected_revision: placement_revision,
@@ -392,33 +490,21 @@ fn main() -> Result<()> {
         placement_pitch,
     )?;
     require(
-        first.edits.get(&4) == Some(&true),
+        first.edits.get(&request) == Some(&true),
         "valid placement was rejected",
     )?;
     require(
         first.world.block(placement) == Some(5) && second.world.block(placement) == Some(5),
         "placement did not replicate to both clients",
     )?;
-    // Remove the block we just placed through the same authoritative path:
-    // it is directly ahead and forms a two-block wall above the excavated floor.
-    first.net.send(ClientMessage::Edit {
-        request: 5,
-        target: placement,
-        block: 0,
-        expected_revision: first.world.chunks[&placement_coord].revision,
-    })?;
-    drive(
+    // Break the placed material through repeated authoritative contacts too.
+    break_block(
         &mut app,
         &mut [&mut first, &mut second],
-        30,
-        [0.0; 2],
+        placement,
         placement_pitch,
-    )?;
-    require(
-        first.edits.get(&5) == Some(&true)
-            && first.world.block(placement) == Some(0)
-            && second.world.block(placement) == Some(0),
-        "placed-block removal did not replicate",
+        &mut request,
+        false,
     )?;
     let final_revision = first.world.chunks[&coord].revision;
     let started = first.authority.position;
@@ -490,7 +576,7 @@ fn main() -> Result<()> {
         .resource::<Simulation>()
         .print_metrics(app.world().resource::<VoxelWorld>().chunks.len());
     println!(
-        "SMOKE PASS: two real TCP/UDP clients; reliable edits/revisions/rejection/resync; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect"
+        "SMOKE PASS: two real TCP/UDP clients; accumulating fracture/replay protection/destruction; reliable edits/revisions/rejection/resync; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect"
     );
     Ok(())
 }

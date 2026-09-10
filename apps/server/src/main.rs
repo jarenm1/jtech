@@ -13,9 +13,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..6] [--ticks N] [--metrics-every 600]"
+                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..6] [--ticks N] [--metrics-every 600] [--gpu-physics]"
             );
             return Ok(());
+        }
+        if arg == "--gpu-physics" {
+            config.gpu_physics = true;
+            continue;
         }
         let value = args
             .next()
