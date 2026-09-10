@@ -9,6 +9,7 @@ bevy_app.workspace = true
 bevy_ecs.workspace = true
 glam.workspace = true
 physics.workspace = true
+gameplay.workspace = true
 voxel_world.workspace = true
 protocol.workspace = true
 networking.workspace = true

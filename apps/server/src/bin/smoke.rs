@@ -2,7 +2,7 @@ use bevy_app::App;
 use glam::{IVec3, Vec3};
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, step_player};
-use protocol::{ArrowSnapshot, ClientMessage, EditRejection, InputPacket, ServerMessage};
+use protocol::{ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, ServerMessage};
 use simulation::{ServerConfig, Simulation, SimulationPlugin};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -20,6 +20,8 @@ struct Bot {
     world: VoxelWorld,
     state: PlayerState,
     authority: PlayerState,
+    health: Option<Health>,
+    remote_health: HashMap<u64, Health>,
     sequence: u64,
     acknowledged: u64,
     history: VecDeque<PlayerInput>,
@@ -47,6 +49,8 @@ impl Bot {
             world: VoxelWorld::default(),
             state: PlayerState::default(),
             authority: PlayerState::default(),
+            health: None,
+            remote_health: HashMap::new(),
             sequence: 0,
             acknowledged: 0,
             history: VecDeque::new(),
@@ -75,12 +79,15 @@ impl Bot {
                     session,
                     seed,
                     spawn,
+                    health,
                 } => {
                     self.id = id;
                     self.session = session;
                     self.world.seed = seed;
                     self.state = spawn;
                     self.authority = spawn;
+                    require(health == Health::default(), "welcome health was not full")?;
+                    self.health = Some(health);
                 }
                 ServerMessage::Chunk {
                     coord,
@@ -159,6 +166,8 @@ impl Bot {
             self.acknowledged = snapshot.you.last_input;
             self.remotes = snapshot.players.len();
             self.authority = snapshot.you.state;
+            self.health = Some(snapshot.you.health);
+            self.remote_health = snapshot.players.iter().map(|p| (p.id, p.health)).collect();
             while self
                 .history
                 .front()
@@ -539,6 +548,54 @@ fn explosive_bow() -> Result<()> {
     }
     Ok(())
 }
+fn check_health(app: &mut App, first: &mut Bot, second: &mut Bot) -> Result<()> {
+    require(
+        first.health == Some(Health::default()) && second.health == Some(Health::default()),
+        "initial player health missing",
+    )?;
+    let applied = app
+        .world_mut()
+        .resource_mut::<Simulation>()
+        .damage_player(first.id, 35);
+    require(applied == Some(35), "server damage did not apply")?;
+    drive(app, &mut [first, second], 30, [0.0; 2], -1.5)?;
+    require(
+        first.health.is_some_and(|h| h.current() == 65),
+        "local health did not replicate",
+    )?;
+    require(
+        second.remote_health.get(&first.id) == first.health.as_ref(),
+        "remote health did not replicate",
+    )?;
+    require(
+        second.health == Some(Health::default()),
+        "damage changed the wrong player",
+    )?;
+
+    app.world_mut()
+        .resource_mut::<Simulation>()
+        .damage_player(first.id, u16::MAX);
+    drive(app, &mut [first, second], 30, [0.0; 2], -1.5)?;
+    require(
+        first.health.is_some_and(Health::is_depleted),
+        "depleted health did not replicate",
+    )?;
+    app.world_mut()
+        .resource_mut::<Simulation>()
+        .heal_player(first.id, u16::MAX);
+    drive(app, &mut [first, second], 30, [0.0; 2], -1.5)?;
+    require(
+        first.health == Some(Health::default()),
+        "healing did not replicate",
+    )?;
+    require(
+        second.remote_health.get(&first.id) == first.health.as_ref(),
+        "remote healing did not replicate",
+    )?;
+    println!("HEALTH_OK welcome=100 damage=65 depleted=0 healed=100 local_and_remote=true");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let plugin = SimulationPlugin::bind(ServerConfig {
         bind: "127.0.0.1:0".parse()?,
@@ -574,6 +631,7 @@ fn main() -> Result<()> {
         first.world.chunks.len() == 27 && second.world.chunks.len() == 27,
         "bounded initial interest did not finish streaming",
     )?;
+    check_health(&mut app, &mut first, &mut second)?;
     let hit = first
         .world
         .raycast(
