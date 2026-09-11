@@ -7,6 +7,7 @@ mod bow;
 mod bow_server;
 mod explosion;
 mod health;
+mod items;
 mod material_damage;
 #[cfg(test)]
 mod noclip_tests;
@@ -16,7 +17,7 @@ mod streaming;
 mod terrain_stream;
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
-use gameplay::Health;
+use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
 use material_damage::{MAX_DAMAGED_BLOCKS, tool_contact};
 use networking::ServerTransport;
@@ -154,6 +155,10 @@ impl Plugin for SimulationPlugin {
                 detonations: VecDeque::new(),
                 next_arrow: 1,
                 arrow_revision: 0,
+                drops: VecDeque::new(),
+                next_drop: 1,
+                drop_revision: 0,
+                sent_drop_revision: 0,
                 packages: game_packages::PackageHost::new(&self.config.packages),
                 last_needed: HashMap::new(),
                 tick: 0,
@@ -190,6 +195,8 @@ struct Player {
     next_bow_time: u64,
     arrow_revision: Option<u64>,
     package_revision: Option<u64>,
+    inventory: Inventory,
+    inventory_dirty: bool,
 }
 impl Player {
     fn new() -> Self {
@@ -214,6 +221,8 @@ impl Player {
             next_bow_time: 0,
             arrow_revision: None,
             package_revision: None,
+            inventory: Inventory::default(),
+            inventory_dirty: false,
         }
     }
     fn snapshot(&self, id: u64) -> PlayerSnapshot {
@@ -282,6 +291,10 @@ pub struct Simulation {
     detonations: VecDeque<(u32, Vec3, game_packages::BlastSpec)>,
     next_arrow: u32,
     arrow_revision: u64,
+    drops: VecDeque<items::Drop>,
+    next_drop: u32,
+    drop_revision: u64,
+    sent_drop_revision: u64,
     packages: game_packages::PackageHost,
     terrain: terrain_stream::TerrainStream,
     spawn: Vec3,
@@ -627,10 +640,12 @@ impl Simulation {
         Ok(result.fraction)
     }
 
-    /// Common destruction event for grid and loose ownership. Item spawning belongs here.
+    /// Common destruction event for grid and loose ownership. Material identity is
+    /// all a drop needs today; a richer item registry can intercept here later.
     fn destroyed(&mut self, target: IVec3, material: u8, body: Option<u32>) {
         self.metrics.destroyed_blocks += 1;
         eprintln!("destroyed target={target} material={material} body={body:?}");
+        self.spawn_drop(target.as_vec3() + Vec3::splat(0.5), material, 1);
     }
     /// One authoritative voxel transaction path for edits, detachment, and settlement.
     fn record_change(&mut self, _world: &VoxelWorld, target: IVec3, block: u8, from: u64, to: u64) {
@@ -949,6 +964,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         player.state.position = position;
         let spawn = player.state;
         let health = player.health;
+        let inventory = player.inventory;
         sim.players.insert(id, player);
         sim.send(
             id,
@@ -958,6 +974,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 seed: sim.config.seed,
                 spawn,
                 health,
+                inventory,
             },
         );
         eprintln!("connect id={id}");
@@ -1089,6 +1106,12 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     sim.advance_bow(&mut world);
     sim.replicate_packages();
     sim.advance_physics(&mut world);
+    sim.advance_drops(&world);
+    sim.collect_drops();
+    sim.replicate_inventory();
+    if sim.tick.is_multiple_of(3) {
+        sim.replicate_drops();
+    }
     let mut needed = std::mem::take(&mut sim.needed);
     needed.clear();
     // One chunk of safety beyond visible interest ensures swept bodies never reach unloaded edges.
@@ -1501,6 +1524,150 @@ mod tests {
             },
         );
         assert_eq!(sim.players[&1].pending.len(), 1);
+        put_resources(&mut app, world, sim);
+    }
+
+    fn drop_arena(world: &mut VoxelWorld, sim: &Simulation) -> (IVec3, IVec3) {
+        let coord = *sim
+            .spawn_chunks
+            .iter()
+            .min_by_key(|coord| (coord.x, coord.y, coord.z))
+            .unwrap();
+        let ground = coord * CHUNK_SIZE + IVec3::new(5, 5, 5);
+        let floor = ground - IVec3::Y;
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let _ = world.set_block(floor + IVec3::new(dx, 0, dz), voxel_world::STONE);
+                for lift in 0..=3 {
+                    let _ = world.set_block(ground + IVec3::new(dx, lift, dz), 0);
+                }
+            }
+        }
+        (floor, ground)
+    }
+
+    #[test]
+    fn destroyed_blocks_drop_items_that_fall_settle_and_are_collected() {
+        let mut app = headless_app(1);
+        let (mut world, mut sim) = take_resources(&mut app);
+        let (floor, ground) = drop_arena(&mut world, &sim);
+
+        sim.destroyed(ground, voxel_world::STONE, None);
+        assert_eq!(sim.drops.len(), 1);
+        assert_eq!(sim.drops[0].snapshot.item, voxel_world::STONE);
+        assert_eq!(
+            sim.drops[0].snapshot.position,
+            ground.as_vec3() + Vec3::splat(0.5)
+        );
+
+        for _ in 0..300 {
+            sim.advance_drops(&world);
+        }
+        let settled = sim.drops[0].snapshot.position;
+        assert!(
+            (settled.y - (floor.y as f32 + 1.15)).abs() < 0.05,
+            "{settled:?}"
+        );
+        for _ in 0..60 {
+            assert!(!sim.drops[0].step(&world));
+            assert_eq!(sim.drops[0].snapshot.position, settled);
+        }
+        let support = (settled - Vec3::Y * 0.16).floor().as_ivec3();
+        world.set_block(support, voxel_world::AIR).unwrap();
+        assert!(sim.drops[0].step(&world));
+        for _ in 0..12 {
+            sim.drops[0].step(&world);
+        }
+        assert!(sim.drops[0].snapshot.position.y < settled.y);
+
+        let mut player = Player::new();
+        player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+        sim.players.insert(1, player);
+        sim.collect_drops();
+        assert!(sim.drops.is_empty());
+        assert_eq!(sim.players[&1].inventory.count(voxel_world::STONE), 1);
+        assert!(sim.players[&1].inventory_dirty);
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
+    fn spawn_drop_rejects_invalid_items_and_bounds_the_set() {
+        let mut app = headless_app(1);
+        let (_world, mut sim) = take_resources(&mut app);
+        for (item, count, position) in [
+            (0_u8, 1_u16, Vec3::ZERO),
+            (6, 1, Vec3::ZERO),
+            (3, 0, Vec3::ZERO),
+            (3, 1, Vec3::new(f32::NAN, 0.0, 0.0)),
+        ] {
+            sim.spawn_drop(position, item, count);
+        }
+        assert!(sim.drops.is_empty());
+        for _ in 0..protocol::MAX_DROPS + 5 {
+            sim.spawn_drop(Vec3::ZERO, voxel_world::STONE, 1);
+        }
+        assert_eq!(sim.drops.len(), protocol::MAX_DROPS);
+        assert!(
+            sim.drops
+                .iter()
+                .map(|drop| drop.snapshot.id)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert_eq!(sim.next_drop, protocol::MAX_DROPS as u32 + 6);
+    }
+
+    #[test]
+    fn collection_keeps_the_remainder_when_the_stack_is_full() {
+        let mut app = headless_app(1);
+        let (mut world, mut sim) = take_resources(&mut app);
+        let (_floor, ground) = drop_arena(&mut world, &sim);
+
+        let mut player = Player::new();
+        player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+        player
+            .inventory
+            .add(voxel_world::STONE, gameplay::MAX_STACK);
+        sim.players.insert(1, player);
+        sim.spawn_drop(ground.as_vec3() + Vec3::splat(0.5), voxel_world::STONE, 3);
+        for _ in 0..40 {
+            sim.advance_drops(&world);
+        }
+        sim.collect_drops();
+        assert_eq!(sim.drops.len(), 1);
+        assert_eq!(sim.drops[0].snapshot.count, 3);
+        assert!(!sim.players[&1].inventory_dirty);
+
+        let taken = sim
+            .players
+            .get_mut(&1)
+            .unwrap()
+            .inventory
+            .take(voxel_world::STONE, 2);
+        assert_eq!(taken, 2);
+        sim.collect_drops();
+        assert_eq!(sim.drops[0].snapshot.count, 1);
+        assert_eq!(
+            sim.players[&1].inventory.count(voxel_world::STONE),
+            gameplay::MAX_STACK
+        );
+
+        sim.players.get_mut(&1).unwrap().inventory_dirty = false;
+        assert_eq!(
+            sim.players
+                .get_mut(&1)
+                .unwrap()
+                .inventory
+                .take(voxel_world::STONE, 1),
+            1
+        );
+        sim.collect_drops();
+        assert!(sim.drops.is_empty());
+        assert_eq!(
+            sim.players[&1].inventory.count(voxel_world::STONE),
+            gameplay::MAX_STACK
+        );
         put_resources(&mut app, world, sim);
     }
 }

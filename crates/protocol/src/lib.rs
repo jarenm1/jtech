@@ -1,17 +1,19 @@
 mod bow_power;
 pub use bow_power::BowPower;
-pub use gameplay::Health;
+pub use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
 use physics::{PlayerInput, PlayerState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_ARROWS: usize = 32;
+/// Ceiling for one complete dropped-item replication, matching the server bound.
+pub const MAX_DROPS: usize = 64;
 pub const EXPLOSIVE_BOW_SLOT: u8 = 6;
 pub const EXPLOSIVE_BOW_SHOTS_PER_SECOND: u32 = 25;
 /// Horizontal chunk radius shared by server configuration and client camera bounds.
@@ -75,6 +77,7 @@ pub enum ServerMessage {
         seed: u64,
         spawn: PlayerState,
         health: Health,
+        inventory: Inventory,
     },
     Chunk {
         coord: IVec3,
@@ -123,6 +126,15 @@ pub enum ServerMessage {
         packages: Vec<PackageStatus>,
         bow_shots_per_second: u32,
     },
+    /// Authoritative owned-item counts for the receiving player, sent reliably on change.
+    Inventory {
+        inventory: Inventory,
+    },
+    /// Complete replacement of the bounded dropped-item set, at 20 Hz.
+    Drops {
+        tick: u64,
+        drops: Vec<DropSnapshot>,
+    },
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PackageState {
@@ -152,6 +164,14 @@ pub struct ArrowSnapshot {
     pub id: u32,
     pub position: Vec3,
     pub velocity: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct DropSnapshot {
+    pub id: u32,
+    pub item: u8,
+    pub count: u16,
+    pub position: Vec3,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,6 +220,7 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gameplay::MAX_STACK;
 
     #[test]
     fn player_health_round_trips_in_welcome_and_snapshot() {
@@ -211,6 +232,7 @@ mod tests {
             seed: 7,
             spawn: PlayerState::default(),
             health,
+            inventory: Inventory::default(),
         };
         let bytes = encode(&welcome, MAX_FRAME).unwrap();
         let ServerMessage::Welcome {
@@ -341,5 +363,44 @@ mod tests {
         let bytes = encode(&Some(EditRejection::Dead), MAX_FRAME).unwrap();
         let decoded: Option<EditRejection> = decode(&bytes, MAX_FRAME).unwrap();
         assert_eq!(decoded, Some(EditRejection::Dead));
+    }
+
+    #[test]
+    fn inventory_and_drops_round_trip_in_one_frame() {
+        let mut inventory = Inventory::default();
+        assert_eq!(inventory.add(3, 12), 12);
+        let bytes = encode(&ServerMessage::Inventory { inventory }, MAX_FRAME).unwrap();
+        let ServerMessage::Inventory {
+            inventory: decoded, ..
+        } = decode(&bytes, MAX_FRAME).unwrap()
+        else {
+            panic!("wrong message")
+        };
+        assert_eq!(decoded, inventory);
+        assert_eq!(decoded.count(3), 12);
+
+        let drops = (0..MAX_DROPS)
+            .map(|id| DropSnapshot {
+                id: id as u32,
+                item: 3,
+                count: 1,
+                position: Vec3::new(0.5, 20.5, -0.5),
+            })
+            .collect();
+        let bytes = encode(&ServerMessage::Drops { tick: 9, drops }, MAX_FRAME).unwrap();
+        let ServerMessage::Drops { tick, drops } = decode(&bytes, MAX_FRAME).unwrap() else {
+            panic!("wrong message")
+        };
+        assert_eq!(tick, 9);
+        assert_eq!(drops.len(), MAX_DROPS);
+        assert_eq!(drops[MAX_DROPS - 1].position, Vec3::new(0.5, 20.5, -0.5));
+    }
+
+    #[test]
+    fn inventory_decode_rejects_counts_above_the_stack_ceiling() {
+        let bytes = encode(&[1_u16, 0, 0, 0, 0, MAX_STACK], MAX_FRAME).unwrap();
+        assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_ok());
+        let bytes = encode(&[1_u16, 0, 0, 0, 0, MAX_STACK + 1], MAX_FRAME).unwrap();
+        assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_err());
     }
 }

@@ -11,7 +11,7 @@ can read `Simulation::player_health` and use `damage_player`, `heal_player`, or
 `restore_player_health`. Unknown or disconnected player IDs return `None`.
 Clients receive health in the welcome message and the 20 Hz player snapshots,
 and display it in the HUD. Health is not predicted during movement replay.
-Protocol version 11 requires matching client and server builds.
+Protocol version 12 requires matching client and server builds.
 
 ## Blast damage and respawn
 
@@ -65,11 +65,33 @@ force. Horizontal momentum carries through movement and decays with drag,
 while gravity and collisions govern the jump. Noclip players ignore blasts.
 Player knockback works with or without GPU physics.
 
+## Items and drops
+
+Destroying a block leaves a dropped stack carrying the material's item id. A drop
+pops out, falls under gravity, and settles on the first solid surface below it;
+if that support is later removed it resumes falling. Drops despawn after five
+minutes, and the replicated set is bounded at `protocol::MAX_DROPS` (64), evicting
+the oldest.
+
+`gameplay::Inventory` keeps one count per placeable material (ids 1 through 5,
+matching the block materials) with a per-kind ceiling of `gameplay::MAX_STACK`
+(999). The server owns every mutation: each authoritative destruction path calls
+`spawn_drop`, and `collect_drops` merges stacks into living players within 1.8 m,
+lowest player id first, after a half-second arming delay. A full stack leaves the
+remainder in the world.
+
+Counts reach clients reliably on change (`ServerMessage::Inventory`, also carried
+in the welcome) and the complete drop set is replaced on change, up to 20 Hz
+(`ServerMessage::Drops`). The client renders drops as bobbing cubes and shows
+owned counts on the hotbar tiles; it holds no authoritative drop or item state.
+Item ids currently match block materials; richer item behavior can be added
+through a future registry.
 ## Game interface
 
-Select a hotbar slot with **1–6**. Read health at the lower left and the selected
-item above the centered hotbar. Package status and reload errors appear at the
-upper right; the FPS counter is at the upper left.
+Select a hotbar slot with **1–6**. Read health at the lower left, the selected
+item above the centered hotbar, and owned item counts on the hotbar tiles.
+Package status and reload errors appear at the upper right; the FPS counter is at
+the upper left.
 
 Press **Esc** to open the translucent pause menu. Choose **Resume** or press
 **Esc** again to return, adjust **Bow power**, or choose **Quit game** to exit.

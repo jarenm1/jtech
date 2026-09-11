@@ -53,6 +53,9 @@ pub(crate) struct SelectedLabel;
 pub(crate) struct ConnectionStatus;
 
 #[derive(Component)]
+pub(crate) struct SlotCount(u8);
+
+#[derive(Component)]
 pub(crate) struct FpsCounter;
 pub(crate) fn spawn(commands: &mut Commands) {
     spawn_crosshair(commands);
@@ -261,17 +264,51 @@ fn spawn_hotbar(commands: &mut Commands) {
                                 BorderRadius::all(px(3)),
                             ));
                         }
+                        if slot != EXPLOSIVE_BOW_SLOT {
+                            tile.spawn((
+                                Text::new(""),
+                                TextFont {
+                                    font_size: 13.0,
+                                    ..default()
+                                },
+                                TextColor(palette::IVORY),
+                                TextShadow::default(),
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    bottom: px(2),
+                                    right: px(5),
+                                    ..default()
+                                },
+                                SlotCount(slot),
+                            ));
+                        }
                     });
                 }
             });
         });
 }
 
+#[allow(clippy::type_complexity)] // Disjoint Text queries keep the label, slot counts and status independent.
 pub(crate) fn update(
     session: Res<ClientSession>,
     mut slots: Query<(&HotbarSlot, &mut BackgroundColor, &mut BorderColor)>,
-    mut selected_label: Single<&mut Text, (With<SelectedLabel>, Without<ConnectionStatus>)>,
+    mut selected_label: Single<
+        &mut Text,
+        (
+            With<SelectedLabel>,
+            Without<ConnectionStatus>,
+            Without<SlotCount>,
+        ),
+    >,
     mut status: Single<(&mut Node, &mut Text, &mut TextColor), With<ConnectionStatus>>,
+    mut counts: Query<
+        (&SlotCount, &mut Text),
+        (
+            With<SlotCount>,
+            Without<SelectedLabel>,
+            Without<ConnectionStatus>,
+        ),
+    >,
 ) {
     for (slot, mut background, mut border) in &mut slots {
         let selected = slot.0 == session.selected;
@@ -287,6 +324,14 @@ pub(crate) fn update(
         });
     }
     **selected_label = Text::new(slot_name(session.selected));
+    for (slot, mut text) in &mut counts {
+        let count = session.inventory.count(slot.0);
+        text.0 = if count == 0 {
+            String::new()
+        } else {
+            count.to_string()
+        };
+    }
 
     let (node, text, color) = &mut *status;
     let connected = session.transport.is_some() && session.id.is_some();

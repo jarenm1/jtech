@@ -1,5 +1,6 @@
 mod bow_power_hud;
 mod death_overlay;
+mod drops;
 mod game_hud;
 mod health_hud;
 mod loose_blocks;
@@ -22,8 +23,8 @@ use bevy::{
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerInput, PlayerState, look_direction};
 use protocol::{
-    BowPower, ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, Health, InputPacket, ServerMessage,
-    Snapshot,
+    BowPower, ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, Health, InputPacket, Inventory,
+    ServerMessage, Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{
@@ -97,6 +98,7 @@ struct ClientSession {
     life: u64,
     // Replicated independently of movement prediction.
     health: Health,
+    inventory: Inventory,
     noclip_requested: bool,
     pending: VecDeque<PlayerInput>,
     sequence: u64,
@@ -156,6 +158,7 @@ impl Default for ClientSession {
             state: PlayerState::default(),
             life: 0,
             health: Health::default(),
+            inventory: Inventory::default(),
             noclip_requested: false,
             pending: VecDeque::with_capacity(256),
             sequence: 0,
@@ -350,6 +353,7 @@ fn main() {
             ClientPlugin,
             loose_blocks::LooseBlocksPlugin,
             projectiles::ProjectilesPlugin,
+            drops::DropsPlugin,
         ))
         .run();
 }
@@ -446,6 +450,8 @@ fn receive_network(
     loose_assets: Res<loose_blocks::LooseBlockAssets>,
     mut projectiles: ResMut<projectiles::Projectiles>,
     projectile_assets: Res<projectiles::ProjectileAssets>,
+    mut drops: ResMut<drops::Drops>,
+    drop_assets: Res<drops::DropAssets>,
 ) {
     let Some(transport) = &mut session.transport else {
         return;
@@ -468,14 +474,17 @@ fn receive_network(
                 seed,
                 spawn,
                 health,
+                inventory,
             } => {
                 projectiles.clear(&mut commands);
+                drops.clear(&mut commands);
                 session.packages = package_hud::ServerPackages::default();
                 session.id = Some(id);
                 session.session = token;
                 session.state = spawn;
                 session.noclip_requested = spawn.noclip;
                 session.health = health;
+                session.inventory = inventory;
                 session.life = 0;
                 session.pending.clear();
                 session.correction = Vec3::ZERO;
@@ -580,6 +589,21 @@ fn receive_network(
                 session
                     .packages
                     .receive(revision, packages, bow_shots_per_second);
+            }
+            ServerMessage::Inventory { inventory } => {
+                session.inventory = inventory;
+            }
+            ServerMessage::Drops {
+                tick,
+                drops: snapshots,
+            } => {
+                drops.receive(
+                    tick,
+                    &snapshots,
+                    &mut commands,
+                    &drop_assets,
+                    Instant::now(),
+                );
             }
             ServerMessage::Disconnect { reason } => {
                 session.disconnect(reason);
