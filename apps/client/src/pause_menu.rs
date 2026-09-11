@@ -24,6 +24,12 @@ impl PauseMenu {
         self.suppress_frame = true;
         self.wait_for_release = true;
     }
+
+    /// Extend the gameplay gate until the mouse is released. Overlays that close
+    /// without opening the menu use this so their click cannot reach gameplay.
+    pub(crate) fn hold_for_mouse_release(&mut self) {
+        self.wait_for_release = true;
+    }
 }
 
 #[derive(Component)]
@@ -167,7 +173,7 @@ pub(crate) fn actions(
     }
 }
 
-fn button_color(interaction: Interaction) -> Color {
+pub(crate) fn button_color(interaction: Interaction) -> Color {
     match interaction {
         Interaction::Pressed => Color::srgb(0.39, 0.32, 0.2),
         Interaction::Hovered => Color::srgb(0.24, 0.26, 0.25),

@@ -217,7 +217,38 @@ pub(super) fn spawn_position(generator: &TerrainGenerator, seed: u64) -> Vec3 {
     Vec3::new(0.5, height as f32 + 1.05, 0.5)
 }
 
-/// Search only the warm spawn volume. Joining never performs generation on the tick.
+const SPAWN_SEARCH_HEIGHT: i32 = 64;
+
+/// Small fallback volume to warm asynchronously if excavation removes every
+/// supported landing in the initially loaded spawn chunks.
+pub(super) fn spawn_search_chunks(preferred: Vec3) -> HashSet<IVec3> {
+    let min = chunk_coord(
+        (preferred - Vec3::new(9.0, (SPAWN_SEARCH_HEIGHT + 1) as f32, 9.0))
+            .floor()
+            .as_ivec3(),
+    );
+    let max = chunk_coord(
+        (preferred + Vec3::new(9.0, (SPAWN_SEARCH_HEIGHT + 2) as f32, 9.0))
+            .floor()
+            .as_ivec3(),
+    );
+    let mut chunks = HashSet::new();
+    for x in min.x..=max.x {
+        for z in min.z..=max.z {
+            for y in min.y..=max.y {
+                let coord = IVec3::new(x, y, z);
+                if valid_coord(coord) {
+                    chunks.insert(coord);
+                }
+            }
+        }
+    }
+    chunks
+}
+
+/// Search only the warm spawn volume for a supported, player-clear cell that also
+/// avoids loose colliders. Joining and respawn never generate terrain on the tick;
+/// when no safe cell is loaded the caller keeps the player dead for a later retry.
 pub(super) fn available_spawn(
     world: &voxel_world::VoxelWorld,
     preferred: Vec3,
@@ -234,7 +265,7 @@ pub(super) fn available_spawn(
         (8, -8),
         (-8, 8),
     ] {
-        for step in 0..128 {
+        for step in 0..SPAWN_SEARCH_HEIGHT * 2 {
             let dy = if step % 2 == 0 {
                 step / 2
             } else {

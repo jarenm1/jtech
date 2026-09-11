@@ -6,7 +6,7 @@ use physics::{PlayerInput, PlayerState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -34,6 +34,7 @@ pub enum EditRejection {
     StorageFull,
     RevisionExhausted,
     PackageUnavailable,
+    Dead,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +62,9 @@ pub enum ClientMessage {
         yaw: f32,
         pitch: f32,
         power: BowPower,
+    },
+    Respawn {
+        life: u64,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,6 +160,7 @@ pub struct PlayerSnapshot {
     pub last_input: u64,
     pub state: PlayerState,
     pub health: Health,
+    pub life: u64,
     pub yaw: f32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,6 +172,7 @@ pub struct Snapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputPacket {
     pub session: u64,
+    pub life: u64,
     pub inputs: Vec<PlayerInput>,
 }
 
@@ -219,6 +225,7 @@ mod tests {
             last_input: 3,
             state: PlayerState::default(),
             health,
+            life: 0,
             yaw: 0.0,
         };
         let snapshot = Snapshot {
@@ -254,6 +261,7 @@ mod tests {
             last_input: u64::MAX,
             state: PlayerState::default(),
             health: Health::new(u16::MAX).unwrap(),
+            life: u64::MAX,
             yaw: 1.0,
         };
         let snapshot = Snapshot {
@@ -291,5 +299,47 @@ mod tests {
         assert_eq!(bodies.len(), MAX_PHYSICS_BODIES);
         assert_eq!(bodies[127].position, Vec3::new(0.5, 20.5, -0.5));
         assert_eq!(bodies[127].velocity, Vec3::new(1.0, -2.0, 3.0));
+    }
+
+    #[test]
+    fn life_tokens_round_trip_in_snapshot_and_input_packet() {
+        let player = PlayerSnapshot {
+            id: 4,
+            last_input: 9,
+            state: PlayerState::default(),
+            health: Health::default(),
+            life: 3,
+            yaw: 0.5,
+        };
+        let snapshot = Snapshot {
+            tick: 12,
+            you: player.clone(),
+            players: vec![player],
+        };
+        let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
+        let decoded: Snapshot = decode(&bytes, MAX_DATAGRAM).unwrap();
+        assert_eq!(decoded.you.life, 3);
+        assert_eq!(decoded.players[0].life, 3);
+
+        let packet = InputPacket {
+            session: 7,
+            life: 3,
+            inputs: vec![PlayerInput::default()],
+        };
+        let bytes = encode(&packet, MAX_DATAGRAM).unwrap();
+        let decoded: InputPacket = decode(&bytes, MAX_DATAGRAM).unwrap();
+        assert_eq!(decoded.session, 7);
+        assert_eq!(decoded.life, 3);
+    }
+
+    #[test]
+    fn respawn_request_and_dead_rejection_round_trip() {
+        let bytes = encode(&ClientMessage::Respawn { life: 5 }, MAX_FRAME).unwrap();
+        let decoded: ClientMessage = decode(&bytes, MAX_FRAME).unwrap();
+        assert!(matches!(decoded, ClientMessage::Respawn { life: 5 }));
+
+        let bytes = encode(&Some(EditRejection::Dead), MAX_FRAME).unwrap();
+        let decoded: Option<EditRejection> = decode(&bytes, MAX_FRAME).unwrap();
+        assert_eq!(decoded, Some(EditRejection::Dead));
     }
 }

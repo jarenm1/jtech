@@ -9,6 +9,10 @@ use protocol::BowPower;
 use protocol::PhysicsBodySnapshot;
 use voxel_world::{CHUNK_SIZE, MIN_CHUNK_Y, VoxelWorld};
 
+// A full-health player survives one blast at any preset. Larger radii extend
+// the dangerous area; repeated close shots are lethal without sacrificing jumps.
+const MAX_PLAYER_BLAST_DAMAGE: f32 = 60.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Target {
     Grid(IVec3),
@@ -22,6 +26,8 @@ pub(super) struct BlastLoad {
     pub contact: TerrainContact,
     pub direction: Vec3,
     pub kinetic_energy: f32,
+    /// Whole health points from the same frozen exposure samples as knockback.
+    pub player_damage: u16,
 }
 
 /// Positive outward impulse whose change in kinetic energy is the reserved budget.
@@ -200,6 +206,11 @@ pub(super) fn plan_blast(
                 target,
                 direction,
                 kinetic_energy,
+                player_damage: if matches!(target, Target::Player(_)) {
+                    (MAX_PLAYER_BLAST_DAMAGE * weight).round() as u16
+                } else {
+                    0
+                },
                 contact: TerrainContact {
                     target: match target {
                         Target::Grid(cell) => cell.to_array(),
@@ -545,5 +556,36 @@ mod tests {
                 .iter()
                 .all(|load| load.target != Target::Player(1))
         );
+    }
+
+    #[test]
+    fn player_damage_uses_falloff_and_partial_exposure_without_sharing_a_budget() {
+        let mut world = empty_world();
+        let center = Vec3::new(8.5, 10.9, 10.5);
+        let player = PlayerState {
+            position: Vec3::new(10.5, 10.0, 10.5),
+            ..Default::default()
+        };
+        let damage = |world: &VoxelWorld, players: &[(u64, PlayerState)]| {
+            plan(world, &[], players, center, BowPower::Standard)
+                .into_iter()
+                .filter(|load| matches!(load.target, Target::Player(_)))
+                .map(|load| load.player_damage)
+                .collect::<Vec<_>>()
+        };
+        let full = damage(&world, &[(1, player)])[0];
+        assert!(full > 0);
+        assert_eq!(damage(&world, &[(1, player), (2, player)]), [full, full]);
+        let farther = PlayerState {
+            position: player.position + Vec3::X,
+            ..player
+        };
+        assert!(damage(&world, &[(1, farther)])[0] < full);
+        // The top ray clears this block, the lower two do not.
+        world.set_block(IVec3::new(9, 10, 10), 3).unwrap();
+        let partial = damage(&world, &[(1, player)])[0];
+        assert!(partial > 0 && partial < full);
+        world.set_block(IVec3::new(9, 11, 10), 3).unwrap();
+        assert!(damage(&world, &[(1, player)]).is_empty());
     }
 }

@@ -20,6 +20,7 @@ type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 struct Bot {
     net: ClientTransport,
     id: u64,
+    life: u64,
     session: u64,
     world: VoxelWorld,
     state: PlayerState,
@@ -50,6 +51,7 @@ impl Bot {
         Ok(Self {
             net: ClientTransport::connect(address)?,
             id: 0,
+            life: 0,
             session: 0,
             world: VoxelWorld::default(),
             state: PlayerState::default(),
@@ -92,6 +94,7 @@ impl Bot {
                     self.world.seed = seed;
                     self.state = spawn;
                     self.authority = spawn;
+                    self.life = 0;
                     require(health == Health::default(), "welcome health was not full")?;
                     self.health = Some(health);
                 }
@@ -180,6 +183,12 @@ impl Bot {
             self.remotes = snapshot.players.len();
             self.authority = snapshot.you.state;
             self.health = Some(snapshot.you.health);
+            let life_changed = self.life != snapshot.you.life;
+            if life_changed || snapshot.you.health.is_depleted() {
+                self.history.clear();
+                self.delayed.clear();
+            }
+            self.life = snapshot.you.life;
             self.remote_health = snapshot.players.iter().map(|p| (p.id, p.health)).collect();
             while self
                 .history
@@ -214,7 +223,9 @@ impl Bot {
             jump: movement != [0.0; 2],
             ..Default::default()
         };
-        step_player(&self.world, &mut self.state, &input, FIXED_DT);
+        if !self.health.is_some_and(Health::is_depleted) {
+            step_player(&self.world, &mut self.state, &input, FIXED_DT);
+        }
         self.history.push_back(input);
         if self.history.len() > 256 {
             return Err("prediction history exceeded bound".into());
@@ -224,6 +235,7 @@ impl Bot {
         if !self.jitter || tick % 29 >= 3 {
             let packet = InputPacket {
                 session: self.session,
+                life: self.life,
                 inputs: self
                     .history
                     .iter()
@@ -695,19 +707,63 @@ fn check_health(app: &mut App, first: &mut Bot, second: &mut Bot) -> Result<()> 
         first.health.is_some_and(Health::is_depleted),
         "depleted health did not replicate",
     )?;
-    app.world_mut()
-        .resource_mut::<Simulation>()
-        .heal_player(first.id, u16::MAX);
-    drive(app, &mut [first, second], 30, [0.0; 2], -1.5)?;
+    let life = first.life;
+    let dead_position = first.authority.position;
     require(
-        first.health == Some(Health::default()),
-        "healing did not replicate",
+        app.world_mut()
+            .resource_mut::<Simulation>()
+            .heal_player(first.id, u16::MAX)
+            == Some(0),
+        "healing revived a dead player",
+    )?;
+    drive(app, &mut [first, second], 300, [0.0; 2], -1.5)?;
+    require(
+        first.authority.position == dead_position,
+        "dead player moved",
+    )?;
+    require(
+        first.health.is_some_and(Health::is_depleted),
+        "death did not persist",
     )?;
     require(
         second.remote_health.get(&first.id) == first.health.as_ref(),
-        "remote healing did not replicate",
+        "remote death did not replicate",
     )?;
-    println!("HEALTH_OK welcome=100 damage=65 depleted=0 healed=100 local_and_remote=true");
+    first.net.send(ClientMessage::Respawn { life })?;
+    drive(app, &mut [first, second], 60, [0.0; 2], -1.5)?;
+    require(
+        first.life == life + 1 && first.health == Some(Health::default()),
+        "respawn did not replicate",
+    )?;
+    require(
+        second.remote_health.get(&first.id) == first.health.as_ref(),
+        "remote respawn health did not replicate",
+    )?;
+    require(
+        first.authority.grounded && first.authority.position.is_finite(),
+        "respawn did not settle on loaded support",
+    )?;
+    let position = first.authority.position;
+    first.net.send(ClientMessage::Respawn { life })?;
+    first.net.send_inputs(InputPacket {
+        session: first.session,
+        life,
+        inputs: vec![PlayerInput {
+            sequence: first.sequence + 1,
+            movement: [1.0, 0.0],
+            noclip: true,
+            ..Default::default()
+        }],
+    })?;
+    drive(app, &mut [first, second], 30, [0.0; 2], -1.5)?;
+    require(
+        first.life == life + 1 && first.authority.position == position && !first.authority.noclip,
+        "old-life action affected respawn",
+    )?;
+    println!(
+        "HEALTH_OK welcome=100 damage=65 death=0 respawn=100 life={} local_and_remote=true",
+        first.life
+    );
     Ok(())
 }
 

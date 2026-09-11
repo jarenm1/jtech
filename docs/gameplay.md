@@ -2,21 +2,42 @@
 
 `gameplay::Health` is a shared Bevy component with whole-point current and maximum
 health. Players start at 100/100. Damage saturates at zero; healing saturates at
-the maximum. Both operations return the actual change. Healing from zero is
-allowed, and `restore` fills health. A custom maximum must be positive.
+the maximum. Both operations return the actual change. The component allows
+healing from zero; the server's player lifecycle requires respawn instead.
+A custom maximum must be positive.
 
 The authoritative server stores health separately from movement. Gameplay code
 can read `Simulation::player_health` and use `damage_player`, `heal_player`, or
 `restore_player_health`. Unknown or disconnected player IDs return `None`.
 Clients receive health in the welcome message and the 20 Hz player snapshots,
 and display it in the HUD. Health is not predicted during movement replay.
-Protocol version 9 requires matching client and server builds.
+Protocol version 11 requires matching client and server builds.
 
-This slice provides health and depletion state. Death/respawn rules and damage
-sources are separate gameplay work. For moving-block damage, convert a confirmed
-server-side impact to health points and call `damage_player` once for that event.
-Use stable player/body IDs across asynchronous physics readback, and distinguish
-new impacts from resting contacts before applying damage.
+## Blast damage and respawn
+
+Blasts damage each exposed player once, including the shooter. Damage is rounded
+to whole points: `60 × exposure × (1 − distance / radius)²`. Distance is measured
+to the player's center; exposure is the fraction of three clear rays at quarter,
+half and three-quarter height. Terrain and loose-block shielding are sampled
+before the explosion changes the world. Noclip players ignore blasts.
+
+One blast cannot kill a full-health player, so ordinary blast jumps are
+survivable. Larger bow presets extend the dangerous area. Repeated close shots
+can kill. At zero HP, movement, firing and terrain edits are blocked by the
+server; queued input, momentum and pending strikes are cleared.
+
+Press **Enter** or select **Respawn** on the death overlay to return with full
+health and zero momentum in walking mode. The server searches loaded, supported,
+collision-free space near the original spawn, using the current edited terrain.
+The request waits for GPU readback and, if needed, asynchronous loading of a
+small fallback area. You stay on the death overlay until safe support is available.
+Each successful respawn advances a life counter: old movement packets and
+repeated respawn requests cannot affect the new life, and the client discards
+prediction from the previous life.
+
+For moving-block damage, convert a confirmed server-side impact to health points
+and call `damage_player` once for that event. Use stable player/body IDs across
+asynchronous physics readback, and distinguish new impacts from resting contacts.
 
 Run `cargo test -p gameplay -p protocol -p simulation -p voxel-client` for the
 component, wire validation, server integration, and client checks.
