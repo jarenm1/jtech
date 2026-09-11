@@ -765,14 +765,14 @@ mod tests {
             grounded: true,
             ..Default::default()
         };
-        let input = physics::PlayerInput {
+        let input = controller::PlayerInput {
             movement: [1.0, 0.0],
             ..Default::default()
         };
         for _ in 0..60 {
             let mut intended = player;
-            physics::step_player(&world, &mut intended, &input, physics::FIXED_DT);
-            physics::step_player_with_bodies(
+            controller::step_player(&world, &mut intended, &input, physics::FIXED_DT);
+            controller::step_player_with_bodies(
                 &world,
                 &mut player,
                 &input,

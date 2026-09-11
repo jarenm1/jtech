@@ -1,9 +1,9 @@
 //! Server-owned health access for gameplay systems and future physics impacts.
 
 use super::{Simulation, terrain_stream};
+use controller::PlayerInput;
 use gameplay::Health;
 use glam::Vec3;
-use physics::PlayerInput;
 use voxel_world::VoxelWorld;
 
 impl Simulation {

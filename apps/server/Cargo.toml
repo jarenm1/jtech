@@ -12,6 +12,7 @@ voxel_world.workspace = true
 networking.workspace = true
 protocol.workspace = true
 physics.workspace = true
+controller.workspace = true
 glam.workspace = true
 
 [dev-dependencies]

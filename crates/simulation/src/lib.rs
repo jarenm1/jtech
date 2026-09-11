@@ -1,3 +1,5 @@
+use controller::PlayerInput;
+use controller::step_player;
 mod active_terrain;
 #[cfg(test)]
 mod blast_jump_tests;
@@ -21,9 +23,7 @@ use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
 use material_damage::{MAX_DAMAGED_BLOCKS, tool_contact};
 use networking::ServerTransport;
-use physics::{
-    EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, look_direction, overlaps_block, step_player,
-};
+use physics::{EYE_HEIGHT, FIXED_DT, PlayerState, look_direction, overlaps_block};
 use physics_slice::PhysicsSlice;
 use protocol::{
     ClientMessage, EditRejection, InputPacket, PlayerSnapshot, ServerMessage, Snapshot,
@@ -131,6 +131,12 @@ impl SimulationPlugin {
 }
 impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(controller::ControllerPlugin::on(Update));
+        app.configure_sets(Update, controller::ControllerSet::Intent.after(advance));
+        app.add_systems(
+            Update,
+            observe_character_bodies.in_set(controller::ControllerSet::Intent),
+        );
         let mut world = VoxelWorld {
             seed: self.config.seed,
             generator: self.generator.clone(),
@@ -1017,7 +1023,13 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             let previous = player.state;
             let mut intended = previous;
             step_player(&world, &mut intended, &input, FIXED_DT);
-            physics::step_player_with_bodies(&world, &mut player.state, &input, FIXED_DT, &bodies);
+            controller::step_player_with_bodies(
+                &world,
+                &mut player.state,
+                &input,
+                FIXED_DT,
+                &bodies,
+            );
             // Preserve attempted horizontal motion when a loose body blocks the character.
             // The GPU resolves that kinematic push against material mass and terrain.
             player.body_push_velocity = Vec3::new(
@@ -1266,6 +1278,14 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     }
 }
 
+fn observe_character_bodies(sim: Res<Simulation>, mut bodies: ResMut<controller::ObservedBodies>) {
+    bodies.0 = sim
+        .physics
+        .as_ref()
+        .map(|p| p.dynamic_colliders())
+        .unwrap_or_default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1350,6 +1370,63 @@ mod tests {
         player.known.insert(IVec3::ZERO, 2);
         assert!(!valid_player_edit(&world, &player, 100, 1, target, 0, 2));
         assert_eq!(world.block(target), Some(5));
+    }
+
+    #[test]
+    fn controller_actors_use_authoritative_world_and_one_tick_per_update() {
+        let mut app = headless_app(1);
+        let spawn = app.world().resource::<Simulation>().spawn;
+        let position =
+            terrain_stream::available_spawn(app.world().resource::<VoxelWorld>(), spawn, &[])
+                .unwrap();
+        let initial = controller::CharacterState {
+            motion: PlayerState {
+                position,
+                ..Default::default()
+            },
+            yaw: 0.0,
+        };
+        let body = controller::CharacterBody::default();
+        let profile = controller::MovementProfile::default();
+        let mut intent = controller::CharacterIntent {
+            movement: glam::Vec2::X,
+            ..Default::default()
+        };
+        let entity = app.world_mut().spawn((initial, body, profile, intent)).id();
+        // Host refresh must replace stale observations before the motor runs.
+        app.world_mut()
+            .resource_mut::<controller::ObservedBodies>()
+            .0
+            .push(physics::DynamicCollider {
+                id: 99,
+                position,
+                velocity: Vec3::ZERO,
+            });
+        app.update();
+        assert_eq!(app.world().resource::<Simulation>().tick, 1);
+        assert!(
+            app.world()
+                .resource::<controller::ObservedBodies>()
+                .0
+                .is_empty()
+        );
+        let mut expected = initial;
+        controller::step_character(
+            app.world().resource::<VoxelWorld>(),
+            &mut expected,
+            &body,
+            &profile,
+            &mut intent,
+            FIXED_DT,
+            &[],
+        );
+        assert_eq!(
+            *app.world()
+                .get::<controller::CharacterState>(entity)
+                .unwrap(),
+            expected
+        );
+        assert!(expected.motion.position.x > initial.motion.position.x);
     }
 
     fn headless_app(radius: i32) -> App {

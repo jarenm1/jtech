@@ -1,5 +1,5 @@
 [package]
-name = "simulation"
+name = "controller"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,6 @@ license.workspace = true
 bevy_app.workspace = true
 bevy_ecs.workspace = true
 glam.workspace = true
+serde.workspace = true
 physics.workspace = true
-controller.workspace = true
-gameplay.workspace = true
 voxel_world.workspace = true
-protocol.workspace = true
-networking.workspace = true
-parking_lot = "0.12"
-gpu_physics = { path = "../gpu_physics" }
-game_packages.workspace = true

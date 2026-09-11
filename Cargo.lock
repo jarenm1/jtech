@@ -1672,6 +1672,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "controller"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "glam",
+ "physics",
+ "serde",
+ "voxel_world",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3756,6 +3768,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 name = "protocol"
 version = "0.1.0"
 dependencies = [
+ "controller",
  "gameplay",
  "glam",
  "physics",
@@ -4173,6 +4186,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "bevy_app",
+ "controller",
  "game_packages",
  "glam",
  "networking",
@@ -4235,6 +4249,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
+ "controller",
  "game_packages",
  "gameplay",
  "glam",
@@ -4971,6 +4986,7 @@ name = "voxel-client"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "controller",
  "networking",
  "physics",
  "protocol",

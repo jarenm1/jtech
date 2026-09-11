@@ -1,7 +1,9 @@
 use bevy_app::App;
+use controller::PlayerInput;
+use controller::step_player;
 use glam::{IVec3, Vec3};
 use networking::ClientTransport;
-use physics::{EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, step_player};
+use physics::{EYE_HEIGHT, FIXED_DT, PlayerState};
 use protocol::{
     ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, PackageState, PackageStatus,
     ServerMessage,
