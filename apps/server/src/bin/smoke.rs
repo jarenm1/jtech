@@ -88,6 +88,7 @@ impl Bot {
                     seed,
                     spawn,
                     health,
+                    inventory,
                 } => {
                     self.id = id;
                     self.session = session;
@@ -97,6 +98,7 @@ impl Bot {
                     self.life = 0;
                     require(health == Health::default(), "welcome health was not full")?;
                     self.health = Some(health);
+                    require(inventory.is_empty(), "welcome inventory was not empty")?;
                 }
                 ServerMessage::Chunk {
                     coord,
@@ -168,6 +170,8 @@ impl Bot {
                 } => self
                     .packages
                     .push((revision, packages, bow_shots_per_second)),
+                ServerMessage::Inventory { .. } => {}
+                ServerMessage::Drops { .. } => {}
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
             }
         }
