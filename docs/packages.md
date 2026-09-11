@@ -1,10 +1,15 @@
 # Gameplay packages
 
-The first package API is a server-side explosive-bow slot backed by Steel Scheme.
-Edit `packages/explosive-bow/server.scm` to change firing rate, projectile flight,
-and impact behavior. Rust handles request validation, swept collision, native
-blast allocation, world mutation, and replication. Clients use native visuals
-and receive the server's firing rate and package status.
+Packages use server-side Steel Scheme. Edit `packages/explosive-bow/server.scm`
+to change firing rate, projectile flight, and impact behavior. Rust handles
+request validation, swept collision, native blast allocation, world mutation,
+and replication. Clients use native visuals and receive the server's firing rate
+and package status.
+
+Author terrain in `packages/terrain/server.scm`. At world creation the server
+compiles the Scheme terrain graph into an immutable native generator. See
+[terrain generation](terrain.md) for the graph and biome API. Restart the server
+to apply terrain changes; bow packages support live reload.
 
 ## Run and reload
 
@@ -83,5 +88,6 @@ work may not respond promptly to interruption. A reload still pending after six
 seconds reports an error. If the loader never returns, restart the server after
 fixing the source. Only one candidate loader runs at a time.
 
-Package v1 covers one server weapon slot, with one watched entry file. Client-side
-Scheme, dependency resolution, and package distribution require subsequent API work.
+Bow API v1 covers one server weapon slot with one watched entry file. Terrain
+has a separate, startup-only API and entry file. Client-side Scheme, dependency
+resolution, and package distribution require subsequent API work.

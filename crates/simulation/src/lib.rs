@@ -13,6 +13,7 @@ mod noclip_tests;
 mod packages;
 mod physics_slice;
 mod streaming;
+mod terrain_stream;
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
 use gameplay::Health;
@@ -30,6 +31,7 @@ use std::{
     net::SocketAddr,
     time::Instant,
 };
+use terrain_stream::interests;
 use voxel_world::{
     CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, VoxelWorld, chunk_coord, index, local_coord,
 };
@@ -81,6 +83,8 @@ pub struct SimulationPlugin {
     config: ServerConfig,
     transport: parking_lot::Mutex<Option<ServerTransport>>,
     physics: parking_lot::Mutex<Option<PhysicsSlice>>,
+    generator: std::sync::Arc<voxel_world::terrain::TerrainGenerator>,
+    terrain: parking_lot::Mutex<Option<terrain_stream::TerrainStream>>,
 }
 impl SimulationPlugin {
     pub fn bind(config: ServerConfig) -> io::Result<Self> {
@@ -94,6 +98,17 @@ impl SimulationPlugin {
     /// Run the same authoritative simulation without socket IO, for embedding and tests.
     pub fn headless(mut config: ServerConfig) -> io::Result<Self> {
         config.radius = config.radius.clamp(1, protocol::MAX_VIEW_RADIUS);
+        let generator = std::sync::Arc::new(
+            game_packages::load_terrain(&config.packages)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        );
+        eprintln!(
+            "terrain loaded identity={} version={} seed={}",
+            generator.identity(),
+            generator.version(),
+            config.seed
+        );
+        let terrain = terrain_stream::TerrainStream::new(generator.clone(), config.seed)?;
         let physics = if config.gpu_physics {
             Some(PhysicsSlice::new().map_err(io::Error::other)?)
         } else {
@@ -103,6 +118,8 @@ impl SimulationPlugin {
             config,
             transport: parking_lot::Mutex::new(None),
             physics: parking_lot::Mutex::new(physics),
+            generator,
+            terrain: parking_lot::Mutex::new(Some(terrain)),
         })
     }
     pub fn local_addr(&self) -> SocketAddr {
@@ -113,14 +130,13 @@ impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
         let mut world = VoxelWorld {
             seed: self.config.seed,
+            generator: self.generator.clone(),
             ..Default::default()
         };
-        for y in MIN_CHUNK_Y..=MAX_CHUNK_Y {
-            for z in -1..=1 {
-                for x in -1..=1 {
-                    world.ensure_chunk(IVec3::new(x, y, z));
-                }
-            }
+        let spawn = terrain_stream::spawn_position(&self.generator, self.config.seed);
+        let spawn_chunks = terrain_stream::local_chunks(spawn, 1);
+        for &coord in &spawn_chunks {
+            world.ensure_chunk(coord);
         }
         let physics = self.physics.lock().take();
         app.insert_resource(world)
@@ -143,6 +159,9 @@ impl Plugin for SimulationPlugin {
                 tick_times: VecDeque::new(),
                 needed: HashSet::new(),
                 physics,
+                terrain: self.terrain.lock().take().expect("plugin built once"),
+                spawn,
+                spawn_chunks,
             })
             .add_systems(Update, advance);
     }
@@ -157,6 +176,7 @@ struct Player {
     interest: HashSet<IVec3>,
     safety: HashSet<IVec3>,
     interest_center: Option<IVec3>,
+    terrain_revision: u64,
     last_edit: u64,
     results: VecDeque<(u64, EditOutcome)>,
     highest_request: u64,
@@ -179,6 +199,7 @@ impl Player {
             interest: HashSet::new(),
             safety: HashSet::new(),
             interest_center: None,
+            terrain_revision: 0,
             last_edit: 0,
             results: VecDeque::new(),
             highest_request: 0,
@@ -249,6 +270,9 @@ pub struct Simulation {
     next_arrow: u32,
     arrow_revision: u64,
     packages: game_packages::PackageHost,
+    terrain: terrain_stream::TerrainStream,
+    spawn: Vec3,
+    spawn_chunks: HashSet<IVec3>,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -383,6 +407,16 @@ impl Simulation {
                 .journal
                 .get(&chunk_coord(target))
                 .is_some_and(|j| j.blocks.contains_key(&(index(local_coord(target)) as u16)))
+    }
+
+    /// Install one asynchronously generated chunk without clobbering live edits.
+    fn install_generated(&mut self, world: &mut VoxelWorld, coord: IVec3, chunk: Chunk) {
+        // Ignore stale completions and never replace a chunk edited while work was pending.
+        if self.needed.contains(&coord) && !world.chunks.contains_key(&coord) {
+            world.insert(coord, chunk);
+            restore(world, coord, self.journal.get(&coord));
+            self.metrics.generated += 1;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -568,6 +602,12 @@ impl Simulation {
         self.damage.remove(&target);
         let coord = chunk_coord(target);
         let local_index = index(local_coord(target)) as u16;
+        if !self.journal.contains_key(&coord) {
+            // Other players must discover new construction beyond natural surfaces.
+            for player in self.players.values_mut() {
+                player.interest_center = None;
+            }
+        }
         let journal = self.journal.entry(coord).or_default();
         journal.revision = to;
         if journal.blocks.insert(local_index, block).is_none() {
@@ -822,21 +862,6 @@ fn valid_coord(coord: IVec3) -> bool {
         && coord.z.abs_diff(0) <= 1_000_000
         && (MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&coord.y)
 }
-fn interests(position: Vec3, radius: i32) -> HashSet<IVec3> {
-    let center = chunk_coord(position.floor().as_ivec3());
-    let mut result = HashSet::new();
-    for y in MIN_CHUNK_Y..=MAX_CHUNK_Y {
-        for z in -radius..=radius {
-            for x in -radius..=radius {
-                let coord = IVec3::new(center.x + x, y, center.z + z);
-                if valid_coord(coord) {
-                    result.insert(coord);
-                }
-            }
-        }
-    }
-    result
-}
 fn restore(world: &mut VoxelWorld, coord: IVec3, journal: Option<&Journal>) {
     world.ensure_chunk(coord);
     if let Some(journal) = journal {
@@ -857,6 +882,9 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     let sim = &mut *simulation;
     sim.tick += 1;
     sim.poll_packages();
+    for (coord, chunk) in sim.terrain.poll() {
+        sim.install_generated(&mut world, coord, chunk);
+    }
     sim.observe_physics(&mut world);
     let incoming = match sim.transport.as_mut().map_or_else(
         || Ok(networking::ServerIncoming::default()),
@@ -872,7 +900,18 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         sim.drop_player(id);
     }
     for (id, session) in incoming.connected {
-        let player = Player::new();
+        let mut player = Player::new();
+        let bodies = sim
+            .physics
+            .as_ref()
+            .map(|p| p.dynamic_colliders())
+            .unwrap_or_default();
+        let Some(position) = terrain_stream::available_spawn(&world, sim.spawn, &bodies) else {
+            eprintln!("connect id={id} rejected: no clear supported spawn in the loaded area");
+            sim.drop_player(id);
+            continue;
+        };
+        player.state.position = position;
         let spawn = player.state;
         let health = player.health;
         sim.players.insert(id, player);
@@ -936,10 +975,25 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             player.state.velocity = Vec3::ZERO;
         }
         let center = chunk_coord(player.state.position.floor().as_ivec3());
-        if player.interest_center != Some(center) {
-            player.interest = interests(player.state.position, sim.config.radius);
-            player.safety = interests(player.state.position, sim.config.radius + 1);
+        if player.interest_center != Some(center) || player.terrain_revision != sim.terrain.revision
+        {
+            player.interest = interests(
+                player.state.position,
+                sim.config.radius,
+                &sim.terrain.bounds,
+                sim.journal.keys().copied(),
+            );
+            player.safety = interests(
+                player.state.position,
+                sim.config.radius + 1,
+                &sim.terrain.bounds,
+                sim.journal.keys().copied(),
+            );
+            player
+                .safety
+                .extend(terrain_stream::local_chunks(player.state.position, 3));
             player.interest_center = Some(center);
+            player.terrain_revision = sim.terrain.revision;
         }
     }
     for (id, message) in incoming.reliable {
@@ -1000,20 +1054,14 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         .unwrap_or_default();
     needed.extend(physics_needed.iter().copied());
     // Keep spawn warm for reconnects without admitting actors over unloaded terrain.
-    for y in MIN_CHUNK_Y..=MAX_CHUNK_Y {
-        for z in -1..=1 {
-            for x in -1..=1 {
-                needed.insert(IVec3::new(x, y, z));
-            }
-        }
-    }
+    needed.extend(sim.spawn_chunks.iter().copied());
     for &coord in &needed {
         sim.last_needed.insert(coord, sim.tick);
     }
     let missing: Vec<_> = needed
         .iter()
         .copied()
-        .filter(|coord| !world.chunks.contains_key(coord))
+        .filter(|coord| !world.chunks.contains_key(coord) && !sim.terrain.generating(coord))
         .collect();
     let missing = streaming::nearest_chunks(missing, streaming::CHUNKS_PER_TICK, |coord| {
         (
@@ -1029,9 +1077,14 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         )
     });
     for coord in missing {
-        restore(&mut world, coord, sim.journal.get(&coord));
-        sim.metrics.generated += 1;
+        sim.terrain.generate(coord);
     }
+    let centers: Vec<_> = sim
+        .players
+        .values()
+        .map(|p| chunk_coord(p.state.position.floor().as_ivec3()))
+        .collect();
+    sim.terrain.survey(&centers, sim.config.radius + 2);
     let evicted: Vec<_> = world
         .chunks
         .keys()
@@ -1081,7 +1134,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             .filter(|coord| !player.known.contains_key(coord) && world.chunks.contains_key(coord))
             .collect();
         let available = streaming::nearest_chunks(available, streaming::CHUNKS_PER_TICK, |coord| {
-            (*coord - center).length_squared()
+            (*coord - center).as_i64vec3().length_squared()
         });
         for coord in available {
             let chunk = &world.chunks[&coord];
@@ -1225,5 +1278,115 @@ mod tests {
         player.known.insert(IVec3::ZERO, 2);
         assert!(!valid_player_edit(&world, &player, 100, 1, target, 0, 2));
         assert_eq!(world.block(target), Some(5));
+    }
+
+    fn headless_app(radius: i32) -> App {
+        let mut app = App::new();
+        app.add_plugins(
+            SimulationPlugin::headless(ServerConfig {
+                radius,
+                metrics_every: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        app
+    }
+
+    fn take_resources(app: &mut App) -> (VoxelWorld, Simulation) {
+        let world = app.world_mut().remove_resource::<VoxelWorld>().unwrap();
+        let sim = app.world_mut().remove_resource::<Simulation>().unwrap();
+        (world, sim)
+    }
+
+    fn put_resources(app: &mut App, world: VoxelWorld, sim: Simulation) {
+        app.world_mut().insert_resource(world);
+        app.world_mut().insert_resource(sim);
+    }
+
+    #[test]
+    fn headless_startup_pins_package_generator_and_spawn_chunks() {
+        let loaded = game_packages::load_terrain(&game_packages::default_directory()).unwrap();
+        let app = headless_app(1);
+        let spawn_chunks = app.world().resource::<Simulation>().spawn_chunks.clone();
+        assert_eq!(spawn_chunks.len(), 27);
+        let world = app.world().resource::<VoxelWorld>();
+        assert_eq!(world.generator.identity(), loaded.identity());
+        assert_eq!(world.generator.version(), loaded.version());
+        assert!(
+            spawn_chunks
+                .iter()
+                .all(|coord| world.chunks.contains_key(coord))
+        );
+    }
+
+    #[test]
+    fn generated_completion_replays_latest_journal_and_never_overwrites_loaded() {
+        let mut app = headless_app(2);
+        let (mut world, mut sim) = take_resources(&mut app);
+        let seed = world.seed;
+        let generator = world.generator.clone();
+        let coord = IVec3::new(3, 0, 3);
+        let target = coord * CHUNK_SIZE + IVec3::new(4, 4, 4);
+        let cell = index(local_coord(target)) as u16;
+        sim.needed.insert(coord);
+        sim.journal.insert(
+            coord,
+            Journal {
+                revision: 501,
+                blocks: BTreeMap::from([(cell, 5)]),
+            },
+        );
+
+        // A chunk edited while generation was in flight is left untouched.
+        world.insert(coord, Chunk::from_runs(77, &[(32768, 3)]).unwrap());
+        sim.install_generated(
+            &mut world,
+            coord,
+            Chunk::generate_with(coord, seed, &generator),
+        );
+        assert_eq!(world.chunks[&coord].revision, 77);
+        assert_eq!(world.block(target), Some(3));
+
+        // Eviction and regeneration replay the journal edit at its recorded revision.
+        world.remove(coord);
+        sim.install_generated(
+            &mut world,
+            coord,
+            Chunk::generate_with(coord, seed, &generator),
+        );
+        assert_eq!(world.block(target), Some(5));
+        assert_eq!(world.chunks[&coord].revision, 501);
+        let generated = sim.metrics.generated;
+
+        // A later stale completion for the now-resident chunk is ignored.
+        sim.install_generated(
+            &mut world,
+            coord,
+            Chunk::generate_with(coord, seed, &generator),
+        );
+        assert_eq!(world.chunks[&coord].revision, 501);
+        assert_eq!(sim.metrics.generated, generated);
+
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
+    fn generated_completion_for_unneeded_coord_is_ignored() {
+        let mut app = headless_app(1);
+        let (mut world, mut sim) = take_resources(&mut app);
+        let seed = world.seed;
+        let generator = world.generator.clone();
+        let coord = IVec3::new(9, 0, 9);
+        assert!(!sim.needed.contains(&coord));
+        let before = sim.metrics.generated;
+        sim.install_generated(
+            &mut world,
+            coord,
+            Chunk::generate_with(coord, seed, &generator),
+        );
+        assert!(!world.chunks.contains_key(&coord));
+        assert_eq!(sim.metrics.generated, before);
+        put_resources(&mut app, world, sim);
     }
 }

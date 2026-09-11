@@ -25,7 +25,9 @@ use protocol::{
     Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
-use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, WorldPlugin, chunk_coord};
+use voxel_world::{
+    CHUNK_SIZE, Chunk, VoxelWorld, WORLD_MAX_Y, WORLD_MIN_Y, WorldPlugin, chunk_coord,
+};
 
 #[derive(Resource)]
 struct Options {
@@ -315,6 +317,17 @@ fn main() {
         .run();
 }
 
+/// Camera far plane covering the largest server interest square in three
+/// dimensions: the horizontal corner distance plus the full vertical span of
+/// the world, so far mountain terrain is not clipped when its elevation is far
+/// from the camera.
+fn camera_far_distance() -> f32 {
+    let horizontal =
+        (protocol::MAX_VIEW_RADIUS + 2) as f32 * CHUNK_SIZE as f32 * std::f32::consts::SQRT_2;
+    let vertical = (WORLD_MAX_Y - WORLD_MIN_Y + 1) as f32 + EYE_HEIGHT;
+    (horizontal * horizontal + vertical * vertical).sqrt()
+}
+
 fn setup(
     mut commands: Commands,
     options: Res<Options>,
@@ -340,10 +353,9 @@ fn setup(
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: 75.0_f32.to_radians(),
-            // Cover the far diagonal of the largest server interest square.
-            far: (protocol::MAX_VIEW_RADIUS + 2) as f32
-                * CHUNK_SIZE as f32
-                * std::f32::consts::SQRT_2,
+            // Cover the 3D diagonal of the largest server interest square,
+            // including the full vertical extent of the voxel world.
+            far: camera_far_distance(),
             ..default()
         }),
         Transform::from_translation(session.state.position + Vec3::Y * EYE_HEIGHT),

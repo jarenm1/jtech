@@ -1,18 +1,30 @@
 use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::Resource;
 use glam::{IVec3, Vec3};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
+
+pub mod terrain;
+pub use terrain::{Biome, TerrainGenerator, TerrainSample};
 
 pub const CHUNK_SIZE: i32 = 32;
 pub const CHUNK_VOLUME: usize = 32768;
-pub const MIN_CHUNK_Y: i32 = -1;
-pub const MAX_CHUNK_Y: i32 = 1;
+pub const MIN_CHUNK_Y: i32 = -8;
+pub const MAX_CHUNK_Y: i32 = 23;
 pub const AIR: u8 = 0;
 pub const GRASS: u8 = 1;
 pub const DIRT: u8 = 2;
 pub const STONE: u8 = 3;
 pub const SAND: u8 = 4;
 pub const WOOD: u8 = 5;
+/// Lowest world block coordinate covered by the chunk range.
+pub const WORLD_MIN_Y: i32 = MIN_CHUNK_Y * CHUNK_SIZE;
+/// Highest world block coordinate covered by the chunk range.
+pub const WORLD_MAX_Y: i32 = (MAX_CHUNK_Y + 1) * CHUNK_SIZE - 1;
+
+static DEFAULT_TERRAIN: LazyLock<TerrainGenerator> = LazyLock::new(TerrainGenerator::default);
 const OFFSETS: [IVec3; 7] = [
     IVec3::ZERO,
     IVec3::X,
@@ -147,82 +159,28 @@ impl Chunk {
         }
     }
     pub fn generate(coord: IVec3, seed: u64) -> Self {
-        // Terrain is confined to y=5..19, including pillars. Avoid allocating or
-        // visiting 32^3 cells for the uniform underground and sky layers.
-        if coord.y < 0 {
-            return Self {
-                revision: 0,
-                storage: Storage::Uniform(STONE),
-            };
-        }
-        if coord.y > 0 {
-            return Self {
-                revision: 0,
-                storage: Storage::Uniform(AIR),
-            };
-        }
-        let mut chunk = Self {
-            revision: 0,
-            storage: Storage::Uniform(AIR),
-        };
-        for z in 0..32 {
-            for x in 0..32 {
-                let wx = coord.x as i64 * 32 + x as i64;
-                let wz = coord.z as i64 * 32 + z as i64;
-                let height = terrain_height(wx, wz, seed);
-                let pillar = hash(wx, wz, seed).is_multiple_of(251);
-                for y in 0..32 {
-                    let wy = coord.y as i64 * 32 + y as i64;
-                    let block = if wy > height {
-                        if pillar && wy <= height + 3 {
-                            WOOD
-                        } else {
-                            AIR
-                        }
-                    } else if wy == height {
-                        if height <= 7 { SAND } else { GRASS }
-                    } else if wy >= height - 3 {
-                        DIRT
-                    } else {
-                        STONE
-                    };
-                    if block != AIR {
-                        chunk.set(index(IVec3::new(x, y, z)), block);
-                    }
-                }
-            }
-        }
-        // Fully solid underground chunks stay as compact as empty sky chunks.
-        let first = chunk.at(0);
-        if (1..CHUNK_VOLUME).all(|i| chunk.at(i) == first) {
-            chunk.storage = Storage::Uniform(first);
-        }
-        chunk
+        Self::generate_with(coord, seed, &DEFAULT_TERRAIN)
     }
-}
-fn hash(x: i64, z: i64, seed: u64) -> u64 {
-    let mut v = (x as u64).wrapping_mul(0x9e3779b97f4a7c15)
-        ^ (z as u64).wrapping_mul(0xbf58476d1ce4e5b9)
-        ^ seed;
-    v = (v ^ (v >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    v = (v ^ (v >> 27)).wrapping_mul(0x94d049bb133111eb);
-    v ^ (v >> 31)
-}
-fn terrain_height(x: i64, z: i64, seed: u64) -> i64 {
-    let gx = x.div_euclid(16);
-    let gz = z.div_euclid(16);
-    let tx = x.rem_euclid(16);
-    let tz = z.rem_euclid(16);
-    let sample = |dx, dz| 5 + (hash(gx + dx, gz + dz, seed) % 12) as i64;
-    let a = sample(0, 0) * (16 - tx) + sample(1, 0) * tx;
-    let b = sample(0, 1) * (16 - tx) + sample(1, 1) * tx;
-    (a * (16 - tz) + b * tz) / 256
+
+    /// Generate this chunk from a compiled terrain graph.
+    pub fn generate_with(coord: IVec3, seed: u64, generator: &TerrainGenerator) -> Self {
+        crate::terrain::generate_chunk(coord, seed, generator)
+    }
+
+    fn compact(&mut self) {
+        let first = self.at(0);
+        if (1..CHUNK_VOLUME).all(|i| self.at(i) == first) {
+            self.storage = Storage::Uniform(first);
+        }
+    }
 }
 
 #[derive(Resource, Default)]
 pub struct VoxelWorld {
     pub chunks: HashMap<IVec3, Arc<Chunk>>,
     pub seed: u64,
+    /// Compiled terrain graph shared by streaming generation.
+    pub generator: Arc<TerrainGenerator>,
 }
 pub struct WorldPlugin;
 impl Plugin for WorldPlugin {
@@ -245,7 +203,7 @@ impl VoxelWorld {
     pub fn ensure_chunk(&mut self, coord: IVec3) {
         self.chunks
             .entry(coord)
-            .or_insert_with(|| Arc::new(Chunk::generate(coord, self.seed)));
+            .or_insert_with(|| Arc::new(Chunk::generate_with(coord, self.seed, &self.generator)));
     }
     pub fn set_block(&mut self, pos: IVec3, block: u8) -> Option<(u64, u64)> {
         if block > WOOD {
@@ -416,7 +374,7 @@ mod tests {
     }
     #[test]
     fn terrain_is_seeded_and_revision_exhaustion_is_atomic() {
-        let coord = IVec3::new(-1, 0, 0);
+        let coord = IVec3::new(-1, 1, 0);
         let first = Chunk::generate(coord, 7);
         assert_eq!(first.runs(), Chunk::generate(coord, 7).runs());
         assert_ne!(first.runs(), Chunk::generate(coord, 8).runs());

@@ -186,3 +186,153 @@ fn package_host_is_a_thread_safe_simulation_resource() {
     fn require_send_sync<T: Send + Sync>() {}
     require_send_sync::<PackageHost>();
 }
+
+const TERRAIN: &str = include_str!("../../../packages/terrain/server.scm");
+
+const CUSTOM_TERRAIN: &str = r#"
+(define terrain-api-version 1)
+(define terrain-version 7)
+(define generator-identity "custom-test")
+(define stone-slope 3.0)
+(define terrain-height
+  (tadd (constant 40.0) (tmul (fbm 0.02 3 2.0 0.5 1) (constant 8.0))))
+(define terrain-temperature (constant 0.5))
+(define terrain-moisture (constant 0.5))
+(define terrain-soil (constant 0.5))
+(define biomes
+  (list (biome "sandbar" 'sand 'sand 2 -2.0 3.0 -2.0 3.0 -1000.0 5000.0)))
+"#;
+
+struct TerrainFixture(PathBuf);
+
+impl TerrainFixture {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "jtech-terrain-pkg-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join(TERRAIN_PACKAGE)).unwrap();
+        Self(root)
+    }
+
+    fn write(&self, source: &str) {
+        fs::write(self.0.join(TERRAIN_PACKAGE).join("server.scm"), source).unwrap();
+    }
+}
+
+impl Drop for TerrainFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn load_terrain_source(source: &str) -> Result<voxel_world::TerrainGenerator, String> {
+    let fixture = TerrainFixture::new();
+    fixture.write(source);
+    load_terrain(&fixture.0)
+}
+
+#[test]
+fn shipped_terrain_package_matches_the_native_default() {
+    let loaded = load_terrain_source(TERRAIN).unwrap();
+    let native = voxel_world::TerrainGenerator::default();
+    assert_eq!(loaded.identity(), native.identity());
+    assert_eq!(loaded.version(), native.version());
+    assert_eq!(loaded.biome_count(), native.biome_count());
+    assert_eq!(loaded.node_count(), native.node_count());
+    for seed in [0u64, 3, 77] {
+        for i in 0..64i64 {
+            let x = i * 137 - 9000;
+            let z = i * 211 + 7000;
+            let a = loaded.sample(x, z, seed);
+            let b = native.sample(x, z, seed);
+            assert_eq!(a.height, b.height, "height mismatch at {x},{z},{seed}");
+            assert_eq!(a.biome, b.biome, "biome mismatch at {x},{z},{seed}");
+            assert_eq!(a.surface, b.surface);
+            assert_eq!(a.subsurface, b.subsurface);
+            assert_eq!(a.soil, b.soil);
+            assert_eq!(a.temperature.to_bits(), b.temperature.to_bits());
+            assert_eq!(a.moisture.to_bits(), b.moisture.to_bits());
+        }
+    }
+    assert_eq!(
+        loaded.column_bounds(-4, 6, 9),
+        native.column_bounds(-4, 6, 9)
+    );
+}
+
+#[test]
+fn custom_scheme_graph_compiles_and_samples() {
+    let generator = load_terrain_source(CUSTOM_TERRAIN).unwrap();
+    assert_eq!(generator.identity(), "custom-test");
+    assert_eq!(generator.version(), 7);
+    assert_eq!(generator.biome_count(), 1);
+    assert_eq!(generator.biome_name(voxel_world::Biome(0)), "sandbar");
+    for i in 0..64i64 {
+        let sample = generator.sample(i * 31 - 500, i * 17 + 90, 4);
+        assert!(
+            (40..=48).contains(&sample.height),
+            "height {}",
+            sample.height
+        );
+        assert_eq!(sample.surface, voxel_world::SAND);
+        assert_eq!(sample.subsurface, voxel_world::SAND);
+        assert_eq!(sample.soil, 1);
+    }
+    let chunk = voxel_world::Chunk::generate_with(glam::IVec3::new(0, 1, 0), 4, &generator);
+    let surface = generator.sample(0, 0, 4).height - 32;
+    assert_eq!(
+        chunk.get(glam::IVec3::new(0, surface, 0)),
+        voxel_world::SAND
+    );
+}
+
+#[test]
+fn invalid_terrain_packages_are_rejected() {
+    for (from, to) in [
+        (
+            "(define terrain-api-version 1)",
+            "(define terrain-api-version 2)",
+        ),
+        ("(define terrain-version 1)", "(define terrain-version 0)"),
+        (
+            "(biome \"shore\" 'sand 'sand 3",
+            "(biome \"shore\" 'wood 'sand 3",
+        ),
+        ("(define biomes", "(define missing-biomes"),
+        ("(define terrain-soil", "(define terrain-soil-typo"),
+        ("(define stone-slope 4.0)", "(define stone-slope 0.0)"),
+    ] {
+        assert!(
+            load_terrain_source(&TERRAIN.replace(from, to)).is_err(),
+            "accepted {from} -> {to}"
+        );
+    }
+    let non_finite = r#"
+(define terrain-api-version 1)
+(define terrain-version 1)
+(define generator-identity "nan")
+(define stone-slope 4.0)
+(define terrain-height (tpow (constant -1.0) 0.5))
+(define terrain-temperature (constant 0.5))
+(define terrain-moisture (constant 0.5))
+(define terrain-soil (constant 0.5))
+(define biomes (list (biome "p" 'grass 'dirt 4 -2.0 3.0 -2.0 3.0 -1000.0 5000.0)))
+"#;
+    assert!(load_terrain_source(non_finite).is_err());
+}
+
+#[test]
+fn runaway_terrain_package_is_interrupted() {
+    let source = format!("{TERRAIN}\n(set! terrain-soil (let loop () (loop)))");
+    let error = load_terrain_source(&source).expect_err("loop was not interrupted");
+    assert!(error.contains("budget"), "{error}");
+}
+
+#[test]
+fn terrain_generator_is_a_thread_safe_resource() {
+    fn require_send_sync<T: Send + Sync>() {}
+    require_send_sync::<voxel_world::TerrainGenerator>();
+}

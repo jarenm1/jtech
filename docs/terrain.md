@@ -1,0 +1,195 @@
+# Terrain
+
+Terrain is generated from a compiled native graph. Scheme authors the graph in
+`packages/terrain/server.scm`; the server evaluates that file once and compiles
+it into `voxel_world::terrain::TerrainGenerator`. Chunk generation then walks the
+compiled graph, so no Scheme runs per voxel or per chunk.
+
+## World layout
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `CHUNK_SIZE` | 32 | blocks per chunk axis |
+| `MIN_CHUNK_Y` | -8 | lowest generated chunk layer |
+| `MAX_CHUNK_Y` | 23 | highest generated chunk layer |
+| `WORLD_MIN_Y` | -256 | lowest world block |
+| `WORLD_MAX_Y` | 767 | highest world block |
+
+Surface heights are clamped to -255 through 763, leaving a floor and spawn
+headroom inside the world. Chunks above the surface use uniform air; chunks below
+the deepest possible soil use uniform stone without visiting individual cells.
+
+## Native API
+
+```rust
+pub struct TerrainGenerator;
+
+impl TerrainGenerator {
+    pub fn compile(spec: TerrainSpec) -> Result<Self, String>;
+    pub fn default() -> Self;
+    pub fn identity(&self) -> &str;
+    pub fn version(&self) -> u32;
+    pub fn node_count(&self) -> usize;
+    pub fn biome_count(&self) -> usize;
+    pub fn biome_name(&self, biome: Biome) -> &str;
+    pub fn sample(&self, x: i64, z: i64, seed: u64) -> TerrainSample;
+    pub fn column_bounds(&self, cx: i32, cz: i32, seed: u64) -> (i32, i32);
+}
+
+pub struct TerrainSample {
+    pub height: i32,
+    pub biome: Biome,
+    pub surface: u8,
+    pub subsurface: u8,
+    pub soil: u8,
+    pub temperature: f32,
+    pub moisture: f32,
+}
+```
+
+`sample` is deterministic in `(x, z, seed)` and independent of call order; it is
+the same column the generator would place in a chunk. `surface`, `subsurface`
+and `soil` are the biome rules before the slope override. `column_bounds`
+returns the exact minimum and maximum surface heights of the 32x32 columns of
+chunk `(cx, cz)`.
+
+```rust
+pub struct Chunk;
+
+impl Chunk {
+    pub fn generate(coord: IVec3, seed: u64) -> Self;          // built-in default graph
+    pub fn generate_with(coord: IVec3, seed: u64, generator: &TerrainGenerator) -> Self;
+}
+```
+
+`VoxelWorld` carries `pub generator: Arc<TerrainGenerator>`; `ensure_chunk` uses
+it. `VoxelWorld::default()` installs `TerrainGenerator::default()`.
+
+## Loading a Scheme package
+
+```rust
+use game_packages::load_terrain;
+
+let generator = load_terrain(std::path::Path::new("packages"))?;
+```
+
+`load_terrain(directory)` evaluates `directory/terrain/server.scm` once inside
+the bounded Scheme sandbox and watchdog, validates the declared graph and biome
+table, and compiles them. The API version is independent of the weapon packages.
+
+Start with `cargo run -p server -- --packages ./packages`. A missing or invalid
+terrain package prevents server startup and prints a diagnostic. Only install
+trusted packages: the VM watchdog is cooperative, not a hard process or memory
+sandbox.
+
+The server pins the compiled generator and seed for its lifetime. Edit the
+package, then restart the server to create a world with the new terrain. Terrain
+is not hot-reloaded. Chunk eviction regenerates from the pinned graph and reapplies
+the in-memory edit journal. Worlds and edit journals currently have no disk-save
+format. Increment `terrain-version` when changing the generator's behavior.
+
+## Authoring
+
+The package declares `terrain-api-version`, `terrain-version`,
+`generator-identity`, `stone-slope`, four expression values and a biome list:
+
+```
+(define terrain-api-version 1)
+(define terrain-version 1)
+(define generator-identity "jtech-terrain-v1")
+(define stone-slope 4.0)
+
+(define terrain-height
+  (tadd (constant 40.0) (tmul (fbm 0.01 3 2.0 0.5 1) (constant 12.0))))
+(define terrain-temperature (constant 0.5))
+(define terrain-moisture (constant 0.5))
+(define terrain-soil (constant 0.5))
+
+(define biomes
+  (list (biome "plains" 'grass 'dirt 4 -2.0 3.0 -2.0 3.0 -1000.0 5000.0)))
+```
+
+Primitives:
+
+| Primitive | Result |
+| --- | --- |
+| `(terrain-x)` `(terrain-z)` | world column coordinates |
+| `(constant v)` | literal |
+| `(fbm freq octaves lacunarity gain salt)` | fBm value noise in `[0, 1]` |
+| `(fbm-xy freq octaves lacunarity gain salt x z)` | fBm on explicit coordinates |
+| `(ridged ...)` `(ridged-xy ...)` | folded ridged noise in `[0, 1]` |
+| `(tadd a b)` `(tsub a b)` `(tmul a b)` `(tdiv a b)` | arithmetic (`tdiv` by ~0 is 0) |
+| `(tmin a b)` `(tmax a b)` | extrema |
+| `(tabs v)` `(tneg v)` `(tsqrt v)` `(tpow v e)` | unary |
+| `(tclamp v lo hi)` | clamp |
+| `(tmix a b t)` | linear blend |
+| `(tsmoothstep e0 e1 x)` | smooth 0..1 ramp |
+| `(tstep edge x)` | hard step |
+| `(tsmooth-min a b k)` `(tsmooth-max a b k)` | polynomial smooth extrema |
+| `(tscale-bias v scale bias)` | `v * scale + bias` |
+| `(tcurve x (list (list x0 y0) ...))` | smooth piecewise curve |
+
+Each noise field carries its own `salt`; the seed is mixed with the salt so
+different seeds decorrelate every field. Graph size is capped at 512 nodes and
+64 levels of nesting, and constants, noise parameters and curve points must be
+finite. A value that evaluates to a non-finite number is rejected at compile
+time and replaced with 0 if it ever appears at runtime.
+
+The biome constructor takes:
+
+```scheme
+(biome name surface subsurface depth temp-min temp-max moisture-min moisture-max height-min height-max)
+```
+
+Biome rules are evaluated in declaration order; earlier rules claim coverage
+first and the last biome is the fallback. Membership fades inward across 0.08
+temperature/moisture units and 12 height blocks at range edges. Soil depths are
+blended, and a seeded world-coordinate hash chooses the surface/subsurface
+material pair from those weights. Transitions
+therefore have mixed materials instead of straight palette boundaries.
+`surface` and `subsurface` accept `'grass`, `'dirt`, `'stone` and `'sand`.
+The soil factor scales the blended depth. During generation, the slope override
+replaces surface and soil with stone when the largest neighboring height delta
+reaches `stone-slope`.
+
+## Default world
+
+The shipped package and `TerrainGenerator::default()` describe the same graph:
+broad plains around y=44 with gentle relief, a concentrated ridged mountain field
+reaching roughly y=350, and a connected valley network carving up to 38 blocks
+through the plains. Temperature is cooled by the column's actual height, so high
+ground is cold, and the biome table is shore, desert, mountains, tundra and
+plains. The `game_packages` tests sample both authoring sources on the same grid
+and require identical columns, so the native default cannot drift from the
+shipped package.
+
+Measured on a 256x256 grid of columns 128 blocks apart (seed 2024): median 42,
+p05 7, p10 9, p90 94, p99 201, maximum 339. Sixty-three percent of columns fall
+in 25..=90, 3.3% reach 150 or higher, 0.23% reach 250, 31% sit below 30 and 10%
+below 10. Coverage is roughly 91% plains, 5% tundra, 3% mountains, 1% desert and
+a small shore fringe; only 0.07% of columns touch the clamp floor.
+
+## Preview a package
+
+```sh
+cargo run -p server --example terrain_preview -- target/terrain-preview.png 7 ./packages
+```
+
+The PNG shows an 8,192-block-wide elevation/hillshade map on the left and biome
+IDs on the right. Red crosses mark the origin. The command prints the height
+range and biome sample counts without starting a game or requiring a GPU.
+Append a fourth argument for blocks per pixel (1..1024, default 16). Use `2`
+for a closer, 1,024-block-wide preview.
+
+## Tests
+
+```
+cargo test -p voxel_world
+cargo test -p game_packages
+```
+
+They cover determinism, call-order independence, seed sensitivity, chunk seams,
+vertical layering, slope-aware stone surfaces, `column_bounds` versus generated
+surfaces, terrain distribution (plains, valleys, mountains, multiple biomes),
+graph bounds and validation, Scheme compilation of the shipped and a custom
+graph, and watchdog interruption of a runaway package.

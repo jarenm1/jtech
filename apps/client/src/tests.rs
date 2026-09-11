@@ -682,3 +682,18 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
     assert!(!client.state.noclip);
     assert!(client.state.velocity.y < 0.0);
 }
+
+#[test]
+fn camera_far_distance_covers_vertical_corner_of_view_region() {
+    // The interest square reaches (MAX_VIEW_RADIUS + 2) chunks along each
+    // horizontal axis, so a corner block is offset by that margin on both.
+    let margin = (protocol::MAX_VIEW_RADIUS + 2) as f32 * CHUNK_SIZE as f32;
+    let far = camera_far_distance();
+    // Camera at the top of the world, looking toward the opposite bottom corner.
+    let vertical = (WORLD_MAX_Y - WORLD_MIN_Y + 1) as f32 + EYE_HEIGHT;
+    let corner = Vec3::new(margin, vertical, margin);
+    assert!(
+        far >= corner.length(),
+        "far plane {far} clips corner {corner}"
+    );
+}
