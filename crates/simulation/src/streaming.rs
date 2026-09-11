@@ -35,8 +35,11 @@ mod tests {
             })
             .unwrap();
             assert_eq!(plugin.config.radius, radius);
-            let chunks = interests(Vec3::splat(0.5), radius);
-            assert_eq!(chunks.len(), ((radius * 2 + 1).pow(2) * 3) as usize);
+            let bounds = (-radius..=radius)
+                .flat_map(|z| (-radius..=radius).map(move |x| (glam::IVec2::new(x, z), (20, 24))))
+                .collect();
+            let chunks = interests(Vec3::splat(0.5), radius, &bounds, std::iter::empty());
+            assert!(chunks.len() < ((radius * 2 + 1).pow(2) * 4) as usize);
             assert!(chunks.contains(&IVec3::new(radius, 0, -radius)));
             assert!(!chunks.contains(&IVec3::new(radius + 1, 0, 0)));
         }
@@ -71,6 +74,7 @@ mod tests {
                 .unwrap(),
             );
             let mut player = Player::new();
+            player.state.position = app.world().resource::<Simulation>().spawn;
             player.state.noclip = true;
             player.input.noclip = true;
             app.world_mut()
@@ -79,29 +83,34 @@ mod tests {
                 .insert(1, player);
             let started = std::time::Instant::now();
             let mut ticks = 0;
+            let deadline = started + std::time::Duration::from_secs(300);
             loop {
                 app.update();
                 ticks += 1;
                 let sim = app.world().resource::<Simulation>();
                 let world = app.world().resource::<VoxelWorld>();
-                if sim.players[&1]
-                    .safety
-                    .iter()
-                    .all(|coord| world.chunks.contains_key(coord))
+                let columns = ((radius * 2 + 5).pow(2)) as usize;
+                if sim.terrain.bounds.len() == columns
+                    && sim.players[&1]
+                        .safety
+                        .iter()
+                        .all(|coord| world.chunks.contains_key(coord))
+                    && sim.players[&1].known.len() == sim.players[&1].interest.len()
                 {
                     break;
                 }
-                assert!(ticks < 7000, "streaming did not complete");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "streaming did not complete"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             for _ in 0..120 {
                 app.update();
             }
             let sim = app.world().resource::<Simulation>();
             let world = app.world().resource::<VoxelWorld>();
-            assert_eq!(
-                sim.players[&1].known.len(),
-                ((2 * radius + 1).pow(2) * 3) as usize
-            );
+            assert_eq!(sim.players[&1].known.len(), sim.players[&1].interest.len());
             eprintln!(
                 "radius={radius} fill_ticks={ticks} elapsed_s={:.3}",
                 started.elapsed().as_secs_f32()

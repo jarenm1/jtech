@@ -13,3 +13,7 @@ networking.workspace = true
 protocol.workspace = true
 physics.workspace = true
 glam.workspace = true
+
+[dev-dependencies]
+game_packages.workspace = true
+png = "0.18"

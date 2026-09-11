@@ -2269,8 +2269,10 @@ dependencies = [
 name = "game_packages"
 version = "0.1.0"
 dependencies = [
+ "glam",
  "protocol",
  "steel-core",
+ "voxel_world",
 ]
 
 [[package]]
@@ -4171,9 +4173,11 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "bevy_app",
+ "game_packages",
  "glam",
  "networking",
  "physics",
+ "png",
  "protocol",
  "simulation",
  "voxel_world",

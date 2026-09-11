@@ -24,7 +24,15 @@ impl Simulation {
         }
         let message = ServerMessage::Packages {
             revision,
-            packages: vec![self.packages.status().clone()],
+            packages: vec![
+                self.packages.status().clone(),
+                protocol::PackageStatus {
+                    id: "terrain".into(),
+                    generation: 1,
+                    state: protocol::PackageState::Loaded,
+                    error: None,
+                },
+            ],
             bow_shots_per_second: self.packages.shots_per_second(),
         };
         for id in recipients {

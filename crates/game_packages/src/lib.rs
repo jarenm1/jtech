@@ -1,6 +1,9 @@
 //! Server-side Steel packages. Native simulation owns entities and physics;
 //! Scheme authors validated native weapon policies during package loading.
 mod budget;
+mod terrain;
+
+pub use terrain::{TERRAIN_PACKAGE, load_terrain};
 
 use budget::Budget;
 use protocol::{BowPower, PackageState, PackageStatus};
