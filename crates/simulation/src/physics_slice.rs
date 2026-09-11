@@ -621,6 +621,7 @@ mod tests {
             },
             direction: Vec3::X,
             kinetic_energy: 12.0,
+            player_damage: 0,
         };
         assert_eq!(slice.apply_blast(id, &load), None);
         assert_eq!(slice.apply_blast(id, &load), None);

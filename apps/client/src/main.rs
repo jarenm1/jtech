@@ -1,4 +1,5 @@
 mod bow_power_hud;
+mod death_overlay;
 mod game_hud;
 mod health_hud;
 mod loose_blocks;
@@ -92,6 +93,8 @@ struct ClientSession {
     id: Option<u64>,
     session: u64,
     state: PlayerState,
+    // Authoritative respawn generation; 0 until the first life change.
+    life: u64,
     // Replicated independently of movement prediction.
     health: Health,
     noclip_requested: bool,
@@ -151,6 +154,7 @@ impl Default for ClientSession {
             id: None,
             session: 0,
             state: PlayerState::default(),
+            life: 0,
             health: Health::default(),
             noclip_requested: false,
             pending: VecDeque::with_capacity(256),
@@ -225,10 +229,39 @@ impl ClientSession {
             self.send(ClientMessage::Resync { coord });
         }
     }
+    /// Outgoing input packet tagged with the currently observed life counter.
+    fn input_packet(&self, inputs: Vec<PlayerInput>) -> InputPacket {
+        InputPacket {
+            session: self.session,
+            life: self.life,
+            inputs,
+        }
+    }
+
+    /// Keep the authenticated UDP endpoint alive without predicting dead movement.
+    fn death_heartbeat(&mut self, dt: f32) -> Option<InputPacket> {
+        self.accumulator += dt.min(0.1);
+        if self.accumulator < 0.5 {
+            return None;
+        }
+        self.accumulator = 0.0;
+        self.sequence = self.sequence.max(1);
+        Some(self.input_packet(vec![PlayerInput {
+            sequence: self.sequence,
+            ..Default::default()
+        }]))
+    }
+
+    /// Respawn request for the currently observed life. Repeating it is harmless;
+    /// the server ignores a stale or duplicate counter.
+    fn respawn_request(&self) -> ClientMessage {
+        ClientMessage::Respawn { life: self.life }
+    }
 }
 
 struct RemotePlayer {
     entity: Entity,
+    life: u64,
     previous: Vec3,
     current: Vec3,
     previous_yaw: f32,
@@ -257,6 +290,7 @@ impl Plugin for ClientPlugin {
         app.init_resource::<ClientSession>()
             .init_resource::<RemotePlayers>()
             .init_resource::<pause_menu::PauseMenu>()
+            .init_resource::<death_overlay::DeathOverlay>()
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
@@ -265,6 +299,9 @@ impl Plugin for ClientPlugin {
                     pause_menu::input,
                     pause_menu::actions,
                     pause_menu::sync,
+                    death_overlay::input,
+                    death_overlay::actions,
+                    death_overlay::sync,
                     controls,
                     bow_power_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
                     predict,
@@ -392,6 +429,7 @@ fn setup(
     ));
     game_hud::spawn(&mut commands);
     pause_menu::spawn(&mut commands);
+    death_overlay::spawn(&mut commands);
     health_hud::spawn(&mut commands);
     bow_power_hud::spawn(&mut commands);
     package_hud::spawn(&mut commands);
@@ -438,6 +476,10 @@ fn receive_network(
                 session.state = spawn;
                 session.noclip_requested = spawn.noclip;
                 session.health = health;
+                session.life = 0;
+                session.pending.clear();
+                session.correction = Vec3::ZERO;
+                session.accumulator = 0.0;
                 world.seed = seed;
                 session.status = format!("Connected | player {id}");
                 info!("WELCOME player={id} seed={seed}");
@@ -568,6 +610,11 @@ fn receive_network(
                     remote.previous_yaw = remote.yaw;
                     remote.current = player.state.position;
                     remote.yaw = player.yaw;
+                    if remote.life != player.life {
+                        remote.previous = remote.current;
+                        remote.previous_yaw = remote.yaw;
+                        remote.life = player.life;
+                    }
                     remote.received = now;
                 })
                 .or_insert_with(|| RemotePlayer {
@@ -581,6 +628,7 @@ fn receive_network(
                         ))
                         .id(),
                     previous: player.state.position,
+                    life: player.life,
                     current: player.state.position,
                     previous_yaw: player.yaw,
                     yaw: player.yaw,
@@ -599,7 +647,16 @@ fn reconcile(
     snapshot: &Snapshot,
     bodies: &[physics::DynamicCollider],
 ) {
+    if snapshot.tick <= session.last_tick {
+        // Out-of-order or duplicate datagram: keep the newer authoritative state.
+        return;
+    }
     session.last_tick = snapshot.tick;
+    let previous = session.state.position;
+    let life_changed = snapshot.you.life != session.life;
+    session.life = snapshot.you.life;
+    session.health = snapshot.you.health;
+    session.state = snapshot.you.state;
     while session
         .pending
         .front()
@@ -607,9 +664,22 @@ fn reconcile(
     {
         session.pending.pop_front();
     }
-    let previous = session.state.position;
-    session.state = snapshot.you.state;
-    session.health = snapshot.you.health;
+    if life_changed {
+        // Authoritative respawn: drop replay from the previous life and adopt the
+        // server's motion, noclip request and presentation. The input sequence
+        // stays monotonic so later commands remain acceptable to the server.
+        session.pending.clear();
+        session.correction = Vec3::ZERO;
+        session.accumulator = 0.0;
+        session.noclip_requested = snapshot.you.state.noclip;
+        return;
+    }
+    if session.health.is_depleted() {
+        // Dead players have no local movement to replay.
+        session.pending.clear();
+        session.correction = Vec3::ZERO;
+        return;
+    }
     for input in &session.pending {
         physics::step_player_with_bodies(world, &mut session.state, input, FIXED_DT, bodies);
     }
@@ -630,7 +700,7 @@ fn controls(
     cursor: Single<&CursorOptions>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
-    if menu.blocks_gameplay() {
+    if menu.blocks_gameplay() || session.health.is_depleted() {
         return;
     }
     if !cursor.visible && !options.bot {
@@ -674,6 +744,15 @@ fn predict(
     menu: Res<pause_menu::PauseMenu>,
 ) {
     if session.id.is_none() || session.transport.is_none() {
+        return;
+    }
+    if session.health.is_depleted() {
+        if let Some(packet) = session.death_heartbeat(time.delta_secs())
+            && let Some(transport) = &mut session.transport
+            && let Err(error) = transport.send_inputs(packet)
+        {
+            session.disconnect(error);
+        }
         return;
     }
     if !menu.blocks_gameplay()
@@ -740,10 +819,7 @@ fn predict(
             .skip(session.pending.len().saturating_sub(8))
             .copied()
             .collect();
-        let packet = InputPacket {
-            session: session.session,
-            inputs,
-        };
+        let packet = session.input_packet(inputs);
         if let Some(transport) = &mut session.transport
             && let Err(error) = transport.send_inputs(packet)
         {
@@ -767,6 +843,7 @@ fn edit_blocks(
         || cursor.visible
         || session.transport.is_none()
         || session.id.is_none()
+        || session.health.is_depleted()
     {
         *bow_repeat = BowRepeat::default();
         return;
@@ -896,7 +973,7 @@ fn select_voxel(
     menu: Res<pause_menu::PauseMenu>,
     mut selection: Single<(&mut Transform, &mut Visibility), With<Selection>>,
 ) {
-    if menu.blocks_gameplay() {
+    if menu.blocks_gameplay() || session.health.is_depleted() {
         *selection.1 = Visibility::Hidden;
         return;
     }

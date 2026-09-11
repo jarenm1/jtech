@@ -38,6 +38,8 @@ impl Simulation {
         let now = self.tick.saturating_mul(subticks_per_tick);
         let rejection = if request <= player.highest_request {
             Some(EditRejection::OldRequest)
+        } else if player.health.is_depleted() {
+            Some(EditRejection::Dead)
         } else if subticks_per_tick == 0 {
             Some(EditRejection::PackageUnavailable)
         } else if now < player.next_bow_time {
@@ -156,6 +158,7 @@ impl Simulation {
             let mut players: Vec<_> = self
                 .players
                 .iter()
+                .filter(|(_, player)| !player.health.is_depleted())
                 .map(|(&id, player)| (id, player.state))
                 .collect();
             players.sort_unstable_by_key(|(id, _)| *id);
@@ -194,7 +197,10 @@ impl Simulation {
                         }
                     }
                     Target::Player(player_id) => {
-                        if let Some(player) = self.players.get_mut(&player_id) {
+                        self.damage_player(player_id, load.player_damage);
+                        if let Some(player) = self.players.get_mut(&player_id)
+                            && !player.health.is_depleted()
+                        {
                             let impulse = explosion::kinetic_impulse(
                                 PLAYER_MASS,
                                 player.state.velocity,
@@ -345,12 +351,15 @@ mod tests {
             sim.advance_bow(&mut world);
         }
         assert_eq!(sim.metrics.explosions, 1);
+        let health = sim.player_health(1).unwrap();
+        assert!(health.current() > 0 && health.current() < health.maximum());
         let launched = sim.players[&1].state;
         assert!(launched.velocity.y > 2.0, "{launched:?}");
         assert!(launched.external_velocity.y > 0.0);
         assert!(!launched.grounded);
         sim.advance_bow(&mut world);
         assert_eq!(sim.players[&1].state, launched);
+        assert_eq!(sim.player_health(1), Some(health));
         let mut after = launched;
         physics::step_player(&world, &mut after, &Default::default(), physics::FIXED_DT);
         assert!(after.position.y > launched.position.y);
@@ -380,9 +389,89 @@ mod tests {
         let first_speed = sim.players[&1].state.velocity.y;
         sim.detonate_ready(&mut world);
         let final_state = sim.players[&1].state;
-        assert!(final_state.velocity.y > first_speed);
+        assert!(first_speed > 0.0);
+        assert!(sim.player_health(1).unwrap().is_depleted());
+        assert_eq!(final_state.velocity, Vec3::ZERO);
+        assert_eq!(final_state.external_velocity, glam::Vec2::ZERO);
         assert_eq!(sim.metrics.explosions, 3);
         sim.detonate_ready(&mut world);
         assert_eq!(sim.players[&1].state, final_state);
+    }
+
+    #[test]
+    fn blast_damages_each_exposed_player_once_using_the_pre_destruction_world() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
+        let center = Vec3::new(10.5, 10.9, 10.5);
+        // This wall is destroyed, but still shields player 3 from this blast.
+        for y in 9..=12 {
+            world.set_block(IVec3::new(11, y, 10), 1).unwrap();
+        }
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        for (id, position, noclip) in [
+            (1, Vec3::new(9.5, 10.0, 10.5), false),
+            (2, Vec3::new(9.5, 10.0, 10.5), false),
+            (3, Vec3::new(12.5, 10.0, 10.5), false),
+            (4, Vec3::new(9.5, 10.0, 10.5), true),
+            (5, Vec3::new(20.5, 10.0, 10.5), false),
+        ] {
+            let mut player = Player::new();
+            player.state.position = position;
+            player.state.noclip = noclip;
+            sim.players.insert(id, player);
+        }
+        let expected = explosion::plan(
+            &world,
+            &[],
+            &[(1, sim.players[&1].state)],
+            center,
+            BowPower::Standard,
+        )
+        .into_iter()
+        .find(|load| load.target == Target::Player(1))
+        .unwrap()
+        .player_damage;
+        sim.detonations
+            .push_back((1, center, crate::packages::test_blast(BowPower::Standard)));
+        sim.detonate_ready(&mut world);
+        assert_eq!(sim.player_health(1).unwrap().current(), 100 - expected);
+        assert_eq!(sim.player_health(2), sim.player_health(1));
+        assert!(expected > 0);
+        assert!((9..=12).any(|y| world.block(IVec3::new(11, y, 10)) == Some(0)));
+        for id in [3, 4, 5] {
+            assert_eq!(sim.player_health(id).unwrap().current(), 100);
+        }
+        sim.detonate_ready(&mut world);
+        assert_eq!(sim.player_health(1).unwrap().current(), 100 - expected);
+    }
+
+    #[test]
+    fn dead_players_cannot_fire_or_receive_another_impulse() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        let mut player = Player::new();
+        player.state.position = Vec3::splat(10.0);
+        sim.players.insert(1, player);
+        sim.damage_player(1, 100);
+        sim.fire_bow(&world, 1, 1, 0.0, 0.0, BowPower::Standard);
+        assert_eq!(
+            sim.players[&1].results.back().unwrap().1,
+            Err(EditRejection::Dead)
+        );
+        assert!(sim.arrows.is_empty());
+        sim.detonations.push_back((
+            1,
+            Vec3::splat(10.0),
+            crate::packages::test_blast(BowPower::Standard),
+        ));
+        sim.detonate_ready(&mut world);
+        assert_eq!(sim.players[&1].state.velocity, Vec3::ZERO);
+        assert_eq!(sim.players[&1].state.external_velocity, glam::Vec2::ZERO);
+        assert!(sim.player_health(1).unwrap().is_depleted());
     }
 }

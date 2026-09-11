@@ -49,6 +49,7 @@ fn reconciliation_preserves_blast_momentum_through_input_replay() {
         you: PlayerSnapshot {
             id: 1,
             last_input: 4,
+            life: 0,
             state: authoritative,
             health: Health::default(),
             yaw: 0.0,
@@ -96,6 +97,7 @@ fn reconciliation_copies_authoritative_health_without_predicting_damage() {
         you: PlayerSnapshot {
             id: 1,
             last_input: 0,
+            life: 0,
             state: start,
             health,
             yaw: 0.0,
@@ -210,6 +212,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
         you: PlayerSnapshot {
             id: 1,
             last_input: 10,
+            life: 0,
             state: acknowledged,
             health: Health::default(),
             yaw: 0.0,
@@ -231,6 +234,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
             you: PlayerSnapshot {
                 id: 1,
                 last_input: 30,
+                life: 0,
                 state: expected,
                 health: Health::default(),
                 yaw: 0.0,
@@ -277,6 +281,7 @@ fn terrain_changes_are_used_when_replaying_prediction() {
             you: PlayerSnapshot {
                 id: 1,
                 last_input: 0,
+                life: 0,
                 state: start,
                 health: Health::default(),
                 yaw: 0.0,
@@ -324,6 +329,7 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
             you: PlayerSnapshot {
                 id: 1,
                 last_input: 0,
+                life: 0,
                 state: start,
                 health: Health::default(),
                 yaw: 0.0,
@@ -642,6 +648,7 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
         you: PlayerSnapshot {
             id: 1,
             last_input: 5,
+            life: 0,
             state: acknowledged,
             health: Health::default(),
             yaw: 0.0,
@@ -696,4 +703,258 @@ fn camera_far_distance_covers_vertical_corner_of_view_region() {
         far >= corner.length(),
         "far plane {far} clips corner {corner}"
     );
+}
+
+fn snapshot(tick: u64, life: u64, state: PlayerState, health: Health) -> Snapshot {
+    Snapshot {
+        tick,
+        you: PlayerSnapshot {
+            id: 1,
+            last_input: 0,
+            state,
+            health,
+            life,
+            yaw: 0.0,
+        },
+        players: vec![],
+    }
+}
+
+#[test]
+fn reordered_snapshots_ignore_stale_life_and_state() {
+    let world = arena();
+    let start = PlayerState {
+        position: Vec3::new(0.5, 0.0, 0.5),
+        grounded: true,
+        ..default()
+    };
+    let mut client = ClientSession {
+        state: start,
+        ..default()
+    };
+    let current = PlayerState {
+        position: Vec3::new(4.5, 0.0, 0.5),
+        ..default()
+    };
+    reconcile(
+        &mut client,
+        &world,
+        &snapshot(5, 1, current, Health::default()),
+        &[],
+    );
+    assert_eq!(client.life, 1);
+    assert_eq!(client.state, current);
+    // A late datagram from before the respawn must not rewind life or motion.
+    let stale = PlayerState {
+        position: Vec3::new(9.5, 0.0, 0.5),
+        ..default()
+    };
+    reconcile(
+        &mut client,
+        &world,
+        &snapshot(4, 7, stale, Health::default()),
+        &[],
+    );
+    assert_eq!(client.life, 1);
+    assert_eq!(client.state, current);
+    assert_eq!(client.last_tick, 5);
+}
+
+#[test]
+fn life_change_resets_replay_presentation_noclip_and_sequence() {
+    let world = arena();
+    let start = PlayerState {
+        position: Vec3::new(0.5, 0.0, 0.5),
+        grounded: true,
+        ..default()
+    };
+    let mut client = ClientSession {
+        state: start,
+        sequence: 12,
+        ..default()
+    };
+    client.pending.push_back(PlayerInput {
+        sequence: 12,
+        movement: [1.0, 0.0],
+        ..default()
+    });
+    client.correction = Vec3::new(1.0, 0.0, 0.0);
+    client.noclip_requested = true;
+    let respawned = PlayerState {
+        position: Vec3::new(30.5, 4.0, -8.5),
+        velocity: Vec3::new(2.0, 0.0, 0.0),
+        noclip: false,
+        ..default()
+    };
+    reconcile(
+        &mut client,
+        &world,
+        &snapshot(9, 1, respawned, Health::default()),
+        &[],
+    );
+    assert_eq!(client.life, 1);
+    assert_eq!(client.state, respawned);
+    assert!(client.pending.is_empty());
+    assert_eq!(client.correction, Vec3::ZERO);
+    assert!(!client.noclip_requested);
+    assert_eq!(client.sequence, 12, "sequence stays monotonic");
+}
+
+#[test]
+fn life_change_applies_even_when_the_snapshot_is_still_dead() {
+    let world = arena();
+    let mut client = ClientSession {
+        correction: Vec3::new(0.5, 0.0, 0.0),
+        noclip_requested: true,
+        ..default()
+    };
+    client.pending.push_back(PlayerInput {
+        sequence: 3,
+        movement: [1.0, 0.0],
+        ..default()
+    });
+    let mut health = Health::default();
+    health.damage(u16::MAX);
+    let respawned = PlayerState {
+        position: Vec3::new(2.5, 0.0, 0.5),
+        noclip: false,
+        ..default()
+    };
+    reconcile(&mut client, &world, &snapshot(2, 1, respawned, health), &[]);
+    assert_eq!(client.life, 1);
+    assert_eq!(client.state, respawned);
+    assert!(client.pending.is_empty());
+    assert_eq!(client.correction, Vec3::ZERO);
+    assert!(!client.noclip_requested);
+    assert!(client.health.is_depleted());
+}
+
+#[test]
+fn dead_reconciliation_discards_local_replay_and_keeps_sequence_monotonic() {
+    let world = arena();
+    let mut client = ClientSession {
+        sequence: 40,
+        ..default()
+    };
+    for sequence in [39, 40] {
+        client.pending.push_back(PlayerInput {
+            sequence,
+            movement: [1.0, 0.0],
+            ..default()
+        });
+    }
+    client.correction = Vec3::new(1.0, 0.0, 0.0);
+    let mut health = Health::default();
+    health.damage(u16::MAX);
+    let dead_state = PlayerState {
+        position: Vec3::new(0.5, 0.0, 0.5),
+        ..default()
+    };
+    reconcile(
+        &mut client,
+        &world,
+        &snapshot(3, 0, dead_state, health),
+        &[],
+    );
+    assert!(client.health.is_depleted());
+    assert_eq!(client.state, dead_state);
+    assert!(client.pending.is_empty());
+    assert_eq!(client.correction, Vec3::ZERO);
+    assert_eq!(client.sequence, 40);
+}
+
+#[test]
+fn input_packets_and_respawn_requests_carry_observed_life() {
+    let client = ClientSession {
+        session: 7,
+        life: 5,
+        ..default()
+    };
+    let input = PlayerInput {
+        sequence: 1,
+        movement: [0.0, 1.0],
+        ..default()
+    };
+    let packet = client.input_packet(vec![input]);
+    assert_eq!(packet.session, 7);
+    assert_eq!(packet.life, 5);
+    assert_eq!(packet.inputs.len(), 1);
+    assert_eq!(packet.inputs[0].sequence, 1);
+    assert_eq!(packet.inputs[0].movement, [0.0, 1.0]);
+    assert!(matches!(
+        client.respawn_request(),
+        ClientMessage::Respawn { life: 5 }
+    ));
+    assert!(matches!(
+        client.respawn_request(),
+        ClientMessage::Respawn { life: 5 }
+    ));
+}
+
+#[test]
+fn controls_block_look_and_slot_changes_while_dead() {
+    let mut app = App::new();
+    app.insert_resource(Options {
+        server: "127.0.0.1:4000".parse().unwrap(),
+        bot: false,
+        frames: None,
+        screenshot: None,
+    })
+    .insert_resource(ClientSession {
+        selected: 3,
+        ..default()
+    })
+    .init_resource::<ButtonInput<KeyCode>>()
+    .init_resource::<AccumulatedMouseMotion>()
+    .init_resource::<pause_menu::PauseMenu>()
+    .add_systems(Update, controls);
+    app.world_mut().spawn(CursorOptions {
+        visible: false,
+        grab_mode: CursorGrabMode::Locked,
+        ..default()
+    });
+    let mut health = Health::default();
+    health.damage(u16::MAX);
+    app.world_mut().resource_mut::<ClientSession>().health = health;
+    let yaw = app.world().resource::<ClientSession>().yaw;
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::Digit6);
+    app.world_mut()
+        .resource_mut::<AccumulatedMouseMotion>()
+        .delta = Vec2::splat(50.0);
+    app.update();
+    assert_eq!(app.world().resource::<ClientSession>().selected, 3);
+    assert_eq!(app.world().resource::<ClientSession>().yaw, yaw);
+
+    app.world_mut().resource_mut::<ClientSession>().health = Health::default();
+    app.update();
+    assert_eq!(app.world().resource::<ClientSession>().selected, 6);
+    assert_ne!(app.world().resource::<ClientSession>().yaw, yaw);
+}
+
+#[test]
+fn death_heartbeat_keeps_sending_without_prediction_or_sequence_growth() {
+    let mut client = ClientSession {
+        life: 3,
+        sequence: 40,
+        ..default()
+    };
+    client.health.damage(100);
+    let state = client.state;
+    let mut packets = 0;
+    for _ in 0..600 {
+        if let Some(packet) = client.death_heartbeat(0.1) {
+            packets += 1;
+            assert_eq!(packet.life, 3);
+            assert_eq!(packet.inputs.len(), 1);
+            assert_eq!(packet.inputs[0].sequence, 40);
+            assert_eq!(packet.inputs[0].movement, [0.0; 2]);
+            assert!(!packet.inputs[0].jump && !packet.inputs[0].noclip);
+        }
+    }
+    assert_eq!(packets, 120);
+    assert!(client.pending.is_empty());
+    assert_eq!(client.sequence, 40);
+    assert_eq!(client.state, state);
 }

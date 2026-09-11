@@ -63,6 +63,9 @@ pub(crate) fn cycle_on_click(
     cursor: Single<&CursorOptions>,
     mut session: ResMut<ClientSession>,
 ) {
+    if session.health.is_depleted() {
+        return;
+    }
     if cursor.visible && session.selected == EXPLOSIVE_BOW_SLOT {
         for interaction in &buttons {
             if *interaction == Interaction::Pressed {

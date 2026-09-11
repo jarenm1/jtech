@@ -24,7 +24,9 @@ use physics::{
     EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, look_direction, overlaps_block, step_player,
 };
 use physics_slice::PhysicsSlice;
-use protocol::{ClientMessage, EditRejection, PlayerSnapshot, ServerMessage, Snapshot};
+use protocol::{
+    ClientMessage, EditRejection, InputPacket, PlayerSnapshot, ServerMessage, Snapshot,
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
@@ -169,6 +171,8 @@ impl Plugin for SimulationPlugin {
 struct Player {
     state: PlayerState,
     health: Health,
+    life: u64,
+    respawn_requested: bool,
     last_input: u64,
     input: PlayerInput,
     pending: BTreeMap<u64, PlayerInput>,
@@ -192,6 +196,8 @@ impl Player {
         Self {
             state: PlayerState::default(),
             health: Health::default(),
+            life: 0,
+            respawn_requested: false,
             last_input: 0,
             input: PlayerInput::default(),
             pending: BTreeMap::new(),
@@ -216,6 +222,7 @@ impl Player {
             last_input: self.last_input,
             state: self.state,
             health: self.health,
+            life: self.life,
             yaw: self.input.yaw,
         }
     }
@@ -224,6 +231,12 @@ impl Player {
             || input.sequence > self.last_input.saturating_add(256)
             || self.pending.contains_key(&input.sequence)
         {
+            return;
+        }
+        if self.health.is_depleted() {
+            // Acknowledge discarded input without moving or retaining it. A client
+            // may keep sending while dead; its sequence must not outrun admission.
+            self.last_input = input.sequence;
             return;
         }
         if self.pending.len() == MAX_INPUT_QUEUE {
@@ -366,6 +379,20 @@ impl Simulation {
             true
         }
     }
+    /// Queue one input packet for a player. The packet's life token must match the
+    /// player's current spawn generation; stale tokens are dropped, so movement
+    /// from before a respawn cannot replay.
+    fn accept_inputs(&mut self, id: u64, packet: InputPacket) {
+        let Some(player) = self.players.get_mut(&id) else {
+            return;
+        };
+        if packet.life != player.life {
+            return;
+        }
+        for input in packet.inputs {
+            player.enqueue(input);
+        }
+    }
     fn finish_edit(&mut self, id: u64, request: u64, outcome: EditOutcome) {
         if let Some(player) = self.players.get_mut(&id) {
             player.highest_request = player.highest_request.max(request);
@@ -444,6 +471,10 @@ impl Simulation {
         {
             return;
         }
+        if player.health.is_depleted() {
+            self.finish_edit(id, request, Err(EditRejection::Dead));
+            return;
+        }
         let validation = validate_player_edit(
             world,
             player,
@@ -494,6 +525,10 @@ impl Simulation {
             let Some(player) = self.players.get(&strike.id) else {
                 continue;
             };
+            if player.health.is_depleted() {
+                self.finish_edit(strike.id, strike.request, Err(EditRejection::Dead));
+                continue;
+            }
             let validation = if self.tick >= strike.expires {
                 Err(EditRejection::Expired)
             } else {
@@ -733,7 +768,7 @@ impl Simulation {
         physics.player_colliders(
             players
                 .into_iter()
-                .filter(|(_, player)| !player.state.noclip)
+                .filter(|(_, player)| !player.state.noclip && !player.health.is_depleted())
                 .enumerate()
                 .map(|(slot, (_, player))| gpu_physics::PlayerCollider {
                     position: player.state.position.to_array(),
@@ -928,11 +963,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         eprintln!("connect id={id}");
     }
     for (id, packet) in incoming.inputs {
-        if let Some(player) = sim.players.get_mut(&id) {
-            for input in packet.inputs {
-                player.enqueue(input);
-            }
-        }
+        sim.accept_inputs(id, packet);
     }
     // Only one command advances each actor per server tick, regardless of packet rate.
     let bodies = sim
@@ -941,38 +972,52 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         .map(|p| p.dynamic_colliders())
         .unwrap_or_default();
     for player in sim.players.values_mut() {
-        let input = if let Some((sequence, input)) = player.pending.pop_first() {
-            player.last_input = sequence;
-            player.input = input;
-            input
-        } else {
-            PlayerInput {
+        if player.health.is_depleted() {
+            // Dead players are frozen: no input movement, noclip, or GPU body push
+            // until an explicit respawn restores a safe supported position.
+            player.input = PlayerInput {
                 movement: [0.0; 2],
                 jump: false,
                 descend: false,
                 ..player.input
-            }
-        };
-        let previous = player.state;
-        let mut intended = previous;
-        step_player(&world, &mut intended, &input, FIXED_DT);
-        physics::step_player_with_bodies(&world, &mut player.state, &input, FIXED_DT, &bodies);
-        // Preserve attempted horizontal motion when a loose body blocks the character.
-        // The GPU resolves that kinematic push against material mass and terrain.
-        player.body_push_velocity = Vec3::new(
-            intended.velocity.x,
-            player.state.velocity.y,
-            intended.velocity.z,
-        );
-        if player.state.noclip {
-            player.body_push_velocity = Vec3::ZERO;
-        }
-        if !player.state.position.is_finite()
-            || player.state.position.x.abs() >= 31_999_900.0
-            || player.state.position.z.abs() >= 31_999_900.0
-        {
-            player.state = previous;
+            };
             player.state.velocity = Vec3::ZERO;
+            player.state.external_velocity = glam::Vec2::ZERO;
+            player.body_push_velocity = Vec3::ZERO;
+        } else {
+            let input = if let Some((sequence, input)) = player.pending.pop_first() {
+                player.last_input = sequence;
+                player.input = input;
+                input
+            } else {
+                PlayerInput {
+                    movement: [0.0; 2],
+                    jump: false,
+                    descend: false,
+                    ..player.input
+                }
+            };
+            let previous = player.state;
+            let mut intended = previous;
+            step_player(&world, &mut intended, &input, FIXED_DT);
+            physics::step_player_with_bodies(&world, &mut player.state, &input, FIXED_DT, &bodies);
+            // Preserve attempted horizontal motion when a loose body blocks the character.
+            // The GPU resolves that kinematic push against material mass and terrain.
+            player.body_push_velocity = Vec3::new(
+                intended.velocity.x,
+                player.state.velocity.y,
+                intended.velocity.z,
+            );
+            if player.state.noclip {
+                player.body_push_velocity = Vec3::ZERO;
+            }
+            if !player.state.position.is_finite()
+                || player.state.position.x.abs() >= 31_999_900.0
+                || player.state.position.z.abs() >= 31_999_900.0
+            {
+                player.state = previous;
+                player.state.velocity = Vec3::ZERO;
+            }
         }
         let center = chunk_coord(player.state.position.floor().as_ivec3());
         if player.interest_center != Some(center) || player.terrain_revision != sim.terrain.revision
@@ -1033,9 +1078,13 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                     }
                 }
             }
+            ClientMessage::Respawn { life } => {
+                sim.request_respawn(id, life);
+            }
             ClientMessage::Hello { .. } => {}
         }
     }
+    sim.finish_respawns(&world);
     sim.drain_strikes(&mut world);
     sim.advance_bow(&mut world);
     sim.replicate_packages();
@@ -1387,6 +1436,71 @@ mod tests {
         );
         assert!(!world.chunks.contains_key(&coord));
         assert_eq!(sim.metrics.generated, before);
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
+    fn dead_player_freezes_movement_input_and_body_push() {
+        let mut app = headless_app(1);
+        let (world, mut sim) = take_resources(&mut app);
+        let mut player = Player::new();
+        player.health.damage(u16::MAX);
+        player.state.position = Vec3::new(0.5, 40.0, 0.5);
+        let position = player.state.position;
+        player.body_push_velocity = Vec3::new(3.0, 0.0, 0.0);
+        player.input.movement = [1.0, 0.0];
+        player.enqueue(PlayerInput {
+            sequence: 1,
+            movement: [1.0, 0.0],
+            jump: true,
+            ..Default::default()
+        });
+        sim.players.insert(1, player);
+        put_resources(&mut app, world, sim);
+        app.update();
+        let sim = app.world().resource::<Simulation>();
+        let player = &sim.players[&1];
+        assert!(player.health.is_depleted());
+        assert_eq!(player.state.position, position);
+        assert_eq!(player.state.velocity, Vec3::ZERO);
+        assert_eq!(player.body_push_velocity, Vec3::ZERO);
+        assert_eq!(player.last_input, 1);
+        assert!(player.pending.is_empty());
+    }
+
+    #[test]
+    fn input_packets_from_a_stale_life_are_ignored() {
+        let mut app = headless_app(1);
+        let (world, mut sim) = take_resources(&mut app);
+        let mut player = Player::new();
+        player.life = 2;
+        sim.players.insert(1, player);
+        sim.accept_inputs(
+            1,
+            InputPacket {
+                session: 0,
+                life: 1,
+                inputs: vec![PlayerInput {
+                    sequence: 1,
+                    movement: [1.0, 0.0],
+                    ..Default::default()
+                }],
+            },
+        );
+        assert!(sim.players[&1].pending.is_empty());
+        sim.accept_inputs(
+            1,
+            InputPacket {
+                session: 0,
+                life: 2,
+                inputs: vec![PlayerInput {
+                    sequence: 2,
+                    movement: [1.0, 0.0],
+                    ..Default::default()
+                }],
+            },
+        );
+        assert_eq!(sim.players[&1].pending.len(), 1);
         put_resources(&mut app, world, sim);
     }
 }
