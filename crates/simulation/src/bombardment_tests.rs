@@ -246,6 +246,25 @@ fn playerless_streaming_loads_moving_halos_and_retires_remote_regions() {
                 .any(|coord| !world.chunks.contains_key(coord))
         );
     });
+    // Terrain halos stream asynchronously, and the GPU will not step a body until every
+    // collision page is resident. Wait for the normal stream to load them before starting
+    // the crossing budget; the body stays frozen at the source cell until then.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.update();
+        let resident = with_sim(&mut app, |sim, world| {
+            sim.physics
+                .as_ref()
+                .unwrap()
+                .needed_chunks()
+                .iter()
+                .all(|coord| world.chunks.contains_key(coord))
+        });
+        if resident {
+            break;
+        }
+        assert!(Instant::now() < deadline, "terrain halos did not stream");
+    }
     let mut crossed = false;
     for _ in 0..45 {
         app.update();
