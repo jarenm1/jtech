@@ -1,7 +1,10 @@
 use bevy::{prelude::*, window::CursorOptions};
 use protocol::EXPLOSIVE_BOW_SLOT;
 
-use crate::ClientSession;
+use crate::{
+    ClientSession,
+    game_hud::{GameplayHud, palette},
+};
 
 #[derive(Component)]
 pub(crate) struct PowerButton;
@@ -15,23 +18,40 @@ pub(crate) fn spawn(commands: &mut Commands) {
             Button,
             Node {
                 position_type: PositionType::Absolute,
-                bottom: px(112),
-                left: px(260),
-                padding: UiRect::all(px(12)),
+                bottom: px(22),
+                right: px(24),
+                padding: UiRect::axes(px(14), px(9)),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: px(2),
+                border: UiRect::all(px(2)),
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.9)),
+            BackgroundColor(palette::PANEL),
+            BorderColor::all(palette::AMBER),
+            BorderRadius::all(px(6)),
+            GlobalZIndex(10),
+            GameplayHud,
             PowerButton,
         ))
         .with_children(|button| {
+            button.spawn((
+                Text::new("BOW POWER"),
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
+                TextColor(palette::MUTED),
+                TextShadow::default(),
+            ));
             button.spawn((
                 Text::new(""),
                 TextFont {
                     font_size: 18.0,
                     ..default()
                 },
-                TextColor(Color::srgb(0.94, 0.97, 1.0)),
+                TextColor(palette::AMBER),
                 TextShadow::default(),
                 PowerLabel,
             ));
@@ -65,14 +85,11 @@ pub(crate) fn update(
         Display::None
     };
     color.0 = match **interaction {
-        Interaction::Pressed if cursor.visible => Color::srgb(0.3, 0.35, 0.5),
-        Interaction::Hovered if cursor.visible => Color::srgb(0.15, 0.2, 0.3),
-        _ => Color::srgba(0.025, 0.04, 0.07, 0.9),
+        Interaction::Pressed if cursor.visible => palette::PRESSED,
+        Interaction::Hovered if cursor.visible => palette::HOVER,
+        _ => palette::PANEL,
     };
-    **label = Text::new(format!(
-        "Bow power: {}  |  R cycle  |  Esc to click",
-        session.bow_power.label()
-    ));
+    **label = Text::new(session.bow_power.label());
 }
 
 #[cfg(test)]

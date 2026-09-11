@@ -28,7 +28,7 @@ where you look, **Space** to rise, and **Ctrl** to descend. Flight is 12 m/s,
 without gravity or terrain/loose-block collision; release movement to hover.
 The server applies the same movement as client prediction and replicates the mode.
 Press **V** again to walk. If inside a block, fly clear first; walking resumes
-once the whole player fits in loaded empty space. Read the current mode in the HUD.
+once the whole player fits in loaded empty space.
 
 ## Blast jumping
 
@@ -43,3 +43,14 @@ Terrain and loose blocks shield players; distance and partial exposure reduce
 force. Horizontal momentum carries through movement and decays with drag,
 while gravity and collisions govern the jump. Noclip players ignore blasts.
 Player knockback works with or without GPU physics.
+
+## Game interface
+
+Select a hotbar slot with **1–6**. Read health at the lower left and the selected
+item above the centered hotbar. Package status and reload errors appear at the
+upper right; the FPS counter is at the upper left.
+
+Press **Esc** to open the translucent pause menu. Choose **Resume** or press
+**Esc** again to return, adjust **Bow power**, or choose **Quit game** to exit.
+The menu blocks local movement, aiming and weapon input; multiplayer simulation
+and network updates continue. Switching window focus opens the menu too.

@@ -14,7 +14,7 @@ In another terminal, open the client:
 cargo run --release -p voxel-client
 ```
 
-Aim at a highlighted grid block and click **M1** repeatedly. Watch its fracture percentage in the HUD; at 100%, the block is destroyed. Use **1–5** and **right click** to place blocks. Press **6** to equip the **Explosive Bow**, then hold **right click** to fire explosive arrows at **25 shots per second**. Aim beyond the highlighted-block range or at loose blocks. Press **F** for a debug launch. A chipped block carries its damage while loose and after settling into another grid cell.
+Aim at a highlighted grid block and click **M1** repeatedly to fracture it. Use **1–5** and **right click** to place blocks. Press **6** to equip the **Explosive Bow**, then hold **right click** to fire explosive arrows at **25 shots per second** with the default package. Aim beyond the highlighted-block range or at loose blocks. Press **F** for a debug launch. A chipped block carries its damage while loose and after settling into another grid cell.
 
 Rebuild and restart both processes for protocol version **9**, including bow power presets and player blast momentum. Press **V** to toggle flight, **Space** to rise, and **Ctrl** to descend. Connect a second client to observe authoritative arrows, explosions, destruction, loose-body motion, and settlement.
 
@@ -32,7 +32,7 @@ Players use the shared CPU swept-AABB character controller on server and client.
 
 Test arrows are unlimited, with a **0.04-second** successful-shot interval (**25 shots per second**). At fixed60, carry fractional-tick timing forward using alternating two- and three-tick gaps. Hold right click for repeat fire; release it to stop. The server derives the muzzle from the player's eye and validates aim, loaded air, request order, and capacity. Replayed requests return their cached result. Arrows travel at **36 m/s** under **3 m/s²** gravity, sweep against terrain and loose unit cubes, and detonate on the first impact. Expire them after **64 m** of travel, **3 seconds**, or leaving loaded terrain. Admit at most **32** flying arrows and queued detonations combined; process at most **two explosions per tick**.
 
-While the bow is equipped, press **R** to cycle **0.5x → 1x → 2x → 4x** power. Alternatively, release the cursor with **Esc** and click the power button. Start at **1x**; switching weapons preserves the selection. Each arrow keeps the power selected when fired, including through delayed physics readback and queued detonations.
+While the bow is equipped, press **R** to cycle **0.5x → 1x → 2x → 4x** power. Alternatively, open the **Esc** menu and click **Bow power**. Start at **1x**; switching weapons preserves the selection. Each arrow keeps the power selected when fired, including through delayed physics readback and queued detonations.
 
 | Power | Charge | Radius |
 | --- | --- | --- |

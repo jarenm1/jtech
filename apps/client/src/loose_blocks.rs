@@ -57,6 +57,7 @@ impl LooseBlocks {
     pub fn colliders(&self) -> &[physics::DynamicCollider] {
         &self.colliders
     }
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         self.bodies.len()
     }
