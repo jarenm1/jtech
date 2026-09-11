@@ -21,6 +21,7 @@ protocol = { path = "crates/protocol" }
 networking = { path = "crates/networking" }
 simulation = { path = "crates/simulation" }
 voxel_render = { path = "crates/voxel_render" }
+game_packages = { path = "crates/game_packages" }
 
 [profile.dev]
 opt-level = 1

@@ -10,6 +10,7 @@ mod health;
 mod material_damage;
 #[cfg(test)]
 mod noclip_tests;
+mod packages;
 mod physics_slice;
 mod streaming;
 use bevy_app::{App, Plugin, Update};
@@ -62,6 +63,7 @@ pub struct ServerConfig {
     pub radius: i32,
     pub metrics_every: u64,
     pub gpu_physics: bool,
+    pub packages: std::path::PathBuf,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -71,6 +73,7 @@ impl Default for ServerConfig {
             radius: protocol::DEFAULT_VIEW_RADIUS,
             metrics_every: 600,
             gpu_physics: false,
+            packages: game_packages::default_directory(),
         }
     }
 }
@@ -133,6 +136,7 @@ impl Plugin for SimulationPlugin {
                 detonations: VecDeque::new(),
                 next_arrow: 1,
                 arrow_revision: 0,
+                packages: game_packages::PackageHost::new(&self.config.packages),
                 last_needed: HashMap::new(),
                 tick: 0,
                 metrics: SimulationMetrics::default(),
@@ -161,6 +165,7 @@ struct Player {
     // Deadline in 1/(60 * bow shots per second) seconds for fractional-tick cadence.
     next_bow_time: u64,
     arrow_revision: Option<u64>,
+    package_revision: Option<u64>,
 }
 impl Player {
     fn new() -> Self {
@@ -181,6 +186,7 @@ impl Player {
             body_push_velocity: Vec3::ZERO,
             next_bow_time: 0,
             arrow_revision: None,
+            package_revision: None,
         }
     }
     fn snapshot(&self, id: u64) -> PlayerSnapshot {
@@ -239,9 +245,10 @@ pub struct Simulation {
     damage: HashMap<IVec3, DamageState>,
     strikes: VecDeque<QueuedStrike>,
     arrows: Vec<bow::Arrow>,
-    detonations: VecDeque<(u32, Vec3, protocol::BowPower)>,
+    detonations: VecDeque<(u32, Vec3, game_packages::BlastSpec)>,
     next_arrow: u32,
     arrow_revision: u64,
+    packages: game_packages::PackageHost,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -849,6 +856,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     let started = Instant::now();
     let sim = &mut *simulation;
     sim.tick += 1;
+    sim.poll_packages();
     sim.observe_physics(&mut world);
     let incoming = match sim.transport.as_mut().map_or_else(
         || Ok(networking::ServerIncoming::default()),
@@ -976,6 +984,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     }
     sim.drain_strikes(&mut world);
     sim.advance_bow(&mut world);
+    sim.replicate_packages();
     sim.advance_physics(&mut world);
     let mut needed = std::mem::take(&mut sim.needed);
     needed.clear();

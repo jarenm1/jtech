@@ -6,7 +6,7 @@ use physics::{PlayerInput, PlayerState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -33,6 +33,7 @@ pub enum EditRejection {
     Expired,
     StorageFull,
     RevisionExhausted,
+    PackageUnavailable,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,6 +113,28 @@ pub enum ServerMessage {
         position: Vec3,
         radius: f32,
     },
+    /// Server package lifecycle and authoritative weapon cadence, sent reliably.
+    Packages {
+        revision: u64,
+        packages: Vec<PackageStatus>,
+        bow_shots_per_second: u32,
+    },
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PackageState {
+    Loading,
+    Reloading,
+    Loaded,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackageStatus {
+    pub id: String,
+    /// Last successfully loaded generation; zero means no usable package.
+    pub generation: u64,
+    pub state: PackageState,
+    pub error: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PhysicsBodySnapshot {

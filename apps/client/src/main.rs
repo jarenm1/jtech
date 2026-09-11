@@ -1,6 +1,7 @@
 mod bow_power_hud;
 mod health_hud;
 mod loose_blocks;
+mod package_hud;
 mod projectiles;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -100,6 +101,7 @@ struct ClientSession {
     correction: Vec3,
     selected: u8,
     bow_power: BowPower,
+    packages: package_hud::ServerPackages,
     request: u64,
     accepted_edits: u64,
     rejected_edits: u64,
@@ -157,6 +159,7 @@ impl Default for ClientSession {
             correction: Vec3::ZERO,
             selected: 3,
             bow_power: BowPower::default(),
+            packages: package_hud::ServerPackages::default(),
             request: 0,
             accepted_edits: 0,
             rejected_edits: 0,
@@ -203,6 +206,7 @@ impl ClientSession {
         error!("{}", self.status);
         self.transport = None;
         self.pending.clear();
+        self.packages = package_hud::ServerPackages::default();
     }
 
     fn send(&mut self, message: ClientMessage) {
@@ -268,6 +272,7 @@ impl Plugin for ClientPlugin {
                     update_hotbar,
                     health_hud::update,
                     bow_power_hud::update,
+                    package_hud::update,
                     capture_screenshot,
                     record_metrics,
                 )
@@ -384,6 +389,7 @@ fn setup(
             position_type: PositionType::Absolute,
             top: px(18),
             left: px(20),
+            max_width: percent(55),
             padding: UiRect::all(px(12)),
             ..default()
         },
@@ -428,6 +434,7 @@ fn setup(
     ));
     health_hud::spawn(&mut commands);
     bow_power_hud::spawn(&mut commands);
+    package_hud::spawn(&mut commands);
 }
 
 #[allow(clippy::too_many_arguments)] // Independent Bevy presentation resources.
@@ -465,6 +472,7 @@ fn receive_network(
                 health,
             } => {
                 projectiles.clear(&mut commands);
+                session.packages = package_hud::ServerPackages::default();
                 session.id = Some(id);
                 session.session = token;
                 session.state = spawn;
@@ -561,6 +569,15 @@ fn receive_network(
                     &projectile_assets,
                     Instant::now(),
                 );
+            }
+            ServerMessage::Packages {
+                revision,
+                packages,
+                bow_shots_per_second,
+            } => {
+                session
+                    .packages
+                    .receive(revision, packages, bow_shots_per_second);
             }
             ServerMessage::Disconnect { reason } => {
                 session.disconnect(reason);
@@ -780,21 +797,22 @@ fn edit_blocks(
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
     time: Res<Time>,
-    mut next_bow_shot: Local<Option<f64>>,
+    mut bow_repeat: Local<BowRepeat>,
 ) {
     if cursor.visible || session.transport.is_none() || session.id.is_none() {
-        *next_bow_shot = None;
+        *bow_repeat = BowRepeat::default();
         return;
     }
     let strike = keys.just_pressed(KeyCode::KeyF);
     let hit = buttons.just_pressed(MouseButton::Left);
     let bow_shot = repeat_bow(
-        &mut next_bow_shot,
+        &mut bow_repeat,
         time.elapsed_secs_f64(),
         session.selected == EXPLOSIVE_BOW_SLOT
             && buttons.pressed(MouseButton::Right)
             && !strike
             && !hit,
+        session.packages.bow_shots_per_second,
     );
     let secondary = if session.selected == EXPLOSIVE_BOW_SLOT {
         bow_shot
@@ -806,18 +824,28 @@ fn edit_blocks(
     }
 }
 
+#[derive(Default)]
+struct BowRepeat {
+    next: Option<f64>,
+    rate: u32,
+}
+
 /// Repeat while held, preserving fractional-frame cadence without catch-up bursts.
-fn repeat_bow(next: &mut Option<f64>, now: f64, held: bool) -> bool {
-    if !held {
-        *next = None;
+fn repeat_bow(repeat: &mut BowRepeat, now: f64, held: bool, rate: u32) -> bool {
+    if repeat.rate != rate {
+        repeat.next = None;
+        repeat.rate = rate;
+    }
+    if !held || rate == 0 {
+        repeat.next = None;
         return false;
     }
-    let interval = 1.0 / f64::from(protocol::EXPLOSIVE_BOW_SHOTS_PER_SECOND);
-    let deadline = next.unwrap_or(now);
+    let interval = 1.0 / f64::from(rate);
+    let deadline = repeat.next.unwrap_or(now);
     if now + 1e-9 < deadline {
         return false;
     }
-    *next = Some(if now - deadline < interval {
+    repeat.next = Some(if now - deadline < interval {
         deadline + interval
     } else {
         now + interval

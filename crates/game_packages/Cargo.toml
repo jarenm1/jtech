@@ -1,0 +1,9 @@
+[package]
+name = "game_packages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+protocol.workspace = true
+steel = { package = "steel-core", version = "=0.8.2", default-features = false, features = ["std", "sandbox", "interrupt"] }

@@ -1,16 +1,14 @@
 //! Authoritative point-projectile flight with swept terrain and loose-cube hits.
+use game_packages::Shot;
 use glam::Vec3;
-use protocol::{ArrowSnapshot, BowPower, PhysicsBodySnapshot};
+#[cfg(test)]
+use protocol::BowPower;
+use protocol::{ArrowSnapshot, PhysicsBodySnapshot};
 use voxel_world::VoxelWorld;
-
-const ARROW_SPEED: f32 = 36.0;
-const ARROW_GRAVITY: f32 = 3.0;
-const MAX_TRAVEL: f32 = 64.0;
-const MAX_AGE_TICKS: u32 = 180;
 
 pub(super) struct Arrow {
     pub snapshot: ArrowSnapshot,
-    pub power: BowPower,
+    pub shot: Shot,
     age: u32,
     traveled: f32,
     pending_steps: u32,
@@ -23,14 +21,22 @@ pub(super) enum Flight {
 }
 
 impl Arrow {
+    #[cfg(test)]
     pub fn new(id: u32, origin: Vec3, direction: Vec3, power: BowPower) -> Self {
+        let shot = game_packages::PackageHost::new(&game_packages::default_directory())
+            .fire(power)
+            .unwrap();
+        Self::from_shot(id, origin, direction, shot)
+    }
+
+    pub fn from_shot(id: u32, origin: Vec3, direction: Vec3, shot: Shot) -> Self {
         Self {
             snapshot: ArrowSnapshot {
                 id,
                 position: origin,
-                velocity: direction * ARROW_SPEED,
+                velocity: direction * shot.projectile.speed,
             },
-            power,
+            shot,
             age: 0,
             traveled: 0.0,
             pending_steps: 0,
@@ -47,7 +53,7 @@ impl Arrow {
         ready: bool,
     ) -> Flight {
         self.age += 1;
-        if self.age > MAX_AGE_TICKS {
+        if self.age > self.shot.projectile.max_age_ticks {
             return Flight::Expired;
         }
         self.pending_steps = (self.pending_steps + 1).min(3);
@@ -63,7 +69,7 @@ impl Arrow {
     }
 
     fn step(&mut self, world: &VoxelWorld, bodies: &[PhysicsBodySnapshot]) -> Flight {
-        if self.traveled >= MAX_TRAVEL {
+        if self.traveled >= self.shot.projectile.max_travel {
             return Flight::Expired;
         }
         let start = self.snapshot.position;
@@ -71,10 +77,15 @@ impl Arrow {
         if world.block(start.floor().as_ivec3()).is_none() {
             return Flight::Expired;
         }
-        self.snapshot.velocity.y -= ARROW_GRAVITY * physics::FIXED_DT;
+        self.snapshot.velocity.y -= self.shot.projectile.gravity * physics::FIXED_DT;
         let displacement = self.snapshot.velocity * physics::FIXED_DT;
-        let distance = displacement.length().min(MAX_TRAVEL - self.traveled);
-        let direction = displacement.normalize();
+        let distance = displacement
+            .length()
+            .min(self.shot.projectile.max_travel - self.traveled);
+        let Some(direction) = displacement.try_normalize() else {
+            // Authored gravity can bring an upward shot momentarily to rest.
+            return Flight::Flying;
+        };
         let mut impact = world
             .raycast(start, direction, distance)
             .map(|hit| hit.distance);
@@ -194,7 +205,7 @@ mod tests {
                 break;
             }
         }
-        assert!(arrow.traveled >= MAX_TRAVEL);
+        assert!(arrow.traveled >= arrow.shot.projectile.max_travel);
         let mut arrow = Arrow::new(2, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
         assert!(matches!(arrow.step(&world, &[]), Flight::Expired));
     }
@@ -216,7 +227,7 @@ mod tests {
         assert_eq!(arrow.snapshot.position.x, 2.9);
         assert!(matches!(arrow.tick(&world, &[], true), Flight::Flying));
         assert!((arrow.snapshot.position.x - 4.1).abs() < 0.001);
-        for _ in 0..MAX_AGE_TICKS {
+        for _ in 0..arrow.shot.projectile.max_age_ticks {
             arrow.tick(&world, &[], false);
         }
         assert!(matches!(arrow.tick(&world, &[], false), Flight::Expired));

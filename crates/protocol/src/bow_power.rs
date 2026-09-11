@@ -30,24 +30,6 @@ impl BowPower {
             Self::Extreme => "4x",
         }
     }
-
-    pub fn energy_multiplier(self) -> f32 {
-        match self {
-            Self::Low => 0.5,
-            Self::Standard => 1.0,
-            Self::High => 2.0,
-            Self::Extreme => 4.0,
-        }
-    }
-
-    pub fn radius(self) -> f32 {
-        match self {
-            Self::Low => 3.0,
-            Self::Standard => 4.0,
-            Self::High => 5.0,
-            Self::Extreme => 6.0,
-        }
-    }
 }
 
 #[cfg(test)]

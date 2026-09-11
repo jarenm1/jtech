@@ -6,9 +6,7 @@ use super::{
 };
 use glam::Vec3;
 use physics::{EYE_HEIGHT, PLAYER_MASS, apply_player_impulse, look_direction};
-use protocol::{
-    BowPower, EXPLOSIVE_BOW_SHOTS_PER_SECOND, EditRejection, MAX_ARROWS, ServerMessage,
-};
+use protocol::{BowPower, EditRejection, MAX_ARROWS, ServerMessage};
 use voxel_world::VoxelWorld;
 
 impl Simulation {
@@ -36,10 +34,12 @@ impl Simulation {
             return;
         }
         let origin = player.state.position + Vec3::Y * EYE_HEIGHT;
-        let subticks_per_tick = u64::from(EXPLOSIVE_BOW_SHOTS_PER_SECOND);
+        let subticks_per_tick = u64::from(self.packages.shots_per_second());
         let now = self.tick.saturating_mul(subticks_per_tick);
         let rejection = if request <= player.highest_request {
             Some(EditRejection::OldRequest)
+        } else if subticks_per_tick == 0 {
+            Some(EditRejection::PackageUnavailable)
         } else if now < player.next_bow_time {
             Some(EditRejection::Cooldown)
         } else if !yaw.is_finite()
@@ -62,17 +62,24 @@ impl Simulation {
             self.finish_edit(id, request, Err(reason));
             return;
         }
-        self.arrows.push(Arrow::new(
+        let shot = match self.packages.fire(power) {
+            Ok(shot) => shot,
+            Err(_) => {
+                self.finish_edit(id, request, Err(EditRejection::PackageUnavailable));
+                return;
+            }
+        };
+        self.arrows.push(Arrow::from_shot(
             self.next_arrow,
             origin,
             look_direction(yaw, pitch),
-            power,
+            shot,
         ));
         self.next_arrow += 1;
         self.arrow_revision += 1;
         self.metrics.bow_shots += 1;
         let deadline = &mut self.players.get_mut(&id).unwrap().next_bow_time;
-        // Carry sub-tick rounding forward: 25 Hz at fixed60 needs 2/3-tick gaps.
+        // Carry sub-tick rounding forward for the package's authored firing rate.
         // After idle time, start a new cadence rather than banking burst shots.
         if now.saturating_sub(*deadline) >= subticks_per_tick {
             *deadline = now;
@@ -101,7 +108,7 @@ impl Simulation {
                 Flight::Flying => self.arrows.push(arrow),
                 Flight::Impact(position) => {
                     self.detonations
-                        .push_back((arrow.snapshot.id, position, arrow.power))
+                        .push_back((arrow.snapshot.id, position, arrow.shot.impact()))
                 }
                 Flight::Expired => {}
             }
@@ -138,7 +145,7 @@ impl Simulation {
         let mut physics = self.physics.take();
         // Bound voxel scans, transactions, and replication work per server tick.
         for _ in 0..2 {
-            let Some((id, position, power)) = self.detonations.pop_front() else {
+            let Some((id, position, blast)) = self.detonations.pop_front() else {
                 break;
             };
             let bodies = physics
@@ -152,7 +159,7 @@ impl Simulation {
                 .map(|(&id, player)| (id, player.state))
                 .collect();
             players.sort_unstable_by_key(|(id, _)| *id);
-            let loads = explosion::plan(world, &bodies, &players, position, power);
+            let loads = explosion::plan_blast(world, &bodies, &players, position, blast);
             for load in loads {
                 match load.target {
                     Target::Grid(target) => {
@@ -210,7 +217,7 @@ impl Simulation {
             let event = ServerMessage::Explosion {
                 id,
                 position,
-                radius: power.radius(),
+                radius: blast.radius,
             };
             let recipients: Vec<_> = self.players.keys().copied().collect();
             for recipient in recipients {
@@ -286,18 +293,21 @@ mod tests {
         assert_eq!(
             sim.arrows
                 .iter()
-                .map(|arrow| arrow.power)
+                .map(|arrow| arrow.shot.power)
                 .collect::<Vec<_>>(),
             BowPower::ALL
         );
         // A replay with a changed preset must not alter an existing arrow.
         sim.fire_bow(&world, 1, 1, yaw, 0.0, BowPower::Extreme);
         assert_eq!(sim.arrows.len(), 4);
-        assert_eq!(sim.arrows[0].power, BowPower::Low);
+        assert_eq!(sim.arrows[0].shot.power, BowPower::Low);
         // Occupy this tick's two detonation slots, retaining the new impacts in the queue.
         for id in [100, 101] {
-            sim.detonations
-                .push_back((id, Vec3::splat(24.0), BowPower::Low));
+            sim.detonations.push_back((
+                id,
+                Vec3::splat(24.0),
+                crate::packages::test_blast(BowPower::Low),
+            ));
         }
         sim.advance_bow(&mut world);
         assert!(sim.arrows.is_empty());
@@ -307,7 +317,7 @@ mod tests {
                 .iter()
                 .map(|(_, _, power)| *power)
                 .collect::<Vec<_>>(),
-            BowPower::ALL
+            BowPower::ALL.map(crate::packages::test_blast)
         );
         sim.advance_bow(&mut world);
         assert_eq!(sim.metrics.explosions, 4);
@@ -359,7 +369,11 @@ mod tests {
         let center = player.state.position;
         sim.players.insert(1, player);
         for id in 0..3 {
-            sim.detonations.push_back((id, center, BowPower::Standard));
+            sim.detonations.push_back((
+                id,
+                center,
+                crate::packages::test_blast(BowPower::Standard),
+            ));
         }
         sim.detonate_ready(&mut world);
         assert_eq!(sim.detonations.len(), 1);

@@ -1,0 +1,22 @@
+;; Explosive bow, server package API v1.
+;; Edit and save this file to reload. Existing arrows retain their firing generation.
+(define package-api-version 1)
+(define shots-per-second 25)
+
+;; Power is 0 (low), 1 (standard), 2 (high), or 3 (extreme).
+(define (power-scale power)
+  (list-ref '(0.5 1.0 2.0 4.0) power))
+
+(define (projectile-for-power power)
+  ;; speed m/s, gravity m/s², maximum travel m, lifetime fixed60 ticks
+  (projectile 36.0 3.0 64.0 180))
+
+(define (blast-for-power power)
+  (let ((scale (power-scale power)))
+    ;; radius m, material energy J, player launch speed m/s,
+    ;; absorbed fraction, pressure pulse duration s
+    (explosion (list-ref '(3.0 4.0 5.0 6.0) power)
+               (* 6000.0 scale)
+               (* 18.0 (sqrt scale))
+               0.35
+               0.00075)))
