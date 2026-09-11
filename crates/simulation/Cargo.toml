@@ -15,3 +15,4 @@ protocol.workspace = true
 networking.workspace = true
 parking_lot = "0.12"
 gpu_physics = { path = "../gpu_physics" }
+game_packages.workspace = true

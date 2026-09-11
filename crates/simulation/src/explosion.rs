@@ -1,17 +1,13 @@
 //! Bounded blast allocation against one pre-explosion world observation.
 //! Materials share a finite charge; player knockback has a separate authored budget.
+use game_packages::BlastSpec;
 use glam::{IVec3, Vec3};
 use gpu_physics::{TerrainContact, material};
 use physics::{PLAYER_HEIGHT, PLAYER_MASS, PlayerState};
-use protocol::{BowPower, PhysicsBodySnapshot};
+#[cfg(test)]
+use protocol::BowPower;
+use protocol::PhysicsBodySnapshot;
 use voxel_world::{CHUNK_SIZE, MIN_CHUNK_Y, VoxelWorld};
-
-const ENERGY: f32 = 6000.0;
-const ABSORBED_FRACTION: f32 = 0.35;
-// Resting-player speed at the center of a standard blast, before exposure/falloff.
-const PLAYER_BLAST_SPEED: f32 = 18.0;
-// A short pressure pulse can break surface attachments before all receivers fracture.
-const LOAD_WINDOW: f32 = 0.00075;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Target {
@@ -45,9 +41,7 @@ pub(super) fn kinetic_impulse(mass: f32, velocity: Vec3, direction: Vec3, energy
     direction * impulse
 }
 
-/// Sample facing cube-face centers, with 1m² effective area and radial falloff.
-/// Freeze the receivers before changing terrain, so removing the front of a wall
-/// cannot expose its back to the same explosion.
+#[cfg(test)]
 pub(super) fn plan(
     world: &VoxelWorld,
     bodies: &[PhysicsBodySnapshot],
@@ -55,10 +49,28 @@ pub(super) fn plan(
     center: Vec3,
     power: BowPower,
 ) -> Vec<BlastLoad> {
+    plan_blast(
+        world,
+        bodies,
+        players,
+        center,
+        crate::packages::test_blast(power),
+    )
+}
+/// Sample facing cube-face centers, with 1m² effective area and radial falloff.
+/// Freeze the receivers before changing terrain, so removing the front of a wall
+/// cannot expose its back to the same explosion.
+pub(super) fn plan_blast(
+    world: &VoxelWorld,
+    bodies: &[PhysicsBodySnapshot],
+    players: &[(u64, PlayerState)],
+    center: Vec3,
+    blast: BlastSpec,
+) -> Vec<BlastLoad> {
     if !center.is_finite() {
         return Vec::new();
     }
-    let radius = power.radius();
+    let radius = blast.radius;
     let min = (center - Vec3::splat(radius)).floor().as_ivec3();
     let max = (center + Vec3::splat(radius)).floor().as_ivec3();
     let mut candidates = Vec::new();
@@ -176,17 +188,13 @@ pub(super) fn plan(
         .map(|(target, mat, direction, weight)| {
             let (kinetic_energy, dissipated_energy, force) = if matches!(target, Target::Player(_))
             {
-                let energy = 0.5
-                    * PLAYER_MASS
-                    * PLAYER_BLAST_SPEED.powi(2)
-                    * power.energy_multiplier()
-                    * weight;
+                let energy = 0.5 * PLAYER_MASS * blast.player_speed.powi(2) * weight;
                 (energy, 0.0, 0.0)
             } else {
-                let energy = ENERGY * power.energy_multiplier() * weight / normalizer;
-                let kinetic = energy * (1.0 - ABSORBED_FRACTION);
-                let force = (2.0 * material(mat).density * kinetic).sqrt() / LOAD_WINDOW;
-                (kinetic, energy * ABSORBED_FRACTION, force)
+                let energy = blast.energy * weight / normalizer;
+                let kinetic = energy * (1.0 - blast.absorbed_fraction);
+                let force = (2.0 * material(mat).density * kinetic).sqrt() / blast.load_window;
+                (kinetic, energy * blast.absorbed_fraction, force)
             };
             BlastLoad {
                 target,
@@ -279,7 +287,7 @@ mod tests {
                 .iter()
                 .map(|load| load.contact.dissipated_energy + load.kinetic_energy)
                 .sum();
-            assert!(total <= ENERGY + 0.01);
+            assert!(total <= crate::packages::test_blast(BowPower::Standard).energy + 0.01);
             outcomes.push((mat, destroyed, released));
         }
         eprintln!("surface blast (material, destroyed, released): {outcomes:?}");
@@ -320,7 +328,7 @@ mod tests {
             .iter()
             .map(|load| load.contact.dissipated_energy + load.kinetic_energy)
             .sum();
-        assert!(total <= ENERGY + 0.01);
+        assert!(total <= crate::packages::test_blast(BowPower::Standard).energy + 0.01);
         assert!(plan.iter().any(|load| material(3).damage_energy(
             load.contact.dissipated_energy,
             load.contact.force,
@@ -416,14 +424,17 @@ mod tests {
             let loads = plan(&world, &[body], &[], body.position, power);
             assert_eq!(loads.len(), 1);
             let load = &loads[0];
-            let budget = ENERGY * power.energy_multiplier();
+            let spec = crate::packages::test_blast(power);
+            let budget = spec.energy;
             assert!((load.contact.dissipated_energy + load.kinetic_energy - budget).abs() < 0.01);
-            assert!((load.contact.dissipated_energy - budget * ABSORBED_FRACTION).abs() < 0.01);
+            assert!(
+                (load.contact.dissipated_energy - budget * spec.absorbed_fraction).abs() < 0.01
+            );
             assert!(load.contact.force > previous_force);
             previous_force = load.contact.force;
-            let outside = body.position - Vec3::X * (power.radius() + 0.1);
+            let outside = body.position - Vec3::X * (spec.radius + 0.1);
             assert!(plan(&world, &[body], &[], outside, power).is_empty());
-            let inside = body.position - Vec3::X * (power.radius() - 0.1);
+            let inside = body.position - Vec3::X * (spec.radius - 0.1);
             assert_eq!(plan(&world, &[body], &[], inside, power).len(), 1);
         }
         let center = body.position - Vec3::X * 5.5;
@@ -466,7 +477,8 @@ mod tests {
                 .find(|load| load.target == Target::Player(1))
                 .unwrap();
             assert_eq!(first.kinetic_energy, solo.kinetic_energy);
-            let cap = 0.5 * PLAYER_MASS * PLAYER_BLAST_SPEED.powi(2) * power.energy_multiplier();
+            let spec = crate::packages::test_blast(power);
+            let cap = 0.5 * PLAYER_MASS * spec.player_speed.powi(2);
             assert!(first.kinetic_energy <= cap);
             assert_eq!(first.contact.dissipated_energy, 0.0);
             assert!(first.direction.y > 0.99);
@@ -477,7 +489,7 @@ mod tests {
                 .filter(|load| !matches!(load.target, Target::Player(_)))
                 .map(|load| load.kinetic_energy + load.contact.dissipated_energy)
                 .sum();
-            assert!(total <= ENERGY * power.energy_multiplier() + 0.01);
+            assert!(total <= spec.energy + 0.01);
             assert!(
                 loads
                     .iter()

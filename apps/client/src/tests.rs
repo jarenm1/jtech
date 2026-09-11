@@ -569,28 +569,45 @@ fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
 }
 
 #[test]
-fn held_bow_repeats_at_25_hz_across_frame_rates() {
-    for fps in [30, 60, 144] {
-        let mut next = None;
-        let shots = (0..fps * 10)
-            .filter(|frame| repeat_bow(&mut next, f64::from(*frame) / f64::from(fps), true))
-            .count();
-        assert_eq!(shots, 250, "frame rate {fps}");
+fn held_bow_uses_server_rate_across_frame_rates() {
+    for rate in [5, 10, 25] {
+        for fps in [30, 60, 144] {
+            let mut repeat = BowRepeat::default();
+            let shots = (0..fps * 10)
+                .filter(|frame| {
+                    repeat_bow(&mut repeat, f64::from(*frame) / f64::from(fps), true, rate)
+                })
+                .count();
+            assert_eq!(shots, rate as usize * 10, "rate {rate}, frame rate {fps}");
+        }
     }
 }
 
 #[test]
 fn bow_release_cancels_repeat_and_stalls_do_not_queue_bursts() {
-    let mut next = None;
-    assert!(repeat_bow(&mut next, 0.0, true));
-    assert!(!repeat_bow(&mut next, 0.01, true));
-    assert!(!repeat_bow(&mut next, 0.02, false));
-    assert_eq!(next, None);
-    assert!(repeat_bow(&mut next, 1.0, true));
-    assert!(repeat_bow(&mut next, 10.0, true));
-    assert!(!repeat_bow(&mut next, 10.0, true));
-    assert!(!repeat_bow(&mut next, 10.01, true));
-    assert!(repeat_bow(&mut next, 10.04, true));
+    let mut repeat = BowRepeat::default();
+    assert!(repeat_bow(&mut repeat, 0.0, true, 25));
+    assert!(!repeat_bow(&mut repeat, 0.01, true, 25));
+    assert!(!repeat_bow(&mut repeat, 0.02, false, 25));
+    assert_eq!(repeat.next, None);
+    assert!(repeat_bow(&mut repeat, 1.0, true, 25));
+    assert!(repeat_bow(&mut repeat, 10.0, true, 25));
+    assert!(!repeat_bow(&mut repeat, 10.0, true, 25));
+    assert!(!repeat_bow(&mut repeat, 10.01, true, 25));
+    assert!(repeat_bow(&mut repeat, 10.04, true, 25));
+}
+
+#[test]
+fn bow_cadence_changes_immediately_and_zero_rate_disables_firing() {
+    let mut repeat = BowRepeat::default();
+    assert!(repeat_bow(&mut repeat, 0.0, true, 1));
+    assert!(repeat_bow(&mut repeat, 0.1, true, 10));
+    assert!(!repeat_bow(&mut repeat, 0.11, true, 10));
+    assert!(repeat_bow(&mut repeat, 0.2, true, 10));
+    assert!(!repeat_bow(&mut repeat, 0.3, true, 0));
+    assert_eq!(repeat.next, None);
+    assert!(!repeat_bow(&mut repeat, 1.0, true, 0));
+    assert!(repeat_bow(&mut repeat, 1.1, true, 25));
 }
 
 #[test]

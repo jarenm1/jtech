@@ -2,16 +2,20 @@ use bevy_app::App;
 use glam::{IVec3, Vec3};
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerInput, PlayerState, step_player};
-use protocol::{ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, ServerMessage};
+use protocol::{
+    ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, PackageState, PackageStatus,
+    ServerMessage,
+};
 use simulation::{ServerConfig, Simulation, SimulationPlugin};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     error::Error,
+    fs,
     net::SocketAddr,
-    time::Duration,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, chunk_coord};
-
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 struct Bot {
     net: ClientTransport,
@@ -34,6 +38,7 @@ struct Bot {
     flights: Vec<(u64, Vec<ArrowSnapshot>)>,
     explosions: Vec<(u32, Vec3, f32)>,
     chunks: usize,
+    packages: Vec<(u64, Vec<PackageStatus>, u32)>,
     deltas: usize,
     forgotten: usize,
     corrections: usize,
@@ -62,6 +67,7 @@ impl Bot {
             rejections: HashMap::new(),
             flights: Vec::new(),
             explosions: Vec::new(),
+            packages: Vec::new(),
             chunks: 0,
             deltas: 0,
             forgotten: 0,
@@ -152,6 +158,13 @@ impl Bot {
                 } => {
                     self.explosions.push((id, position, radius));
                 }
+                ServerMessage::Packages {
+                    revision,
+                    packages,
+                    bow_shots_per_second,
+                } => self
+                    .packages
+                    .push((revision, packages, bow_shots_per_second)),
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
             }
         }
@@ -369,13 +382,41 @@ fn break_block(
     }
     Err("material did not break within 64 accepted hits".into())
 }
+fn package_fixture() -> Result<(PathBuf, PathBuf, String)> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "jtech-smoke-packages-{}-{nonce}",
+        std::process::id()
+    ));
+    let package_dir = root.join("explosive-bow");
+    fs::create_dir_all(&package_dir)?;
+    let baseline_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/explosive-bow/server.scm");
+    let source = fs::read_to_string(&baseline_path)?;
+    let package_path = package_dir.join("server.scm");
+    fs::write(&package_path, &source)?;
+    Ok((root, package_path, source))
+}
+
+fn latest_package(bot: &Bot) -> Option<(&PackageStatus, u32)> {
+    let (_, packages, rate) = bot.packages.last()?;
+    Some((
+        packages
+            .iter()
+            .find(|package| package.id == "explosive-bow")?,
+        *rate,
+    ))
+}
+
 /// A separate CPU-only world keeps blast damage out of the movement/edit scenarios.
 fn explosive_bow() -> Result<()> {
+    let (package_root, package_path, baseline) = package_fixture()?;
     let plugin = SimulationPlugin::bind(ServerConfig {
         bind: "127.0.0.1:0".parse()?,
         radius: 1,
         metrics_every: 0,
         gpu_physics: false,
+        packages: package_root.clone(),
         ..Default::default()
     })?;
     let address = plugin.local_addr();
@@ -425,6 +466,71 @@ fn explosive_bow() -> Result<()> {
             "bow wall baseline did not replicate",
         )?;
     }
+    for bot in [&first, &second] {
+        let (status, rate) = latest_package(bot).ok_or("initial package status missing")?;
+        require(
+            status.state == PackageState::Loaded && status.generation == 1 && rate == 25,
+            "initial package was not loaded on both bots",
+        )?;
+    }
+    let tuned = baseline
+        .replace(
+            "(define shots-per-second 25)",
+            "(define shots-per-second 20)",
+        )
+        .replace(
+            "(projectile 36.0 3.0 64.0 180)",
+            "(projectile 18.0 3.0 64.0 180)",
+        )
+        .replace(
+            "(list-ref '(3.0 4.0 5.0 6.0) power)",
+            "(list-ref '(5.0 6.0 7.0 8.0) power)",
+        );
+    fs::write(&package_path, &tuned)?;
+    drive(&mut app, &mut [&mut first, &mut second], 420, [0.0; 2], 0.0)?;
+    for bot in [&first, &second] {
+        let (status, rate) = latest_package(bot).ok_or("valid reload status missing")?;
+        require(
+            status.state == PackageState::Loaded && status.generation == 2 && rate == 20,
+            "valid package reload did not publish generation two",
+        )?;
+    }
+    let invalid = tuned.replace(
+        "(define package-api-version 1)",
+        "(define package-api-version",
+    );
+    fs::write(&package_path, invalid)?;
+    drive(&mut app, &mut [&mut first, &mut second], 420, [0.0; 2], 0.0)?;
+    for bot in [&first, &second] {
+        let (status, rate) = latest_package(bot).ok_or("invalid reload status missing")?;
+        require(
+            status.state == PackageState::Error && status.generation == 2 && rate == 20,
+            "invalid reload did not retain the active package",
+        )?;
+    }
+    fs::write(&package_path, &tuned)?;
+    drive(&mut app, &mut [&mut first, &mut second], 420, [0.0; 2], 0.0)?;
+    for bot in [&first, &second] {
+        let (status, rate) = latest_package(bot).ok_or("repaired reload status missing")?;
+        require(
+            status.state == PackageState::Loaded && status.generation == 3 && rate == 20,
+            "repaired package reload did not publish generation three",
+        )?;
+    }
+    let mut late = Bot::connect(address, false)?;
+    drive(
+        &mut app,
+        &mut [&mut first, &mut second, &mut late],
+        180,
+        [0.0; 2],
+        0.0,
+    )?;
+    let (status, rate) = latest_package(&late).ok_or("late join package status missing")?;
+    require(
+        status.state == PackageState::Loaded && status.generation == 3 && rate == 20,
+        "late join did not receive the current package status",
+    )?;
+    drop(late);
     let yaw = -std::f32::consts::FRAC_PI_2;
     let shot = ClientMessage::FireBow {
         request: 1,
@@ -454,10 +560,10 @@ fn explosive_bow() -> Result<()> {
     let (id, position, radius) = first.explosions[0];
     require(
         position.is_finite()
-            && radius > 0.0
+            && (radius - 6.0).abs() < 0.05
             && (position.x - (base.x + 12) as f32).abs() < 0.05
             && position.distance(muzzle) > 6.0,
-        "bow did not impact the distant wall",
+        "bow did not impact the distant wall with the reloaded blast policy",
     )?;
     for bot in [&first, &second] {
         let visible: Vec<_> = bot
@@ -471,8 +577,11 @@ fn explosive_bow() -> Result<()> {
                 && visible
                     .iter()
                     .all(|arrow| arrow.position.is_finite() && arrow.velocity.is_finite())
-                && visible.last().unwrap().position.x > visible[0].position.x + 1.0,
-            "bow moving arrow was not visible before impact",
+                && visible.last().unwrap().position.x > visible[0].position.x + 1.0
+                && visible
+                    .iter()
+                    .any(|arrow| (arrow.velocity.length() - 18.0).abs() < 1.0),
+            "reloaded bow moving arrow did not expose the native speed policy",
         )?;
         require(
             bot.flights
@@ -551,6 +660,7 @@ fn explosive_bow() -> Result<()> {
             "later bow shot did not replicate to both clients",
         )?;
     }
+    fs::remove_dir_all(&package_root)?;
     Ok(())
 }
 fn check_health(app: &mut App, first: &mut Bot, second: &mut Bot) -> Result<()> {

@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..64 (default 16)] [--ticks N] [--metrics-every 600] [--gpu-physics]"
+                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..64 (default 16)] [--ticks N] [--metrics-every 600] [--gpu-physics] [--packages DIR]"
             );
             return Ok(());
         }
@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         match arg.as_str() {
             "--bind" => config.bind = value.parse()?,
             "--seed" => config.seed = value.parse()?,
+            "--packages" => config.packages = value.into(),
             "--radius" => {
                 config.radius = value.parse()?;
                 if !(1..=protocol::MAX_VIEW_RADIUS).contains(&config.radius) {
