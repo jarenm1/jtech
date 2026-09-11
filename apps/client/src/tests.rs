@@ -465,6 +465,7 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
     })
     .init_resource::<ButtonInput<KeyCode>>()
     .init_resource::<AccumulatedMouseMotion>()
+    .init_resource::<pause_menu::PauseMenu>()
     .add_systems(Update, controls);
     let cursor = app
         .world_mut()

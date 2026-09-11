@@ -1,6 +1,9 @@
 use bevy::prelude::*;
 
-use crate::ClientSession;
+use crate::{
+    ClientSession,
+    game_hud::{GameplayHud, palette},
+};
 
 #[derive(Component)]
 pub(crate) struct HealthLabel;
@@ -13,24 +16,29 @@ pub(crate) fn spawn(commands: &mut Commands) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                bottom: px(112),
+                bottom: px(22),
                 left: px(20),
-                width: px(220),
-                padding: UiRect::all(px(10)),
+                width: px(210),
+                padding: UiRect::axes(px(10), px(7)),
                 flex_direction: FlexDirection::Column,
                 row_gap: px(6),
+                border: UiRect::all(px(1)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.8)),
+            BackgroundColor(palette::PANEL),
+            BorderColor::all(palette::BORDER),
+            BorderRadius::all(px(6)),
+            GlobalZIndex(10),
+            GameplayHud,
         ))
         .with_children(|panel| {
             panel.spawn((
                 Text::new(""),
                 TextFont {
-                    font_size: 18.0,
+                    font_size: 13.0,
                     ..default()
                 },
-                TextColor(Color::srgb(0.94, 0.97, 1.0)),
+                TextColor(palette::IVORY),
                 TextShadow::default(),
                 HealthLabel,
             ));
@@ -39,9 +47,12 @@ pub(crate) fn spawn(commands: &mut Commands) {
                     Node {
                         width: percent(100),
                         height: px(10),
+                        border: UiRect::all(px(1)),
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.25, 0.08, 0.08)),
+                    BackgroundColor(palette::HEALTH_TRACK),
+                    BorderColor::all(palette::BORDER),
+                    BorderRadius::all(px(5)),
                 ))
                 .with_children(|track| {
                     track.spawn((
@@ -50,7 +61,8 @@ pub(crate) fn spawn(commands: &mut Commands) {
                             height: percent(100),
                             ..default()
                         },
-                        BackgroundColor(Color::srgb(0.3, 0.85, 0.45)),
+                        BackgroundColor(palette::HEALTH_FILL),
+                        BorderRadius::all(px(4)),
                         HealthFill,
                     ));
                 });
@@ -60,21 +72,19 @@ pub(crate) fn spawn(commands: &mut Commands) {
 pub(crate) fn update(
     session: Res<ClientSession>,
     mut label: Single<&mut Text, With<HealthLabel>>,
-    mut fill: Single<&mut Node, With<HealthFill>>,
+    mut fill: Single<(&mut Node, &mut BackgroundColor), With<HealthFill>>,
 ) {
     if !session.is_changed() {
         return;
     }
     let health = session.health;
-    **label = Text::new(format!(
-        "HP {} / {}{}",
-        health.current(),
-        health.maximum(),
-        if health.is_depleted() {
-            "  DEPLETED"
-        } else {
-            ""
-        },
-    ));
-    fill.width = percent(100.0 * f32::from(health.current()) / f32::from(health.maximum()));
+    let fraction = f32::from(health.current()) / f32::from(health.maximum());
+    **label = Text::new(format!("HP {}/{}", health.current(), health.maximum()));
+    let (node, color) = &mut *fill;
+    node.width = percent(100.0 * fraction);
+    color.0 = if fraction <= 0.3 {
+        palette::HEALTH_LOW
+    } else {
+        palette::HEALTH_FILL
+    };
 }

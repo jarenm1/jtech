@@ -3,7 +3,7 @@ use std::fmt::Write;
 use bevy::{prelude::*, text::LineBreak};
 use protocol::{PackageState, PackageStatus};
 
-use crate::ClientSession;
+use crate::{ClientSession, game_hud::palette};
 
 /// Server package state is independent of movement prediction and local visuals.
 pub(crate) struct ServerPackages {
@@ -46,23 +46,27 @@ pub(crate) fn spawn(commands: &mut Commands) {
     commands.spawn((
         Text::new(""),
         TextFont {
-            font_size: 14.0,
+            font_size: 13.0,
             ..default()
         },
         TextLayout::new_with_linebreak(LineBreak::WordOrCharacter),
-        TextColor(Color::srgb(0.78, 0.92, 0.8)),
+        TextColor(palette::IVORY),
         TextShadow::default(),
         Node {
             position_type: PositionType::Absolute,
-            top: px(18),
-            right: px(20),
-            width: px(360),
-            max_width: percent(38),
-            padding: UiRect::all(px(12)),
+            top: px(16),
+            right: px(18),
+            width: px(340),
+            max_width: percent(40),
+            padding: UiRect::all(px(11)),
+            border: UiRect::all(px(1)),
             display: Display::None,
             ..default()
         },
-        BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.9)),
+        BackgroundColor(palette::PANEL),
+        BorderColor::all(palette::BORDER),
+        BorderRadius::all(px(6)),
+        GlobalZIndex(20),
         PackagePanel,
     ));
 }
@@ -92,16 +96,16 @@ pub(crate) fn update(
         .iter()
         .any(|package| matches!(package.state, PackageState::Error))
     {
-        Color::srgb(1.0, 0.63, 0.55)
+        palette::DANGER
     } else if packages.statuses.iter().any(|package| {
         matches!(
             package.state,
             PackageState::Loading | PackageState::Reloading
         )
     }) {
-        Color::srgb(1.0, 0.86, 0.5)
+        palette::CONNECTING
     } else {
-        Color::srgb(0.78, 0.92, 0.8)
+        palette::IVORY
     };
 }
 

@@ -1,7 +1,9 @@
 mod bow_power_hud;
+mod game_hud;
 mod health_hud;
 mod loose_blocks;
 mod package_hud;
+mod pause_menu;
 mod projectiles;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -11,7 +13,6 @@ use std::{
 
 use bevy::{
     app::AppExit,
-    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
@@ -71,7 +72,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc release/capture mouse (click bow power button) | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc pause menu | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -245,11 +246,7 @@ struct ActorAssets {
 #[derive(Component)]
 struct PlayerCamera;
 #[derive(Component)]
-struct Hud;
-#[derive(Component)]
 struct Selection;
-#[derive(Component)]
-struct Hotbar;
 
 struct ClientPlugin;
 
@@ -257,19 +254,23 @@ impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ClientSession>()
             .init_resource::<RemotePlayers>()
+            .init_resource::<pause_menu::PauseMenu>()
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
                 (
                     receive_network,
+                    pause_menu::input,
+                    pause_menu::actions,
+                    pause_menu::sync,
                     controls,
-                    bow_power_hud::cycle_on_click,
+                    bow_power_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
                     predict,
                     edit_blocks,
                     present_players,
                     select_voxel,
-                    update_hud,
-                    update_hotbar,
+                    game_hud::update,
+                    game_hud::update_fps,
                     health_hud::update,
                     bow_power_hud::update,
                     package_hud::update,
@@ -296,7 +297,7 @@ fn main() {
         })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Voxel / multiplayer laboratory".into(),
+                title: "Voxel".into(),
                 resolution: (1280, 800).into(),
                 present_mode: PresentMode::AutoVsync,
                 ..default()
@@ -304,7 +305,7 @@ fn main() {
             ..default()
         }))
         .add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
+            bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
             WorldPlugin,
             VoxelRenderPlugin,
             ClientPlugin,
@@ -377,61 +378,8 @@ fn setup(
         Visibility::Hidden,
         Selection,
     ));
-    commands.spawn((
-        Text::new("VOXEL / CONNECTING"),
-        TextFont {
-            font_size: 17.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.94, 0.97, 1.0)),
-        TextShadow::default(),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(18),
-            left: px(20),
-            max_width: percent(55),
-            padding: UiRect::all(px(12)),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.8)),
-        Hud,
-    ));
-    commands.spawn((
-        Text::new("+"),
-        TextFont {
-            font_size: 24.0,
-            ..default()
-        },
-        TextShadow::default(),
-        Node {
-            position_type: PositionType::Absolute,
-            left: percent(50),
-            top: percent(50),
-            margin: UiRect {
-                left: px(-7),
-                top: px(-14),
-                ..default()
-            },
-            ..default()
-        },
-    ));
-    commands.spawn((
-        Text::new(""),
-        TextFont {
-            font_size: 14.0,
-            ..default()
-        },
-        TextShadow::default(),
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: px(18),
-            left: px(20),
-            padding: UiRect::all(px(10)),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.025, 0.04, 0.07, 0.8)),
-        Hotbar,
-    ));
+    game_hud::spawn(&mut commands);
+    pause_menu::spawn(&mut commands);
     health_hud::spawn(&mut commands);
     bow_power_hud::spawn(&mut commands);
     package_hud::spawn(&mut commands);
@@ -667,15 +615,11 @@ fn controls(
     mouse: Res<AccumulatedMouseMotion>,
     options: Res<Options>,
     mut session: ResMut<ClientSession>,
-    mut cursor: Single<&mut CursorOptions>,
+    cursor: Single<&CursorOptions>,
+    menu: Res<pause_menu::PauseMenu>,
 ) {
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.visible = !cursor.visible;
-        cursor.grab_mode = if cursor.visible {
-            CursorGrabMode::None
-        } else {
-            CursorGrabMode::Locked
-        };
+    if menu.blocks_gameplay() {
+        return;
     }
     if !cursor.visible && !options.bot {
         session.yaw = (session.yaw - mouse.delta.x * 0.0025) % std::f32::consts::TAU;
@@ -706,6 +650,7 @@ fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
     .map(|(index, _)| index as u8 + 1)
     .next_back()
 }
+#[allow(clippy::too_many_arguments)] // Prediction reads input, pause state and world observations.
 fn predict(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -714,11 +659,16 @@ fn predict(
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
     loose: Res<loose_blocks::LooseBlocks>,
+    menu: Res<pause_menu::PauseMenu>,
 ) {
     if session.id.is_none() || session.transport.is_none() {
         return;
     }
-    if !options.bot && !cursor.visible && keys.just_pressed(KeyCode::KeyV) {
+    if !menu.blocks_gameplay()
+        && !options.bot
+        && !cursor.visible
+        && keys.just_pressed(KeyCode::KeyV)
+    {
         session.noclip_requested = !session.noclip_requested;
     }
     if !session.noclip_requested
@@ -742,7 +692,7 @@ fn predict(
         let mut movement = [0.0, 0.0];
         let mut jump = false;
         let mut descend = false;
-        if options.bot {
+        if options.bot && !menu.blocks_gameplay() {
             // Reproducible traversal for profiling the real rendered client.
             let phase = (session.sequence / 240) % 4;
             movement = match phase {
@@ -752,7 +702,7 @@ fn predict(
                 _ => [-1.0, 0.0],
             };
             jump = session.sequence.is_multiple_of(90);
-        } else if !cursor.visible {
+        } else if !cursor.visible && !menu.blocks_gameplay() {
             movement[0] = f32::from(u8::from(keys.pressed(KeyCode::KeyD)))
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyA)));
             movement[1] = f32::from(u8::from(keys.pressed(KeyCode::KeyW)))
@@ -790,6 +740,7 @@ fn predict(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Gate gameplay actions separately from menu interaction.
 fn edit_blocks(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -798,8 +749,13 @@ fn edit_blocks(
     mut session: ResMut<ClientSession>,
     time: Res<Time>,
     mut bow_repeat: Local<BowRepeat>,
+    menu: Res<pause_menu::PauseMenu>,
 ) {
-    if cursor.visible || session.transport.is_none() || session.id.is_none() {
+    if menu.blocks_gameplay()
+        || cursor.visible
+        || session.transport.is_none()
+        || session.id.is_none()
+    {
         *bow_repeat = BowRepeat::default();
         return;
     }
@@ -925,8 +881,13 @@ fn present_players(
 fn select_voxel(
     world: Res<VoxelWorld>,
     session: Res<ClientSession>,
+    menu: Res<pause_menu::PauseMenu>,
     mut selection: Single<(&mut Transform, &mut Visibility), With<Selection>>,
 ) {
+    if menu.blocks_gameplay() {
+        *selection.1 = Visibility::Hidden;
+        return;
+    }
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
     if let Some(hit) = world.raycast(origin, look_direction(session.yaw, session.pitch), 6.0) {
         selection.0.translation = hit.block.as_vec3() + Vec3::splat(0.5);
@@ -936,99 +897,6 @@ fn select_voxel(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Independent Bevy system resources.
-fn update_hud(
-    mut next_update: Local<Option<Instant>>,
-    session: Res<ClientSession>,
-    world: Res<VoxelWorld>,
-    stats: Res<VoxelRenderStats>,
-    remotes: Res<RemotePlayers>,
-    loose: Res<loose_blocks::LooseBlocks>,
-    diagnostics: Res<DiagnosticsStore>,
-    mut hud: Single<&mut Text, With<Hud>>,
-) {
-    let now = Instant::now();
-    if next_update.is_some_and(|next| now < next) {
-        return;
-    }
-    *next_update = Some(now + std::time::Duration::from_millis(200));
-    let fps = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FPS)
-        .and_then(|value| value.smoothed())
-        .unwrap_or(0.0);
-    let material = slot_name(session.selected);
-    let action = session
-        .last_action
-        .map(|result| result.to_string())
-        .unwrap_or_default();
-    let mode = if session.state.noclip {
-        if session.noclip_requested {
-            "NOCLIP | Space up / Ctrl down"
-        } else {
-            "NOCLIP | Move clear to exit"
-        }
-    } else {
-        "WALK | V noclip"
-    };
-    **hud = Text::new(format!(
-        "VOXEL / MULTIPLAYER LAB\n{}\n{mode}\n{fps:.0} fps | {} chunks | {} triangles\n{} mesh jobs | {} remote players | {} loose blocks\nxyz {:.1} / {:.1} / {:.1} | tick {}\n{} unacked inputs | actions {} accepted / {} rejected\n{action}\nEQUIPPED {} / {material}",
-        session.status,
-        world.chunks.len(),
-        stats.triangles,
-        stats.pending_jobs,
-        remotes.0.len(),
-        loose.count(),
-        session.state.position.x,
-        session.state.position.y,
-        session.state.position.z,
-        session.last_tick,
-        session.pending.len(),
-        session.accepted_edits,
-        session.rejected_edits,
-        session.selected,
-    ));
-}
-
-fn slot_name(slot: u8) -> &'static str {
-    match slot {
-        1 => "Grass",
-        2 => "Dirt",
-        3 => "Stone",
-        4 => "Sand",
-        5 => "Wood",
-        EXPLOSIVE_BOW_SLOT => "Explosive Bow",
-        _ => "Empty",
-    }
-}
-
-fn update_hotbar(session: Res<ClientSession>, mut bar: Single<&mut Text, With<Hotbar>>) {
-    if !session.is_changed() {
-        return;
-    }
-    let slots = (1..=EXPLOSIVE_BOW_SLOT)
-        .map(|slot| {
-            let label = if slot == EXPLOSIVE_BOW_SLOT {
-                format!("{slot} {} {}", slot_name(slot), session.bow_power.label())
-            } else {
-                format!("{slot} {}", slot_name(slot))
-            };
-            if slot == session.selected {
-                format!("[ {label} ]")
-            } else {
-                label
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("    ");
-    let secondary = if session.selected == EXPLOSIVE_BOW_SLOT {
-        "SHOOT    R POWER"
-    } else {
-        "PLACE"
-    };
-    **bar = Text::new(format!(
-        "{slots}\nWASD MOVE    SPACE JUMP    MOUSE LOOK    LMB HIT    RMB {secondary}\nF DEBUG LAUNCH    ESC CURSOR    F12 CAPTURE"
-    ));
-}
 fn capture_screenshot(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
