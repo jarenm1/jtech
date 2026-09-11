@@ -1,8 +1,9 @@
 mod bow_power;
 pub use bow_power::BowPower;
+use controller::PlayerInput;
 pub use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
-use physics::{PlayerInput, PlayerState};
+use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 

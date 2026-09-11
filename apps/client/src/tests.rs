@@ -1,5 +1,5 @@
 use super::*;
-use physics::step_player;
+use controller::step_player;
 use protocol::PlayerSnapshot;
 use voxel_world::{AIR, STONE};
 
@@ -957,4 +957,19 @@ fn death_heartbeat_keeps_sending_without_prediction_or_sequence_growth() {
     assert!(client.pending.is_empty());
     assert_eq!(client.sequence, 40);
     assert_eq!(client.state, state);
+}
+
+#[test]
+fn ground_jump_edge_survives_render_only_frames_and_fires_once_per_catchup() {
+    let mut session = ClientSession::default();
+    session.capture_jump(true, true);
+    session.capture_jump(true, false); // Another rendered frame, no simulation tick yet.
+    assert!(session.consume_jump(false, true));
+    assert!(!session.consume_jump(false, true)); // Holding across catch-up ticks.
+    session.capture_jump(true, true);
+    session.capture_jump(false, false); // Pause cancels pending gameplay input.
+    assert!(!session.consume_jump(false, false));
+    assert!(session.consume_jump(true, true)); // Flight uses held ascent instead.
+    assert!(session.consume_jump(true, true));
+    assert!(!session.consume_jump(true, false));
 }

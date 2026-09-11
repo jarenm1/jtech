@@ -1,3 +1,4 @@
+use controller::PlayerInput;
 mod bow_power_hud;
 mod death_overlay;
 mod drops;
@@ -21,7 +22,7 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions, PresentMode},
 };
 use networking::ClientTransport;
-use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerInput, PlayerState, look_direction};
+use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerState, look_direction};
 use protocol::{
     BowPower, ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, Health, InputPacket, Inventory,
     ServerMessage, Snapshot,
@@ -100,6 +101,7 @@ struct ClientSession {
     health: Health,
     inventory: Inventory,
     noclip_requested: bool,
+    jump_pending: bool,
     pending: VecDeque<PlayerInput>,
     sequence: u64,
     last_tick: u64,
@@ -160,6 +162,7 @@ impl Default for ClientSession {
             health: Health::default(),
             inventory: Inventory::default(),
             noclip_requested: false,
+            jump_pending: false,
             pending: VecDeque::with_capacity(256),
             sequence: 0,
             last_tick: 0,
@@ -187,13 +190,21 @@ impl Default for ClientSession {
 }
 
 impl ClientSession {
+    fn capture_jump(&mut self, enabled: bool, pressed: bool) {
+        self.jump_pending = enabled && (self.jump_pending || pressed);
+    }
+
+    fn consume_jump(&mut self, flight: bool, held: bool) -> bool {
+        let pressed = std::mem::take(&mut self.jump_pending);
+        if flight { held } else { pressed }
+    }
     fn predict_input(
         &mut self,
         world: &VoxelWorld,
         input: PlayerInput,
         bodies: &[physics::DynamicCollider],
     ) {
-        physics::step_player_with_bodies(world, &mut self.state, &input, FIXED_DT, bodies);
+        controller::step_player_with_bodies(world, &mut self.state, &input, FIXED_DT, bodies);
         self.pending.push_back(input);
     }
     fn receive_action(&mut self, result: ActionResult) {
@@ -290,6 +301,12 @@ struct ClientPlugin;
 
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(controller::ControllerPlugin::default());
+        app.insert_resource(Time::<Fixed>::from_hz(60.0));
+        app.add_systems(
+            FixedUpdate,
+            observe_character_bodies.in_set(controller::ControllerSet::Intent),
+        );
         app.init_resource::<ClientSession>()
             .init_resource::<RemotePlayers>()
             .init_resource::<pause_menu::PauseMenu>()
@@ -483,6 +500,7 @@ fn receive_network(
                 session.session = token;
                 session.state = spawn;
                 session.noclip_requested = spawn.noclip;
+                session.jump_pending = false;
                 session.health = health;
                 session.inventory = inventory;
                 session.life = 0;
@@ -696,6 +714,7 @@ fn reconcile(
         session.correction = Vec3::ZERO;
         session.accumulator = 0.0;
         session.noclip_requested = snapshot.you.state.noclip;
+        session.jump_pending = false;
         return;
     }
     if session.health.is_depleted() {
@@ -705,7 +724,7 @@ fn reconcile(
         return;
     }
     for input in &session.pending {
-        physics::step_player_with_bodies(world, &mut session.state, input, FIXED_DT, bodies);
+        controller::step_player_with_bodies(world, &mut session.state, input, FIXED_DT, bodies);
     }
     let difference = previous - session.state.position;
     session.max_correction = session.max_correction.max(difference.length());
@@ -771,6 +790,7 @@ fn predict(
         return;
     }
     if session.health.is_depleted() {
+        session.jump_pending = false;
         if let Some(packet) = session.death_heartbeat(time.delta_secs())
             && let Some(transport) = &mut session.transport
             && let Err(error) = transport.send_inputs(packet)
@@ -795,6 +815,10 @@ fn predict(
         session.accumulator = 0.0;
         return;
     }
+    session.capture_jump(
+        !options.bot && !cursor.visible && !menu.blocks_gameplay(),
+        keys.just_pressed(KeyCode::Space),
+    );
     session.accumulator += time.delta_secs().min(0.1);
     while session.accumulator >= FIXED_DT {
         session.accumulator -= FIXED_DT;
@@ -822,7 +846,8 @@ fn predict(
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyA)));
             movement[1] = f32::from(u8::from(keys.pressed(KeyCode::KeyW)))
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyS)));
-            jump = keys.pressed(KeyCode::Space);
+            let flight = session.noclip_requested || session.state.noclip;
+            jump = session.consume_jump(flight, keys.pressed(KeyCode::Space));
             descend = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
         }
         let input = PlayerInput {
@@ -1080,3 +1105,11 @@ fn record_metrics(
 
 #[cfg(test)]
 mod tests;
+
+fn observe_character_bodies(
+    loose: Res<loose_blocks::LooseBlocks>,
+    mut bodies: ResMut<controller::ObservedBodies>,
+) {
+    bodies.0.clear();
+    bodies.0.extend_from_slice(loose.colliders());
+}

@@ -9,5 +9,6 @@ bevy.workspace = true
 voxel_world.workspace = true
 voxel_render.workspace = true
 physics.workspace = true
+controller.workspace = true
 protocol.workspace = true
 networking.workspace = true

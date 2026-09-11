@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(sim.players[&1].state, launched);
         assert_eq!(sim.player_health(1), Some(health));
         let mut after = launched;
-        physics::step_player(&world, &mut after, &Default::default(), physics::FIXED_DT);
+        controller::step_player(&world, &mut after, &Default::default(), physics::FIXED_DT);
         assert!(after.position.y > launched.position.y);
         assert!(after.position.z > launched.position.z);
     }

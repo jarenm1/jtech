@@ -8,5 +8,6 @@ license.workspace = true
 serde.workspace = true
 glam.workspace = true
 physics.workspace = true
+controller.workspace = true
 gameplay.workspace = true
 postcard.workspace = true

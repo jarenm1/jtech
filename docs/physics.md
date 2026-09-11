@@ -26,7 +26,7 @@ The server admits **128 loose blocks globally**, at any loaded horizontal locati
 
 The GPU simulates axis-aligned unit cubes, gravity, terrain and block contacts, friction, and floating-point fracture damage. A world-space width-two **hashed spatial grid** and four contact iterations per substep support short stacks. Filter bucket candidates by their exact cell before resolving contacts, so hash collisions cannot apply a contact twice. Material constants are authored once in `crates/gpu_physics/src/lib.rs`; generate shader constants from that table.
 
-Players use the shared CPU swept-AABB character controller on server and client. Walking against loose blocks supplies a **60 N budget per player per substep**, shared across touched bodies and applied once before contact iterations. Position overlap alone does not push a loose body. Incoming body impacts use a kinematic character boundary; this is a force-limited walking motor, not a symmetric player rigid-body solver. Body observations arrive at 20 Hz.
+Players use the shared CPU swept-AABB motor in the `controller` crate on server and client. See [Character controllers](controller.md) for intent, body/profile configuration, Bevy scheduling, and vision-policy adapters. Walking against loose blocks supplies a **60 N budget per player per substep**, shared across touched bodies and applied once before contact iterations. Position overlap alone does not push a loose body. Incoming body impacts use a kinematic character boundary; this is a force-limited walking motor, not a symmetric player rigid-body solver. Body observations arrive at 20 Hz.
 
 ## Explosive bow
 
