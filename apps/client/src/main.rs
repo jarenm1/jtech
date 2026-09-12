@@ -4,6 +4,7 @@ mod death_overlay;
 mod drops;
 mod game_hud;
 mod health_hud;
+mod lighting;
 mod loose_blocks;
 mod package_hud;
 mod pause_menu;
@@ -38,6 +39,7 @@ struct Options {
     bot: bool,
     frames: Option<u64>,
     screenshot: Option<String>,
+    lighting: lighting::DayCycle,
 }
 
 impl Options {
@@ -47,6 +49,7 @@ impl Options {
             bot: false,
             frames: None,
             screenshot: None,
+            lighting: lighting::DayCycle::default(),
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -75,9 +78,34 @@ impl Options {
                 "--screenshot" => {
                     options.screenshot = Some(args.next().ok_or("--screenshot needs a PNG path")?)
                 }
+                "--time-of-day" | "--day-length" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| format!("{arg} needs a number"))?
+                        .parse::<f64>()
+                        .map_err(|_| format!("invalid {arg}"))?;
+                    if !value.is_finite()
+                        || value < 0.0
+                        || (arg == "--time-of-day" && value >= 24.0)
+                    {
+                        return Err(format!(
+                            "{arg}: expected {}",
+                            if arg == "--time-of-day" {
+                                "hour in [0, 24)"
+                            } else {
+                                "nonnegative seconds (0 freezes time)"
+                            }
+                        ));
+                    }
+                    if arg == "--time-of-day" {
+                        options.lighting.hour = value;
+                    } else {
+                        options.lighting.day_seconds = value;
+                    }
+                }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png]\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc pause menu | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc pause menu | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -347,13 +375,8 @@ fn main() {
         std::process::exit(2)
     });
     App::new()
+        .insert_resource(options.lighting)
         .insert_resource(options)
-        .insert_resource(ClearColor(Color::srgb(0.48, 0.69, 0.88)))
-        .insert_resource(AmbientLight {
-            color: Color::WHITE,
-            brightness: 500.0,
-            ..default()
-        })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Voxel".into(),
@@ -368,6 +391,7 @@ fn main() {
             WorldPlugin,
             VoxelRenderPlugin,
             ClientPlugin,
+            lighting::LightingPlugin,
             loose_blocks::LooseBlocksPlugin,
             projectiles::ProjectilesPlugin,
             drops::DropsPlugin,
@@ -418,14 +442,6 @@ fn setup(
         }),
         Transform::from_translation(session.state.position + Vec3::Y * EYE_HEIGHT),
         PlayerCamera,
-    ));
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 12_000.0,
-            shadows_enabled: false,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, -0.7, 0.0)),
     ));
     commands.insert_resource(ActorAssets {
         mesh: meshes.add(Cuboid::new(0.6, PLAYER_HEIGHT, 0.6)),

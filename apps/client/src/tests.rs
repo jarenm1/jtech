@@ -464,6 +464,7 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
         bot: false,
         frames: None,
         screenshot: None,
+        lighting: lighting::DayCycle::default(),
     })
     .insert_resource(ClientSession {
         selected: EXPLOSIVE_BOW_SLOT,
@@ -899,6 +900,7 @@ fn controls_block_look_and_slot_changes_while_dead() {
         bot: false,
         frames: None,
         screenshot: None,
+        lighting: lighting::DayCycle::default(),
     })
     .insert_resource(ClientSession {
         selected: 3,

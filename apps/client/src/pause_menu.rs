@@ -237,6 +237,7 @@ mod tests {
                 bot: false,
                 frames: None,
                 screenshot: None,
+                lighting: crate::lighting::DayCycle::default(),
             })
             .add_message::<AppExit>()
             .add_systems(Startup, |mut commands: Commands| spawn(&mut commands))
