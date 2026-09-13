@@ -6,4 +6,7 @@ license.workspace = true
 
 [dependencies]
 bevy_ecs.workspace = true
+glam.workspace = true
+physics.workspace = true
 serde.workspace = true
+voxel_world.workspace = true

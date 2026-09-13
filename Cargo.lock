@@ -2292,7 +2292,10 @@ name = "gameplay"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "glam",
+ "physics",
  "serde",
+ "voxel_world",
 ]
 
 [[package]]
@@ -4987,6 +4990,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "controller",
+ "gameplay",
  "networking",
  "physics",
  "protocol",
