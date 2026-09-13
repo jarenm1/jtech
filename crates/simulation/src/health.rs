@@ -24,6 +24,7 @@ impl Simulation {
                 movement: [0.0; 2],
                 jump: false,
                 descend: false,
+                attack: false,
                 ..player.input
             };
             if let Some((&sequence, _)) = player.pending.last_key_value() {
@@ -34,7 +35,23 @@ impl Simulation {
             player.state.velocity = Vec3::ZERO;
             player.state.external_velocity = glam::Vec2::ZERO;
             player.body_push_velocity = Vec3::ZERO;
+            // Full-loot death: the carried inventory scatters as drops.
+            let position = player.state.position + Vec3::Y * 0.5;
+            let mut spilled = Vec::new();
+            for (item, &count) in player.inventory.counts().iter().enumerate() {
+                if count > 0 {
+                    spilled.push((item as u8, count));
+                }
+            }
+            player.inventory = gameplay::Inventory::new();
+            player.inventory_dirty = true;
             self.cancel_player_strikes(id);
+            for (index, (item, count)) in spilled.iter().enumerate() {
+                // Fan stacks around the body so they read as a spill, not a point.
+                let angle = index as f32 * 2.4;
+                let offset = Vec3::new(angle.cos() * 0.4, 0.0, angle.sin() * 0.4);
+                self.spawn_drop(position + offset, *item, *count);
+            }
         }
         Some(lost)
     }
@@ -191,6 +208,32 @@ mod tests {
         assert_eq!(sim.heal_player(1, 50), Some(0));
         assert_eq!(sim.restore_player_health(1), Some(0));
         assert!(sim.players[&1].health.is_depleted());
+    }
+
+    #[test]
+    fn death_spills_inventory_as_drops_and_clears_the_corpse() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        let mut player = Player::new();
+        player.inventory.add(3, 40);
+        player.inventory.add(5, 7);
+        player.state.position = Vec3::new(1.5, 4.0, 2.5);
+        sim.players.insert(1, player);
+
+        sim.damage_player(1, u16::MAX);
+
+        assert!(sim.players[&1].inventory.is_empty());
+        assert!(sim.players[&1].inventory_dirty);
+        let dropped: Vec<(u8, u16)> = sim
+            .drops
+            .iter()
+            .map(|drop| (drop.snapshot.item, drop.snapshot.count))
+            .collect();
+        assert_eq!(dropped, vec![(3, 40), (5, 7)]);
+        // A second death on the empty corpse spills nothing.
+        sim.damage_player(1, 10);
+        assert_eq!(sim.drops.len(), 2);
     }
 
     #[test]

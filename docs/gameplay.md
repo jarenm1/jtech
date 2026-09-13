@@ -114,6 +114,12 @@ clients render a capsule that flashes on damage.
 for authored weapons; `MELEE_HANDS` is the built-in default. Enemy policies
 write `CharacterIntent.attack` the same way human input maps to it.
 
+Death is full-loot: the transition to zero health scatters the carried
+inventory as drops around the body and empties the corpse. Drops behave like
+mined items — a short pickup delay, then any living player within reach
+collects them. Respawning restores health only; gear must be recovered or
+replaced.
+
 ## Game interface
 
 Select a hotbar slot with **1–6**. Read health at the lower left, the selected
