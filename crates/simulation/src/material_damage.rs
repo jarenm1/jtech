@@ -69,7 +69,7 @@ pub(super) fn apply_to_grid(
     journal_space: bool,
 ) -> Result<GridContactResult, EditRejection> {
     let target = IVec3::from_array(contact.target);
-    if !(1..=5).contains(&contact.material)
+    if !(1..=6).contains(&contact.material)
         || world.block(target) != Some(contact.material as u8)
         || !contact.force.is_finite()
         || contact.force < 0.0

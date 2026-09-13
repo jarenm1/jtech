@@ -120,9 +120,18 @@ mined items — a short pickup delay, then any living player within reach
 collects them. Respawning restores health only; gear must be recovered or
 replaced.
 
+## Respawn binding
+
+The bedroll (hotbar **7**) is a placeable respawn anchor. Placing one spends
+the item and binds the owner's respawn to that block; dying respawns near the
+bedroll instead of world spawn. It is soft — cheap to mine or blast — and
+destroying it unbinds every player anchored to it, so raiding a base's
+bedroll sends defenders back to world spawn. An unbound or destroyed-bedroll
+player respawns at world spawn as before.
+
 ## Game interface
 
-Select a hotbar slot with **1–6**. Read health at the lower left, the selected
+Select a hotbar slot with **1–7**. Read health at the lower left, the selected
 item above the centered hotbar, and owned item counts on the hotbar tiles.
 Package status and reload errors appear at the upper right; the FPS counter is at
 the upper left.

@@ -215,7 +215,7 @@ fn spawn_hotbar(commands: &mut Commands) {
                 BorderRadius::all(px(8)),
             ))
             .with_children(|row| {
-                for slot in 1..=EXPLOSIVE_BOW_SLOT {
+                for slot in 1..=7 {
                     row.spawn((
                         Node {
                             width: px(SLOT_SIZE),
@@ -336,7 +336,7 @@ pub(crate) fn update(
     }
     **selected_label = Text::new(slot_name(session.selected));
     for (slot, mut text) in &mut counts {
-        let count = session.inventory.count(slot.0);
+        let count = session.inventory.count(slot_item(slot.0));
         text.0 = if count == 0 {
             String::new()
         } else {
@@ -344,7 +344,7 @@ pub(crate) fn update(
         };
     }
     for (swatch, mut color) in &mut swatches {
-        color.0 = swatch_color(swatch.0, session.inventory.count(swatch.0) == 0);
+        color.0 = swatch_color(swatch.0, session.inventory.count(slot_item(swatch.0)) == 0);
     }
 
     let (node, text, color) = &mut *status;
@@ -372,6 +372,7 @@ fn slot_name(slot: u8) -> &'static str {
         voxel_world::SAND => "Sand",
         voxel_world::WOOD => "Wood",
         EXPLOSIVE_BOW_SLOT => "Explosive Bow",
+        7 => "Bedroll",
         _ => "Empty",
     }
 }
@@ -389,8 +390,15 @@ fn swatch(slot: u8) -> Color {
         voxel_world::STONE => Color::srgb(0.55, 0.56, 0.58),
         voxel_world::SAND => Color::srgb(0.82, 0.73, 0.48),
         voxel_world::WOOD => Color::srgb(0.55, 0.38, 0.21),
+        7 => Color::srgb(0.62, 0.48, 0.70),
         _ => palette::AMBER,
     }
+}
+
+/// Hotbar slot to inventory item: slots 1-5 mirror materials, slot 6 is the
+/// bow, slot 7 carries the bedroll (item id 6).
+fn slot_item(slot: u8) -> u8 {
+    if slot == 7 { voxel_world::BEDROLL } else { slot }
 }
 
 #[cfg(test)]
@@ -422,7 +430,7 @@ mod tests {
                     accented.push((slot.0, background.0));
                 }
             }
-            assert_eq!(count, usize::from(EXPLOSIVE_BOW_SLOT));
+            assert_eq!(count, 7);
             assert_eq!(accented, vec![(selected, palette::SLOT_SELECTED)]);
         }
     }

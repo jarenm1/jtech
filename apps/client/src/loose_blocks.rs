@@ -40,7 +40,7 @@ fn setup(
 ) {
     commands.insert_resource(LooseBlockAssets {
         mesh: meshes.add(Cuboid::from_length(1.0)),
-        materials: (0..=voxel_world::WOOD)
+        materials: (0..=voxel_world::BEDROLL)
             .map(|id| {
                 let [r, g, b, _] = voxel_world::block_color(id);
                 materials.add(StandardMaterial {
