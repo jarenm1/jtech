@@ -5,7 +5,7 @@ use super::Simulation;
 use gameplay::Inventory;
 use glam::Vec3;
 use protocol::{DropSnapshot, MAX_DROPS, ServerMessage};
-use voxel_world::{AIR, BEDROLL, VoxelWorld};
+use voxel_world::{AIR, VoxelWorld};
 
 /// Fall acceleration for a dropped item.
 const DROP_GRAVITY: f32 = 18.0;
@@ -106,7 +106,7 @@ impl Simulation {
     /// Leave a dropped stack at `position`. The authoritative destruction path
     /// calls this for grid and loose-block destruction alike.
     pub(super) fn spawn_drop(&mut self, position: Vec3, item: u8, count: u16) {
-        if item == 0 || item > BEDROLL || count == 0 || !position.is_finite() {
+        if item == 0 || item > gameplay::combat::MAX_ITEM || count == 0 || !position.is_finite() {
             return;
         }
         if self.drops.len() >= MAX_DROPS {

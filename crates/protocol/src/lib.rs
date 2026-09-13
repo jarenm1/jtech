@@ -7,7 +7,7 @@ use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -412,9 +412,9 @@ mod tests {
 
     #[test]
     fn inventory_decode_rejects_counts_above_the_stack_ceiling() {
-        let bytes = encode(&[1_u16, 0, 0, 0, 0, MAX_STACK], MAX_FRAME).unwrap();
+        let bytes = encode(&[1_u16, 0, 0, 0, 0, 0, 0, 0, 0, MAX_STACK], MAX_FRAME).unwrap();
         assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_ok());
-        let bytes = encode(&[1_u16, 0, 0, 0, 0, MAX_STACK + 1], MAX_FRAME).unwrap();
+        let bytes = encode(&[1_u16, 0, 0, 0, 0, 0, 0, 0, 0, MAX_STACK + 1], MAX_FRAME).unwrap();
         assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_err());
     }
 }

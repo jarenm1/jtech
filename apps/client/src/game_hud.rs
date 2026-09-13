@@ -215,7 +215,7 @@ fn spawn_hotbar(commands: &mut Commands) {
                 BorderRadius::all(px(8)),
             ))
             .with_children(|row| {
-                for slot in 1..=7 {
+                for slot in 1..=10 {
                     row.spawn((
                         Node {
                             width: px(SLOT_SIZE),
@@ -373,6 +373,9 @@ fn slot_name(slot: u8) -> &'static str {
         voxel_world::WOOD => "Wood",
         EXPLOSIVE_BOW_SLOT => "Explosive Bow",
         7 => "Bedroll",
+        8 => "Rock",
+        9 => "Hatchet",
+        10 => "Pickaxe",
         _ => "Empty",
     }
 }
@@ -391,14 +394,16 @@ fn swatch(slot: u8) -> Color {
         voxel_world::SAND => Color::srgb(0.82, 0.73, 0.48),
         voxel_world::WOOD => Color::srgb(0.55, 0.38, 0.21),
         7 => Color::srgb(0.62, 0.48, 0.70),
+        8 => Color::srgb(0.50, 0.50, 0.52),
+        9 => Color::srgb(0.60, 0.42, 0.25),
+        10 => Color::srgb(0.45, 0.45, 0.50),
         _ => palette::AMBER,
     }
 }
 
-/// Hotbar slot to inventory item: slots 1-5 mirror materials, slot 6 is the
-/// bow, slot 7 carries the bedroll (item id 6).
+/// Hotbar slot to inventory item, shared with the server's melee-spec lookup.
 fn slot_item(slot: u8) -> u8 {
-    if slot == 7 { voxel_world::BEDROLL } else { slot }
+    gameplay::combat::slot_item(slot)
 }
 
 #[cfg(test)]
@@ -430,7 +435,7 @@ mod tests {
                     accented.push((slot.0, background.0));
                 }
             }
-            assert_eq!(count, 7);
+            assert_eq!(count, 10);
             assert_eq!(accented, vec![(selected, palette::SLOT_SELECTED)]);
         }
     }

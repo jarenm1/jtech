@@ -114,6 +114,13 @@ clients render a capsule that flashes on damage.
 for authored weapons; `MELEE_HANDS` is the built-in default. Enemy policies
 write `CharacterIntent.attack` the same way human input maps to it.
 
+Swings land in hit zones: the top quarter of the target's height is the head
+zone and takes double damage. The held item sets the profile — hands (10),
+rock (15), pickaxe (20), hatchet (25) — via `combat::melee_spec`; the
+replicated `selected` hotbar slot resolves identically on both sides through
+`combat::slot_item`. Tools are items 7-9 on hotbar slots 8/9/0; they swing
+instead of placing.
+
 Death is full-loot: the transition to zero health scatters the carried
 inventory as drops around the body and empties the corpse. Drops behave like
 mined items — a short pickup delay, then any living player within reach

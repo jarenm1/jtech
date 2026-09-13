@@ -1504,9 +1504,10 @@ mod tests {
 
         sim.tick = 100;
         sim.resolve_attacks(&world);
+        // A level swing at eye height lands in the head zone: double damage.
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
-            100 - gameplay::combat::MELEE_HANDS.damage
+            100 - gameplay::combat::MELEE_HANDS.damage * gameplay::combat::HEADSHOT_MULTIPLIER
         );
         assert!(
             sim.actor_position(dummy).unwrap().z < 0.5
@@ -1517,7 +1518,7 @@ mod tests {
         sim.resolve_attacks(&world);
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
-            100 - gameplay::combat::MELEE_HANDS.damage
+            100 - gameplay::combat::MELEE_HANDS.damage * gameplay::combat::HEADSHOT_MULTIPLIER
         );
         // Ten swings at cooldown spacing kill the dummy; it respawns later.
         for _ in 0..10 {
@@ -1833,7 +1834,7 @@ mod tests {
         let (_world, mut sim) = take_resources(&mut app);
         for (item, count, position) in [
             (0_u8, 1_u16, Vec3::ZERO),
-            (7, 1, Vec3::ZERO),
+            (10, 1, Vec3::ZERO),
             (3, 0, Vec3::ZERO),
             (3, 1, Vec3::new(f32::NAN, 0.0, 0.0)),
         ] {

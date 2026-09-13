@@ -865,6 +865,9 @@ fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
         KeyCode::Digit5,
         KeyCode::Digit6,
         KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+        KeyCode::Digit0,
     ]
     .into_iter()
     .enumerate()
@@ -956,6 +959,7 @@ fn predict(
             descend,
             noclip: session.noclip_requested,
             attack: session.consume_attack(),
+            selected: session.selected,
         };
         session.predict_input(&world, input, loose.colliders());
     }
@@ -1003,7 +1007,7 @@ fn edit_blocks(
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
     let direction = look_direction(session.yaw, session.pitch);
     let melee = buttons.pressed(MouseButton::Left)
-        && melee_target(&world, origin, direction, &actors, &remotes);
+        && melee_target(&world, origin, direction, &actors, &remotes, session.selected);
     if melee {
         session.attack_pending = true;
     }
@@ -1035,8 +1039,9 @@ fn melee_target(
     direction: Vec3,
     actors: &RemoteActors,
     remotes: &RemotePlayers,
+    selected: u8,
 ) -> bool {
-    let spec = gameplay::combat::MELEE_HANDS;
+    let spec = gameplay::combat::melee_spec(gameplay::combat::slot_item(selected));
     let wall = world
         .raycast(origin, direction, spec.range)
         .map(|hit| hit.distance)
@@ -1109,12 +1114,8 @@ fn block_action(
     let block = if strike || hit {
         0
     } else if secondary {
-        // Hotbar slots 1-5 mirror materials; slot 7 carries the bedroll (item 6).
-        let item = if session.selected == 7 {
-            voxel_world::BEDROLL
-        } else {
-            session.selected
-        };
+        // Only placeable blocks (items 1-6) place; tools swing instead.
+        let item = gameplay::combat::slot_item(session.selected);
         if !(1..=voxel_world::BEDROLL).contains(&item) || session.inventory.count(item) == 0 {
             return None;
         }

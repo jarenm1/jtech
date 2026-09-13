@@ -279,8 +279,21 @@ mod tests {
             sim.drops.back().map(|d| (d.snapshot.item, d.snapshot.count)),
             Some((voxel_world::BEDROLL, 1))
         );
-    }
 
+        // Mining the bedroll to air through the damage path unbinds too.
+        sim.players.get_mut(&1).unwrap().respawn_point = Some(bedroll);
+        for request in 2..22 {
+            let revision = world.chunks[&glam::IVec3::ZERO].revision;
+            sim.players.get_mut(&1).unwrap().known.insert(glam::IVec3::ZERO, revision);
+            sim.tick += 100;
+            sim.edit(&mut world, 1, request, bedroll, 0, revision, false);
+            if world.block(bedroll) == Some(0) {
+                break;
+            }
+        }
+        assert_eq!(world.block(bedroll), Some(0));
+        assert_eq!(sim.players[&1].respawn_point, None);
+    }
     #[test]
     fn absent_and_disconnected_players_cannot_receive_health_changes() {
         let mut app = App::new();
