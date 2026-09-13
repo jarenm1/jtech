@@ -41,6 +41,56 @@ pub const MELEE_HANDS: MeleeSpec = MeleeSpec {
     knockback: 320.0,
 };
 
+/// Tool items (not placeable blocks): the early-game weapon ladder.
+pub const ITEM_ROCK: u8 = 7;
+pub const ITEM_HATCHET: u8 = 8;
+pub const ITEM_PICKAXE: u8 = 9;
+/// Highest valid inventory item id.
+pub const MAX_ITEM: u8 = ITEM_PICKAXE;
+
+/// Hotbar slot to inventory item: slots 1-5 mirror block materials, 6 is the
+/// bow, 7 the bedroll, 8-10 the tools. Shared by client and server so the
+/// replicated `selected` slot resolves identically on both sides.
+pub fn slot_item(slot: u8) -> u8 {
+    match slot {
+        7 => voxel_world::BEDROLL,
+        8 => ITEM_ROCK,
+        9 => ITEM_HATCHET,
+        10 => ITEM_PICKAXE,
+        other => other,
+    }
+}
+
+/// Melee profile for the held item; anything without a tool swings hands.
+pub fn melee_spec(item: u8) -> MeleeSpec {
+    match item {
+        ITEM_ROCK => MeleeSpec {
+            range: 3.0,
+            damage: 15,
+            cooldown_ticks: 30,
+            knockback: 400.0,
+        },
+        ITEM_PICKAXE => MeleeSpec {
+            range: 3.2,
+            damage: 20,
+            cooldown_ticks: 36,
+            knockback: 360.0,
+        },
+        ITEM_HATCHET => MeleeSpec {
+            range: 3.2,
+            damage: 25,
+            cooldown_ticks: 40,
+            knockback: 320.0,
+        },
+        _ => MELEE_HANDS,
+    }
+}
+
+/// Fraction of the target's height counting as the head zone (top quarter).
+pub const HEAD_ZONE: f32 = 0.25;
+/// Damage multiplier for head-zone hits.
+pub const HEADSHOT_MULTIPLIER: u16 = 2;
+
 /// One resolved hit. `target` is the host's opaque target id; `distance` is the
 /// ray entry distance; `impulse` is the knockback to apply to the victim.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,10 +140,17 @@ pub fn resolve_swing(
             continue;
         }
         let impulse = direction * spec.knockback + Vec3::Y * spec.knockback * 0.25;
+        // Top quarter of the target's height is the head zone.
+        let hit_y = origin.y + direction.y * distance;
+        let head = hit_y > target.position.y + target.shape.height() * (1.0 - HEAD_ZONE);
         let hit = SwingHit {
             target: target.id,
             distance,
-            damage: spec.damage,
+            damage: if head {
+                spec.damage.saturating_mul(HEADSHOT_MULTIPLIER)
+            } else {
+                spec.damage
+            },
             impulse,
         };
         if best.is_none_or(|b| distance < b.distance) {
@@ -136,7 +193,8 @@ mod tests {
         ];
         let hit = resolve_swing(&world, origin, Vec3::NEG_Z, &MELEE_HANDS, &targets).unwrap();
         assert_eq!(hit.target, 3);
-        assert_eq!(hit.damage, MELEE_HANDS.damage);
+        // Eye-level swings land in the head zone.
+        assert_eq!(hit.damage, MELEE_HANDS.damage * HEADSHOT_MULTIPLIER);
         assert!(hit.impulse.z < 0.0 && hit.impulse.y > 0.0);
     }
 
@@ -173,5 +231,42 @@ mod tests {
         );
         // No targets, no hit.
         assert!(resolve_swing(&world, origin, Vec3::NEG_Z, &MELEE_HANDS, &[]).is_none());
+    }
+
+    #[test]
+    fn head_zone_hits_double_damage() {
+        let world = flat_world();
+        let target = target(1, Vec3::new(0.5, 0.0, -2.0));
+        // Level swing at eye height lands in the top quarter of a 1.8m body.
+        let head = resolve_swing(
+            &world,
+            Vec3::new(0.5, 1.7, 0.5),
+            Vec3::NEG_Z,
+            &MELEE_HANDS,
+            &[target],
+        )
+        .unwrap();
+        assert_eq!(head.damage, MELEE_HANDS.damage * HEADSHOT_MULTIPLIER);
+        // A low swing at the legs deals base damage.
+        let legs = resolve_swing(
+            &world,
+            Vec3::new(0.5, 0.4, 0.5),
+            Vec3::NEG_Z,
+            &MELEE_HANDS,
+            &[target],
+        )
+        .unwrap();
+        assert_eq!(legs.damage, MELEE_HANDS.damage);
+    }
+
+    #[test]
+    fn tool_specs_outdamage_hands_and_slots_map_to_items() {
+        assert!(melee_spec(ITEM_ROCK).damage > MELEE_HANDS.damage);
+        assert!(melee_spec(ITEM_HATCHET).damage > melee_spec(ITEM_ROCK).damage);
+        assert_eq!(melee_spec(0), MELEE_HANDS);
+        assert_eq!(slot_item(3), 3);
+        assert_eq!(slot_item(7), voxel_world::BEDROLL);
+        assert_eq!(slot_item(8), ITEM_ROCK);
+        assert_eq!(slot_item(10), ITEM_PICKAXE);
     }
 }

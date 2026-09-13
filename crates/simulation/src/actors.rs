@@ -10,7 +10,7 @@ use controller::{
 };
 use gameplay::{
     Health,
-    combat::{MELEE_HANDS, SwingTarget, resolve_swing},
+    combat::{SwingTarget, resolve_swing},
 };
 use glam::{Vec2, Vec3};
 use physics::{
@@ -116,7 +116,6 @@ impl Simulation {
     /// apply to misses and hits alike; dead players and noclip attackers cannot
     /// swing.
     pub(super) fn resolve_attacks(&mut self, world: &VoxelWorld) {
-        let spec = MELEE_HANDS;
         let attackers: Vec<u64> = self
             .players
             .iter()
@@ -141,9 +140,12 @@ impl Simulation {
             .map(|(&id, _)| id)
             .collect();
         for actor_id in actor_attackers {
-            self.swing_actor(world, actor_id, spec);
+            self.swing_actor(world, actor_id);
         }
         for id in attackers {
+            let spec = gameplay::combat::melee_spec(gameplay::combat::slot_item(
+                self.players[&id].input.selected,
+            ));
             let player = &self.players[&id];
             let origin = player.state.position + Vec3::Y * EYE_HEIGHT;
             let direction = look_direction(player.input.yaw, player.input.pitch);
@@ -195,7 +197,8 @@ impl Simulation {
 
     /// One actor swing: level aim along the actor's yaw against every other
     /// living actor and player. Consumes the intent edge and starts cooldown.
-    fn swing_actor(&mut self, world: &VoxelWorld, id: u32, spec: gameplay::combat::MeleeSpec) {
+    fn swing_actor(&mut self, world: &VoxelWorld, id: u32) {
+        let spec = gameplay::combat::melee_spec(self.actors[&id].intent.held_item);
         let actor = &self.actors[&id];
         let origin = actor.state.motion.position + Vec3::Y * EYE_HEIGHT;
         let direction = look_direction(actor.state.yaw, 0.0);

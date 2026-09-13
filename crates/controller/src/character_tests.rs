@@ -192,6 +192,7 @@ fn invalid_configuration_actions_and_ticks_are_bounded() {
         turn: f32::INFINITY,
         jump: true,
         attack: false,
+        held_item: 0,
     };
     tick(
         &world,
@@ -226,6 +227,7 @@ fn invalid_configuration_actions_and_ticks_are_bounded() {
         turn: -100.0,
         jump: false,
         attack: false,
+        held_item: 0,
     }
     .bounded();
     assert!(extreme.movement.length() <= 1.0);
@@ -320,6 +322,7 @@ fn headless_plugin_runs_script_before_motor_and_matches_direct_ticks() {
                 turn: 0.25,
                 jump: false,
                 attack: false,
+                held_item: 0,
             },
         );
     }

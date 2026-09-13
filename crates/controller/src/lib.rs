@@ -21,6 +21,8 @@ pub struct CharacterIntent {
     pub turn: f32,
     pub jump: bool,
     pub attack: bool,
+    /// Item the character swings with; the host maps it to a melee spec.
+    pub held_item: u8,
 }
 impl CharacterIntent {
     pub fn bounded(self) -> Self {
@@ -33,6 +35,7 @@ impl CharacterIntent {
             turn: finite(self.turn).clamp(-1.0, 1.0),
             jump: self.jump,
             attack: self.attack,
+            held_item: self.held_item,
         }
     }
 }

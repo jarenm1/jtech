@@ -19,6 +19,8 @@ pub struct PlayerInput {
     pub noclip: bool,
     /// One-tick melee request; the redundant input tail makes the edge reliable.
     pub attack: bool,
+    /// Selected hotbar slot; the server maps it to the held item for melee specs.
+    pub selected: u8,
 }
 
 #[path = "noclip.rs"]
@@ -66,6 +68,7 @@ pub fn step_player_with_bodies(
         turn: 0.0,
         jump: input.jump,
         attack: input.attack,
+        held_item: 0,
     };
     step_character(
         world,
