@@ -111,11 +111,12 @@ impl Simulation {
         }
     }
 
-    /// Respawn a dead player into loaded, supported, empty space near the pinned
-    /// spawn, including clearance from loose colliders. Only a depleted player
-    /// holding the current `life` token can spawn; success increments the token so
-    /// replayed requests become stale. When no safe space is loaded yet the player
-    /// stays dead and may retry with the same token. Returns whether the player is
+    /// Respawn a dead player into loaded, supported, empty space near their
+    /// bound bedroll — or the pinned world spawn when unbound — including
+    /// clearance from loose colliders. Only a depleted player holding the
+    /// current `life` token can spawn; success increments the token so replayed
+    /// requests become stale. When no safe space is loaded yet the player stays
+    /// dead and may retry with the same token. Returns whether the player is
     /// alive again.
     pub fn respawn_player(&mut self, world: &VoxelWorld, id: u64, life: u64) -> bool {
         let Some(player) = self.players.get(&id) else {
@@ -141,9 +142,12 @@ impl Simulation {
             .as_ref()
             .map(|physics| physics.dynamic_colliders())
             .unwrap_or_default();
-        let Some(position) = terrain_stream::available_spawn(world, self.spawn, &bodies) else {
+        let anchor = player.respawn_point.map_or(self.spawn, |point| {
+            point.as_vec3() + Vec3::splat(0.5)
+        });
+        let Some(position) = terrain_stream::available_spawn(world, anchor, &bodies) else {
             self.spawn_chunks
-                .extend(terrain_stream::spawn_search_chunks(self.spawn));
+                .extend(terrain_stream::spawn_search_chunks(anchor));
             return false;
         };
         self.cancel_player_strikes(id);
@@ -234,6 +238,47 @@ mod tests {
         // A second death on the empty corpse spills nothing.
         sim.damage_player(1, 10);
         assert_eq!(sim.drops.len(), 2);
+    }
+
+    #[test]
+    fn bedroll_binds_respawn_and_destruction_unbinds() {
+        let mut app = App::new();
+        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        let mut world = VoxelWorld::default();
+        let bedroll = glam::IVec3::new(9, 3, 9);
+        world.chunks.insert(
+            glam::IVec3::ZERO,
+            std::sync::Arc::new(voxel_world::Chunk::from_runs(0, &[(32768, 0)]).unwrap()),
+        );
+        // A floor block gives the placement ray a surface; the bedroll lands
+        // on the adjacent air cell above it.
+        world.set_block(bedroll - glam::IVec3::Y, voxel_world::STONE);
+
+        let mut player = Player::new();
+        player.inventory.add(voxel_world::BEDROLL, 1);
+        player.interest.insert(glam::IVec3::ZERO);
+        player.state.position = Vec3::new(9.5, 5.0, 9.5);
+        player.input.pitch = -std::f32::consts::FRAC_PI_2;
+
+        let revision = world.chunks[&glam::IVec3::ZERO].revision;
+        player.known.insert(glam::IVec3::ZERO, revision);
+        sim.players.insert(1, player);
+
+        // Placing the bedroll spends the item and binds respawn.
+        sim.tick = 100;
+        sim.edit(&mut world, 1, 1, bedroll, voxel_world::BEDROLL, revision, false);
+        assert_eq!(world.block(bedroll), Some(voxel_world::BEDROLL));
+        assert_eq!(sim.players[&1].respawn_point, Some(bedroll));
+        assert_eq!(sim.players[&1].inventory.count(voxel_world::BEDROLL), 0);
+
+        // Destroying the bedroll drops it and clears the binding.
+        sim.destroyed(bedroll, voxel_world::BEDROLL, None);
+        assert_eq!(sim.players[&1].respawn_point, None);
+        assert_eq!(
+            sim.drops.back().map(|d| (d.snapshot.item, d.snapshot.count)),
+            Some((voxel_world::BEDROLL, 1))
+        );
     }
 
     #[test]

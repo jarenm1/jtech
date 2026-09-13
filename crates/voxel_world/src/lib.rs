@@ -19,6 +19,9 @@ pub const DIRT: u8 = 2;
 pub const STONE: u8 = 3;
 pub const SAND: u8 = 4;
 pub const WOOD: u8 = 5;
+/// Placeable respawn anchor: placing binds the owner's respawn, destroying
+/// clears it. Soft like sand so raiding a bedroll is cheap.
+pub const BEDROLL: u8 = 6;
 /// Lowest world block coordinate covered by the chunk range.
 pub const WORLD_MIN_Y: i32 = MIN_CHUNK_Y * CHUNK_SIZE;
 /// Highest world block coordinate covered by the chunk range.
@@ -42,6 +45,7 @@ pub fn block_color(block: u8) -> [f32; 4] {
         STONE => [0.32, 0.35, 0.39, 1.0],
         SAND => [0.72, 0.57, 0.29, 1.0],
         WOOD => [0.24, 0.095, 0.035, 1.0],
+        BEDROLL => [0.55, 0.42, 0.62, 1.0],
         _ => [0.0; 4],
     }
 }
@@ -101,7 +105,7 @@ impl Chunk {
     pub fn from_runs(revision: u64, runs: &[(u16, u8)]) -> Result<Self, String> {
         let mut total = 0usize;
         for &(count, block) in runs {
-            if count == 0 || block > WOOD {
+            if count == 0 || block > BEDROLL {
                 return Err("zero run or invalid block".into());
             }
             total += count as usize;
@@ -206,7 +210,7 @@ impl VoxelWorld {
             .or_insert_with(|| Arc::new(Chunk::generate_with(coord, self.seed, &self.generator)));
     }
     pub fn set_block(&mut self, pos: IVec3, block: u8) -> Option<(u64, u64)> {
-        if block > WOOD {
+        if block > BEDROLL {
             return None;
         }
         let chunk = self.chunks.get_mut(&chunk_coord(pos))?;

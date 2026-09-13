@@ -220,6 +220,8 @@ struct Player {
     attack_ready: u64,
     inventory: Inventory,
     inventory_dirty: bool,
+    /// Block position of the placed bedroll anchoring respawn, if bound.
+    respawn_point: Option<IVec3>,
 }
 impl Player {
     fn new() -> Self {
@@ -247,6 +249,7 @@ impl Player {
             inventory: Inventory::default(),
             attack_ready: 0,
             inventory_dirty: false,
+            respawn_point: None,
         }
     }
     fn snapshot(&self, id: u64) -> PlayerSnapshot {
@@ -650,6 +653,10 @@ impl Simulation {
             let player = self.players.get_mut(&id).unwrap();
             player.inventory.take(block, 1);
             player.inventory_dirty = true;
+            // Placing a bedroll binds the owner's respawn to it.
+            if block == voxel_world::BEDROLL {
+                player.respawn_point = Some(target);
+            }
         }
         if let Some((material, direction, damage)) = detached {
             // F is a debug energy source; material damage is carried into the body.
@@ -686,6 +693,14 @@ impl Simulation {
         self.metrics.destroyed_blocks += 1;
         eprintln!("destroyed target={target} material={material} body={body:?}");
         self.spawn_drop(target.as_vec3() + Vec3::splat(0.5), material, 1);
+        // Destroying a bedroll unbinds every respawn anchored to it.
+        if material == voxel_world::BEDROLL {
+            for player in self.players.values_mut() {
+                if player.respawn_point == Some(target) {
+                    player.respawn_point = None;
+                }
+            }
+        }
     }
     /// One authoritative voxel transaction path for edits, detachment, and settlement.
     fn record_change(&mut self, _world: &VoxelWorld, target: IVec3, block: u8, from: u64, to: u64) {
@@ -883,7 +898,7 @@ fn validate_edit_target(
     revision: u64,
 ) -> Result<(), EditRejection> {
     let coord = chunk_coord(target);
-    if block > 5
+    if block > voxel_world::BEDROLL
         || target.y <= MIN_CHUNK_Y * CHUNK_SIZE
         || !valid_coord(coord)
         || !player.interest.contains(&coord)
@@ -1818,7 +1833,7 @@ mod tests {
         let (_world, mut sim) = take_resources(&mut app);
         for (item, count, position) in [
             (0_u8, 1_u16, Vec3::ZERO),
-            (6, 1, Vec3::ZERO),
+            (7, 1, Vec3::ZERO),
             (3, 0, Vec3::ZERO),
             (3, 1, Vec3::new(f32::NAN, 0.0, 0.0)),
         ] {

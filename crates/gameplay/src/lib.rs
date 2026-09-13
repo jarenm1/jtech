@@ -89,10 +89,10 @@ impl Health {
     }
 }
 
-/// Item kinds addressable by an inventory. Ids 1 through 5 mirror the placeable
+/// Item kinds addressable by an inventory. Ids 1 through 6 mirror the placeable
 /// block materials and 0 is empty; a later item registry can widen the mapping
 /// without changing the container shape.
-pub const INVENTORY_SLOTS: usize = 6;
+pub const INVENTORY_SLOTS: usize = 7;
 /// Ceiling for one item kind's count.
 pub const MAX_STACK: u16 = 999;
 

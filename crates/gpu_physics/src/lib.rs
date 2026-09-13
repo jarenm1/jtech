@@ -56,7 +56,7 @@ impl Material {
         self.fracture_budget * volume.max(0.)
     }
 }
-const MATERIALS: [Material; 6] = [
+const MATERIALS: [Material; 7] = [
     Material {
         density: 1.,
         damage_onset: 2000.,
@@ -111,6 +111,16 @@ const MATERIALS: [Material; 6] = [
         restitution: 0.15,
         friction: 5.,
     },
+    // Bedroll: soft, weakly attached — raiding it is cheap.
+    Material {
+        density: 0.8,
+        damage_onset: 300.,
+        fracture_budget: 12.,
+        fracture_efficiency: 0.5,
+        attachment_strength: 400.,
+        restitution: 0.,
+        friction: 10.,
+    },
 ];
 /// Unknown identifiers use the inert/default material at index zero.
 pub fn material(id: u32) -> &'static Material {
@@ -138,7 +148,7 @@ struct RawTerrainContact {
 // Generate shader constants from the Rust table, avoiding a second material database.
 fn shader_source() -> String {
     let mut source = String::from(
-        "struct Material { density: f32, damage_onset: f32, fracture_budget: f32, fracture_efficiency: f32, attachment_strength: f32, restitution: f32, friction: f32 }\nconst MATERIALS = array<Material, 6>(\n",
+        "struct Material { density: f32, damage_onset: f32, fracture_budget: f32, fracture_efficiency: f32, attachment_strength: f32, restitution: f32, friction: f32 }\nconst MATERIALS = array<Material, 7>(\n",
     );
     for m in MATERIALS {
         source.push_str(&format!(

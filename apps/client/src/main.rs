@@ -864,6 +864,7 @@ fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
         KeyCode::Digit4,
         KeyCode::Digit5,
         KeyCode::Digit6,
+        KeyCode::Digit7,
     ]
     .into_iter()
     .enumerate()
@@ -1107,11 +1108,17 @@ fn block_action(
     }
     let block = if strike || hit {
         0
-    } else if secondary
-        && (1..=voxel_world::WOOD).contains(&session.selected)
-        && session.inventory.count(session.selected) > 0
-    {
-        session.selected
+    } else if secondary {
+        // Hotbar slots 1-5 mirror materials; slot 7 carries the bedroll (item 6).
+        let item = if session.selected == 7 {
+            voxel_world::BEDROLL
+        } else {
+            session.selected
+        };
+        if !(1..=voxel_world::BEDROLL).contains(&item) || session.inventory.count(item) == 0 {
+            return None;
+        }
+        item
     } else {
         return None;
     };
