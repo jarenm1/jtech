@@ -54,6 +54,10 @@ pub(crate) struct ConnectionStatus;
 
 #[derive(Component)]
 pub(crate) struct SlotCount(u8);
+/// Material swatch inside a hotbar tile; dimmed while the stack is empty.
+#[derive(Component)]
+pub(crate) struct Swatch(u8);
+
 
 #[derive(Component)]
 pub(crate) struct FpsCounter;
@@ -261,6 +265,7 @@ fn spawn_hotbar(commands: &mut Commands) {
                                     ..default()
                                 },
                                 BackgroundColor(swatch(slot)),
+                                Swatch(slot),
                                 BorderRadius::all(px(3)),
                             ));
                         }
@@ -288,10 +293,12 @@ fn spawn_hotbar(commands: &mut Commands) {
         });
 }
 
-#[allow(clippy::type_complexity)] // Disjoint Text queries keep the label, slot counts and status independent.
 pub(crate) fn update(
     session: Res<ClientSession>,
-    mut slots: Query<(&HotbarSlot, &mut BackgroundColor, &mut BorderColor)>,
+    mut slots: Query<
+        (&HotbarSlot, &mut BackgroundColor, &mut BorderColor),
+        Without<Swatch>,
+    >,
     mut selected_label: Single<
         &mut Text,
         (
@@ -308,6 +315,10 @@ pub(crate) fn update(
             Without<SelectedLabel>,
             Without<ConnectionStatus>,
         ),
+    >,
+    mut swatches: Query<
+        (&Swatch, &mut BackgroundColor),
+        (With<Swatch>, Without<HotbarSlot>),
     >,
 ) {
     for (slot, mut background, mut border) in &mut slots {
@@ -331,6 +342,9 @@ pub(crate) fn update(
         } else {
             count.to_string()
         };
+    }
+    for (swatch, mut color) in &mut swatches {
+        color.0 = swatch_color(swatch.0, session.inventory.count(swatch.0) == 0);
     }
 
     let (node, text, color) = &mut *status;
@@ -361,6 +375,12 @@ fn slot_name(slot: u8) -> &'static str {
         _ => "Empty",
     }
 }
+/// Empty stacks keep their material hue at low alpha so the tile reads as spent.
+fn swatch_color(slot: u8, empty: bool) -> Color {
+    let color = swatch(slot);
+    if empty { color.with_alpha(0.25) } else { color }
+}
+
 
 fn swatch(slot: u8) -> Color {
     match slot {

@@ -12,3 +12,4 @@ physics.workspace = true
 controller.workspace = true
 protocol.workspace = true
 networking.workspace = true
+gameplay.workspace = true

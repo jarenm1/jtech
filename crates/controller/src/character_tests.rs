@@ -191,6 +191,7 @@ fn invalid_configuration_actions_and_ticks_are_bounded() {
         movement: Vec2::new(f32::NAN, f32::MAX),
         turn: f32::INFINITY,
         jump: true,
+        attack: false,
     };
     tick(
         &world,
@@ -224,6 +225,7 @@ fn invalid_configuration_actions_and_ticks_are_bounded() {
         movement: Vec2::splat(f32::MAX),
         turn: -100.0,
         jump: false,
+        attack: false,
     }
     .bounded();
     assert!(extreme.movement.length() <= 1.0);
@@ -317,6 +319,7 @@ fn headless_plugin_runs_script_before_motor_and_matches_direct_ticks() {
                 movement: Vec2::Y,
                 turn: 0.25,
                 jump: false,
+                attack: false,
             },
         );
     }

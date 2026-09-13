@@ -11,7 +11,7 @@ can read `Simulation::player_health` and use `damage_player`, `heal_player`, or
 `restore_player_health`. Unknown or disconnected player IDs return `None`.
 Clients receive health in the welcome message and the 20 Hz player snapshots,
 and display it in the HUD. Health is not predicted during movement replay.
-Protocol version 12 requires matching client and server builds.
+Protocol version 14 requires matching client and server builds.
 
 ## Blast damage and respawn
 
@@ -86,6 +86,34 @@ in the welcome) and the complete drop set is replaced on change, up to 20 Hz
 owned counts on the hotbar tiles; it holds no authoritative drop or item state.
 Item ids currently match block materials; richer item behavior can be added
 through a future registry.
+
+Placing a block spends one owned item of that material: the server rejects an
+empty stack with `EditRejection::OutOfStock` and decrements the count only after
+the world mutation succeeds. The client skips sending placements for empty
+slots and dims the hotbar swatch while a stack is at zero.
+
+## Melee combat
+
+Left click swings when a living actor or remote player is under the crosshair
+within reach; otherwise it mines terrain as before. Swings ride the input
+stream (`PlayerInput.attack`), so a held click repeats at the weapon cooldown
+and the same channel serves scripted policies. The server resolves one swing
+per tick per player through `gameplay::combat::resolve_swing`: a ray from the
+eye must reach a feet-anchored AABB before terrain blocks it. Hits apply
+`MeleeSpec` damage and a directional knockback impulse; a killing blow still
+launches the victim before death zeroes momentum.
+
+A training dummy spawns near the player spawn. It is a server `Actor` — the
+shared character motor with an empty `CharacterIntent` — so it walks, takes
+knockback, and collides with terrain exactly like a player. At zero health it
+disappears and respawns at its spawn point after five seconds. Actor state
+replicates in the 20 Hz snapshot (`ActorSnapshot`) filtered by chunk interest;
+clients render a capsule that flashes on damage.
+
+`MeleeSpec` (range, damage, cooldown ticks, knockback) is the extension point
+for authored weapons; `MELEE_HANDS` is the built-in default. Enemy policies
+write `CharacterIntent.attack` the same way human input maps to it.
+
 ## Game interface
 
 Select a hotbar slot with **1–6**. Read health at the lower left, the selected

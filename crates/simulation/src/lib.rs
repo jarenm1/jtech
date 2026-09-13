@@ -1,6 +1,7 @@
 use controller::PlayerInput;
 use controller::step_player;
 mod active_terrain;
+mod actors;
 #[cfg(test)]
 mod blast_jump_tests;
 #[cfg(test)]
@@ -175,8 +176,22 @@ impl Plugin for SimulationPlugin {
                 terrain: self.terrain.lock().take().expect("plugin built once"),
                 spawn,
                 spawn_chunks,
+                actors: HashMap::new(),
+                next_actor: 1,
             })
             .add_systems(Update, advance);
+        // The training dummy shares the player spawn volume so it is always
+        // reachable on foot; `available_spawn` keeps it off occupied cells.
+        {
+            let world = app.world().resource::<VoxelWorld>();
+            if let Some(position) =
+                terrain_stream::available_spawn(world, spawn + Vec3::new(4.0, 0.0, 0.0), &[])
+            {
+                app.world_mut()
+                    .resource_mut::<Simulation>()
+                    .spawn_actor(position);
+            }
+        }
     }
 }
 struct Player {
@@ -201,6 +216,8 @@ struct Player {
     next_bow_time: u64,
     arrow_revision: Option<u64>,
     package_revision: Option<u64>,
+    /// Fixed tick when the next melee swing is allowed.
+    attack_ready: u64,
     inventory: Inventory,
     inventory_dirty: bool,
 }
@@ -228,6 +245,7 @@ impl Player {
             arrow_revision: None,
             package_revision: None,
             inventory: Inventory::default(),
+            attack_ready: 0,
             inventory_dirty: false,
         }
     }
@@ -305,6 +323,8 @@ pub struct Simulation {
     terrain: terrain_stream::TerrainStream,
     spawn: Vec3,
     spawn_chunks: HashSet<IVec3>,
+    actors: actors::ActorMap,
+    next_actor: u32,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -582,6 +602,15 @@ impl Simulation {
                 .apply_contact(world, &tool_contact(target, material))
                 .map(Some);
         }
+        // Placement spends one owned item; strikes always carry block 0.
+        if block != 0
+            && self
+                .players
+                .get(&id)
+                .is_none_or(|player| player.inventory.count(block) == 0)
+        {
+            return Err(EditRejection::OutOfStock);
+        }
         if !self.has_journal_space(target) {
             return Err(EditRejection::StorageFull);
         }
@@ -617,6 +646,11 @@ impl Simulation {
         let (from, to) = world
             .set_block(target, block)
             .ok_or(EditRejection::RevisionExhausted)?;
+        if block != 0 {
+            let player = self.players.get_mut(&id).unwrap();
+            player.inventory.take(block, 1);
+            player.inventory_dirty = true;
+        }
         if let Some((material, direction, damage)) = detached {
             // F is a debug energy source; material damage is carried into the body.
             self.physics.as_mut().unwrap().release(
@@ -1002,6 +1036,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 movement: [0.0; 2],
                 jump: false,
                 descend: false,
+                attack: false,
                 ..player.input
             };
             player.state.velocity = Vec3::ZERO;
@@ -1070,6 +1105,8 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             player.terrain_revision = sim.terrain.revision;
         }
     }
+    sim.advance_actors(&world, &bodies);
+    sim.resolve_attacks(&world);
     for (id, message) in incoming.reliable {
         match message {
             ClientMessage::Edit {
@@ -1244,6 +1281,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             let Some(player) = sim.players.get(&id) else {
                 continue;
             };
+            let actors = sim.actor_snapshots(player);
             let snapshot = Snapshot {
                 tick: sim.tick,
                 you: player.snapshot(id),
@@ -1258,6 +1296,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                     })
                     .map(|(&id, p)| p.snapshot(id))
                     .collect(),
+                actors,
             };
             if sim
                 .transport
@@ -1370,6 +1409,112 @@ mod tests {
         player.known.insert(IVec3::ZERO, 2);
         assert!(!valid_player_edit(&world, &player, 100, 1, target, 0, 2));
         assert_eq!(world.block(target), Some(5));
+    }
+
+    #[test]
+    fn placement_spends_inventory_and_rejects_empty_stock() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        for wall in [IVec3::new(2, 3, 2), IVec3::new(4, 3, 2), IVec3::new(6, 3, 2)] {
+            world.set_block(wall, 5).unwrap();
+        }
+        let mut player = Player::new();
+        player.state.position = Vec3::new(2.5, 2.0, 5.5);
+        player.interest.insert(IVec3::ZERO);
+        player.known.insert(IVec3::ZERO, 3);
+        sim.players.insert(1, player);
+
+        // Empty stock rejects before the world changes.
+        sim.tick = 100;
+        sim.edit(&mut world, 1, 1, IVec3::new(2, 3, 3), voxel_world::STONE, 3, false);
+        assert_eq!(
+            sim.players[&1].results.back().unwrap().1,
+            Err(EditRejection::OutOfStock)
+        );
+        assert_eq!(world.block(IVec3::new(2, 3, 3)), Some(0));
+
+        // Each accepted placement spends exactly one item.
+        sim.players
+            .get_mut(&1)
+            .unwrap()
+            .inventory
+            .add(voxel_world::STONE, 2);
+        sim.tick = 200;
+        sim.edit(&mut world, 1, 2, IVec3::new(2, 3, 3), voxel_world::STONE, 3, false);
+
+        assert_eq!(sim.players[&1].results.back().unwrap().1, Ok(None));
+        assert_eq!(world.block(IVec3::new(2, 3, 3)), Some(voxel_world::STONE));
+        assert_eq!(sim.players[&1].inventory.count(voxel_world::STONE), 1);
+        assert!(sim.players[&1].inventory_dirty);
+
+        let player = sim.players.get_mut(&1).unwrap();
+        player.state.position = Vec3::new(4.5, 2.0, 5.5);
+        player.known.insert(IVec3::ZERO, 4);
+        sim.tick = 300;
+        sim.edit(&mut world, 1, 3, IVec3::new(4, 3, 3), voxel_world::STONE, 4, false);
+        assert_eq!(sim.players[&1].results.back().unwrap().1, Ok(None));
+        assert_eq!(sim.players[&1].inventory.count(voxel_world::STONE), 0);
+
+        let player = sim.players.get_mut(&1).unwrap();
+        player.state.position = Vec3::new(6.5, 2.0, 5.5);
+        player.known.insert(IVec3::ZERO, 5);
+        sim.tick = 400;
+        sim.edit(&mut world, 1, 4, IVec3::new(6, 3, 3), voxel_world::STONE, 5, false);
+        assert_eq!(
+            sim.players[&1].results.back().unwrap().1,
+            Err(EditRejection::OutOfStock)
+        );
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
+    fn melee_swings_damage_knockback_and_respawn_actors() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        // Ground plane so the actor and player stand on terrain.
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set_block(IVec3::new(x, 0, z), voxel_world::STONE).unwrap();
+            }
+        }
+        let dummy = sim.spawn_actor(Vec3::new(2.5, 1.0, 0.5)).unwrap();
+        let mut player = Player::new();
+        player.state.position = Vec3::new(2.5, 1.0, 3.5);
+        player.input.pitch = 0.0;
+        player.input.yaw = 0.0; // -Z faces the dummy
+        player.input.attack = true;
+        sim.players.insert(1, player);
+
+        sim.tick = 100;
+        sim.resolve_attacks(&world);
+        assert_eq!(
+            sim.actor_health(dummy).unwrap().current(),
+            100 - gameplay::combat::MELEE_HANDS.damage
+        );
+        assert!(
+            sim.actor_position(dummy).unwrap().z < 0.5
+                || sim.actors[&dummy].state.motion.external_velocity.length() > 0.0,
+            "knockback did not move the dummy"
+        );
+        // Cooldown blocks an immediate second swing.
+        sim.resolve_attacks(&world);
+        assert_eq!(
+            sim.actor_health(dummy).unwrap().current(),
+            100 - gameplay::combat::MELEE_HANDS.damage
+        );
+        // Ten swings at cooldown spacing kill the dummy; it respawns later.
+        for _ in 0..10 {
+            sim.tick += u64::from(gameplay::combat::MELEE_HANDS.cooldown_ticks);
+            sim.resolve_attacks(&world);
+        }
+        assert!(sim.actor_health(dummy).unwrap().is_depleted());
+        sim.tick += 300;
+        sim.advance_actors(&world, &[]);
+        assert_eq!(sim.actor_health(dummy).unwrap(), Health::default());
+        assert_eq!(sim.actor_position(dummy).unwrap(), Vec3::new(2.5, 1.0, 0.5));
+        put_resources(&mut app, world, sim);
     }
 
     #[test]

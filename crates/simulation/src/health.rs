@@ -180,6 +180,7 @@ mod tests {
             tick: sim.tick,
             you: sim.players[&1].snapshot(1),
             players: vec![sim.players[&2].snapshot(2)],
+            actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
         let received: Snapshot = decode(&bytes, MAX_DATAGRAM).unwrap();

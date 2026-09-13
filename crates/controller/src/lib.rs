@@ -13,11 +13,14 @@ pub use plugin::{ControllerPlugin, ControllerSet, ObservedBodies};
 /// Held body-relative axes: +X right, +Y forward (-Z at yaw zero).
 /// Turn is a held fraction of the profile's maximum yaw rate; positive turns left.
 /// Jump is a one-tick request, consumed even when airborne. No automatic buffering.
+/// Attack is a one-tick action edge: the motor ignores it, and the host's combat
+/// system consumes and clears it each tick so policies submit it like jump.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CharacterIntent {
     pub movement: Vec2,
     pub turn: f32,
     pub jump: bool,
+    pub attack: bool,
 }
 impl CharacterIntent {
     pub fn bounded(self) -> Self {
@@ -29,6 +32,7 @@ impl CharacterIntent {
             .clamp_length_max(1.0),
             turn: finite(self.turn).clamp(-1.0, 1.0),
             jump: self.jump,
+            attack: self.attack,
         }
     }
 }

@@ -55,6 +55,7 @@ fn reconciliation_preserves_blast_momentum_through_input_replay() {
             yaw: 0.0,
         },
         players: vec![],
+        actors: vec![],
     };
     let mut expected = authoritative;
     for sequence in 5..=10 {
@@ -103,6 +104,7 @@ fn reconciliation_copies_authoritative_health_without_predicting_damage() {
             yaw: 0.0,
         },
         players: vec![],
+        actors: vec![],
     };
     client.pending.push_back(PlayerInput {
         sequence: 1,
@@ -218,6 +220,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
             yaw: 0.0,
         },
         players: vec![],
+        actors: vec![],
     };
     reconcile(&mut client, &world, &snapshot, &[]);
     assert_eq!(client.state, expected);
@@ -240,6 +243,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
                 yaw: 0.0,
             },
             players: vec![],
+        actors: vec![],
         },
         &[],
     );
@@ -287,6 +291,7 @@ fn terrain_changes_are_used_when_replaying_prediction() {
                 yaw: 0.0,
             },
             players: vec![],
+        actors: vec![],
         },
         &[],
     );
@@ -335,6 +340,7 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
                 yaw: 0.0,
             },
             players: vec![],
+        actors: vec![],
         },
         &[body],
     );
@@ -567,6 +573,8 @@ fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
     ));
     for selected in 1..=5 {
         client.selected = selected;
+        assert!(block_action(&mut client, &world, false, false, true).is_none());
+        client.inventory.add(selected, 1);
         assert!(
             matches!(block_action(&mut client, &world, false, false, true),
             Some(ClientMessage::Edit { block, .. }) if block == selected)
@@ -655,6 +663,7 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
             yaw: 0.0,
         },
         players: vec![],
+        actors: vec![],
     };
     reconcile(&mut client, &world, &snapshot, &[]);
     assert_eq!(client.state, server);
@@ -718,6 +727,7 @@ fn snapshot(tick: u64, life: u64, state: PlayerState, health: Health) -> Snapsho
             yaw: 0.0,
         },
         players: vec![],
+        actors: vec![],
     }
 }
 

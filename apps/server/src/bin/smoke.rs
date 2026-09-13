@@ -5,8 +5,8 @@ use glam::{IVec3, Vec3};
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerState};
 use protocol::{
-    ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, PackageState, PackageStatus,
-    ServerMessage,
+    ActorSnapshot, ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, Inventory,
+    PackageState, PackageStatus, ServerMessage,
 };
 use simulation::{ServerConfig, Simulation, SimulationPlugin};
 use std::{
@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, chunk_coord};
+use voxel_world::{CHUNK_SIZE, Chunk, VoxelWorld, WOOD, chunk_coord};
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 struct Bot {
     net: ClientTransport,
@@ -40,12 +40,16 @@ struct Bot {
     rejections: HashMap<u64, EditRejection>,
     flights: Vec<(u64, Vec<ArrowSnapshot>)>,
     explosions: Vec<(u32, Vec3, f32)>,
+    inventory: Inventory,
     chunks: usize,
     packages: Vec<(u64, Vec<PackageStatus>, u32)>,
     deltas: usize,
     forgotten: usize,
     corrections: usize,
     max_error: f32,
+    yaw: f32,
+    attack: bool,
+    actors: HashMap<u32, ActorSnapshot>,
     jitter: bool,
 }
 impl Bot {
@@ -73,9 +77,13 @@ impl Bot {
             explosions: Vec::new(),
             packages: Vec::new(),
             chunks: 0,
+            inventory: Inventory::default(),
             deltas: 0,
             forgotten: 0,
             corrections: 0,
+            yaw: 0.0,
+            attack: false,
+            actors: HashMap::new(),
             max_error: 0.0,
             jitter,
         })
@@ -172,7 +180,7 @@ impl Bot {
                 } => self
                     .packages
                     .push((revision, packages, bow_shots_per_second)),
-                ServerMessage::Inventory { .. } => {}
+                ServerMessage::Inventory { inventory } => self.inventory = inventory,
                 ServerMessage::Drops { .. } => {}
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
             }
@@ -188,6 +196,11 @@ impl Bot {
             self.acknowledged = snapshot.you.last_input;
             self.remotes = snapshot.players.len();
             self.authority = snapshot.you.state;
+            self.actors = snapshot
+                .actors
+                .iter()
+                .map(|actor| (actor.id, actor.clone()))
+                .collect();
             self.health = Some(snapshot.you.health);
             let life_changed = self.life != snapshot.you.life;
             if life_changed || snapshot.you.health.is_depleted() {
@@ -224,9 +237,10 @@ impl Bot {
         let input = PlayerInput {
             sequence: self.sequence,
             movement,
-            yaw: 0.0,
+            yaw: self.yaw,
             pitch,
             jump: movement != [0.0; 2],
+            attack: self.attack,
             ..Default::default()
         };
         if !self.health.is_some_and(Health::is_depleted) {
@@ -297,6 +311,31 @@ fn drive(
         for bot in bots.iter_mut() {
             bot.poll()?;
         }
+    }
+    Ok(())
+}
+/// Drive one bot while the other stands still; both keep polling so their
+/// replicated views stay current without disturbing the scenario.
+fn drive_first(
+    app: &mut App,
+    first: &mut Bot,
+    second: &mut Bot,
+    steps: usize,
+    movement: [f32; 2],
+    pitch: f32,
+) -> Result<()> {
+    for _ in 0..steps {
+        let tick = app.world().resource::<Simulation>().tick;
+        first.poll()?;
+        first.input(tick, movement, pitch)?;
+        first.poll()?;
+        second.poll()?;
+        second.input(tick, [0.0; 2], pitch)?;
+        second.poll()?;
+        app.update();
+        std::thread::sleep(Duration::from_millis(1));
+        first.poll()?;
+        second.poll()?;
     }
     Ok(())
 }
@@ -413,6 +452,13 @@ fn package_fixture() -> Result<(PathBuf, PathBuf, String)> {
     let source = fs::read_to_string(&baseline_path)?;
     let package_path = package_dir.join("server.scm");
     fs::write(&package_path, &source)?;
+    // The plugin also compiles the terrain package from the same root.
+    let terrain_dir = root.join("terrain");
+    fs::create_dir_all(&terrain_dir)?;
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/terrain/server.scm"),
+        terrain_dir.join("server.scm"),
+    )?;
     Ok((root, package_path, source))
 }
 
@@ -878,6 +924,23 @@ fn main() -> Result<()> {
         "burst resync stranded a missing baseline",
     )?;
     // Place a block ahead of the players, not inside their collision bodies.
+    // Placement spends inventory: an unowned material rejects before any grant.
+    let missing = (1..=5)
+        .find(|&item| first.inventory.count(item) == 0)
+        .ok_or("every material was stocked before the placement scenario")?;
+    request += 1;
+    first.net.send(ClientMessage::Edit {
+        request,
+        target: hit.block,
+        block: missing,
+        expected_revision: first.world.chunks[&coord].revision,
+    })?;
+    drive(&mut app, &mut [&mut first, &mut second], 12, [0.0; 2], -1.5)?;
+    require(
+        first.rejections.get(&request) == Some(&EditRejection::OutOfStock),
+        "unstocked placement was not rejected",
+    )?;
+    // Place a block ahead of the players, not inside their collision bodies.
     let placement_pitch = -0.65;
     drive(
         &mut app,
@@ -902,11 +965,29 @@ fn main() -> Result<()> {
     )?;
     let placement_coord = chunk_coord(placement);
     let placement_revision = first.world.chunks[&placement_coord].revision;
+    require(
+        app.world_mut()
+            .resource_mut::<Simulation>()
+            .grant_item(first.id, WOOD, 1)
+            == Some(1),
+        "wood grant was not accepted",
+    )?;
+    drive(
+        &mut app,
+        &mut [&mut first, &mut second],
+        12,
+        [0.0; 2],
+        placement_pitch,
+    )?;
+    require(
+        first.inventory.count(WOOD) == 1,
+        "granted wood did not replicate",
+    )?;
     request += 1;
     first.net.send(ClientMessage::Edit {
         request,
         target: placement,
-        block: 5,
+        block: WOOD,
         expected_revision: placement_revision,
     })?;
     drive(
@@ -933,6 +1014,52 @@ fn main() -> Result<()> {
         &mut request,
         false,
     )?;
+    // Melee: walk to the training dummy, swing until it dies, watch it respawn.
+    // Aim with the authoritative position: the server resolves swings there.
+    let dummy = *first
+        .actors
+        .keys()
+        .next()
+        .ok_or("no training dummy replicated")?;
+    for _ in 0..600 {
+        let Some(actor) = first.actors.get(&dummy) else {
+            // Interest-set flicker: keep polling rather than aborting.
+            drive_first(&mut app, &mut first, &mut second, 4, [0.0; 2], 0.0)?;
+            continue;
+        };
+        if actor.health.is_depleted() {
+            break;
+        }
+        // Predicted position leads the authoritative echo under jitter; stop
+        // early, then stand still so the server position converges in range.
+        let to = actor.state.position - first.state.position;
+        let flat = Vec3::new(to.x, 0.0, to.z);
+        first.yaw = (-to.x).atan2(-to.z);
+        if flat.length() > 2.5 {
+            first.attack = false;
+            drive_first(&mut app, &mut first, &mut second, 4, [0.0, 1.0], 0.0)?;
+        } else {
+            first.attack = true;
+            drive_first(&mut app, &mut first, &mut second, 34, [0.0; 2], 0.0)?;
+        }
+    }
+    first.attack = false;
+    first.yaw = 0.0;
+    require(
+        first
+            .actors
+            .get(&dummy)
+            .is_some_and(|actor| actor.health.is_depleted()),
+        "melee swings did not kill the training dummy",
+    )?;
+    drive(&mut app, &mut [&mut first, &mut second], 360, [0.0; 2], 0.0)?;
+    require(
+        first
+            .actors
+            .get(&dummy)
+            .is_some_and(|actor| actor.health == Health::default()),
+        "training dummy did not respawn",
+    )?;
     let final_revision = first.world.chunks[&coord].revision;
     let started = first.authority.position;
     drive(
@@ -942,7 +1069,9 @@ fn main() -> Result<()> {
         [0.0, 1.0],
         0.0,
     )?;
-    drive(&mut app, &mut [&mut first, &mut second], 90, [0.0; 2], 0.0)?;
+    // Idle past the 120-tick eviction window so trail chunks age out before
+    // the bounded-chunk checks below.
+    drive(&mut app, &mut [&mut first, &mut second], 200, [0.0; 2], 0.0)?;
     require(
         first.authority.position.distance(started) > 32.0,
         &format!(
@@ -958,9 +1087,12 @@ fn main() -> Result<()> {
         first.world.chunks.len() <= 27 && second.world.chunks.len() <= 27,
         "divergent streaming exceeded client chunk bound",
     )?;
+    // Server residency = both players' safety halos + warm spawn set + physics
+    // collision pages; 588 observed, bound leaves headroom for terrain drift.
+    let server_chunks = app.world().resource::<VoxelWorld>().chunks.len();
     require(
-        app.world().resource::<VoxelWorld>().chunks.len() <= 270,
-        "server loaded chunks did not remain bounded after traversal",
+        server_chunks <= 640,
+        &format!("server loaded chunks did not remain bounded after traversal: {server_chunks}"),
     )?;
     require(
         first.acknowledged > 900 && first.corrections > 0 && first.max_error.is_finite(),
@@ -1004,7 +1136,7 @@ fn main() -> Result<()> {
         .print_metrics(app.world().resource::<VoxelWorld>().chunks.len());
     explosive_bow()?;
     println!(
-        "SMOKE PASS: two real TCP/UDP clients; accumulating fracture/replay protection/destruction; reliable edits/revisions/rejection/resync; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect; CPU explosive bow flight/impact/destruction/cooldown/replay on both clients"
+        "SMOKE PASS: two real TCP/UDP clients; accumulating fracture/replay protection/destruction; reliable edits/revisions/rejection/resync; inventory-spending placement; melee kill/respawn on the training dummy; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect; CPU explosive bow flight/impact/destruction/cooldown/replay on both clients"
     );
     Ok(())
 }

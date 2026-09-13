@@ -85,6 +85,45 @@ pub fn overlaps_shape(state: &KinematicState, block: IVec3, shape: CollisionShap
     let block_min = block.as_vec3();
     min.cmplt(block_min + Vec3::ONE).all() && max.cmpgt(block_min).all()
 }
+
+/// Ray vs a feet-anchored AABB. Returns the entry distance in world units along
+/// the normalized direction, or `None` on a miss. An origin inside the box hits
+/// at distance zero so point-blank swings still connect.
+pub fn raycast_body(
+    origin: Vec3,
+    direction: Vec3,
+    position: Vec3,
+    shape: CollisionShape,
+) -> Option<f32> {
+    if !origin.is_finite() || !position.is_finite() {
+        return None;
+    }
+    let direction = direction.try_normalize()?;
+    let (min, max) = bounds(position, shape);
+    let mut enter = 0.0_f32;
+    let mut exit = f32::INFINITY;
+    for axis in 0..3 {
+        let d = direction[axis];
+        if d.abs() < EPSILON {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inv = d.recip();
+        let mut near = (min[axis] - origin[axis]) * inv;
+        let mut far = (max[axis] - origin[axis]) * inv;
+        if near > far {
+            std::mem::swap(&mut near, &mut far);
+        }
+        enter = enter.max(near);
+        exit = exit.min(far);
+        if enter > exit {
+            return None;
+        }
+    }
+    Some(enter)
+}
 fn solid(world: &VoxelWorld, cell: IVec3) -> bool {
     world.block(cell) != Some(AIR)
 }
@@ -320,5 +359,30 @@ impl Default for CollisionShape {
             half_depth: PLAYER_RADIUS,
             height: PLAYER_HEIGHT,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raycast_body_reports_entry_distance_and_misses() {
+        let shape = CollisionShape::default();
+        let feet = Vec3::new(0.0, 0.0, -5.0);
+        // Straight at the torso: enters the 0.3-radius box 4.7m out.
+        let hit = raycast_body(Vec3::ZERO, Vec3::NEG_Z, feet, shape).unwrap();
+        assert!((hit - 4.7).abs() < 0.001, "{hit}");
+        // Above the head and beside the body miss entirely.
+        assert!(raycast_body(Vec3::ZERO, Vec3::Y, feet, shape).is_none());
+        assert!(raycast_body(Vec3::ZERO, Vec3::X, feet, shape).is_none());
+        // Origin inside the box still connects at zero distance.
+        assert_eq!(
+            raycast_body(feet + Vec3::Y, Vec3::NEG_Z, feet, shape),
+            Some(0.0)
+        );
+        // Non-finite inputs miss rather than panic.
+        assert!(raycast_body(Vec3::ZERO, Vec3::ZERO, feet, shape).is_none());
+        assert!(raycast_body(Vec3::splat(f32::NAN), Vec3::NEG_Z, feet, shape).is_none());
     }
 }

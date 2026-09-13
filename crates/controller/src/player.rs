@@ -17,6 +17,8 @@ pub struct PlayerInput {
     pub descend: bool,
     /// Desired mode, not a toggle edge, so input replay is idempotent.
     pub noclip: bool,
+    /// One-tick melee request; the redundant input tail makes the edge reliable.
+    pub attack: bool,
 }
 
 #[path = "noclip.rs"]
@@ -63,6 +65,7 @@ pub fn step_player_with_bodies(
         movement: Vec2::from_array(input.movement),
         turn: 0.0,
         jump: input.jump,
+        attack: input.attack,
     };
     step_character(
         world,

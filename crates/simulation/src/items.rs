@@ -90,6 +90,19 @@ impl Drop {
 }
 
 impl Simulation {
+    /// Add up to `amount` of `item` to a player's inventory. Returns the amount
+    /// accepted before the stack ceiling; unknown players return `None`.
+    pub fn grant_item(&mut self, id: u64, item: u8, amount: u16) -> Option<u16> {
+        let player = self.players.get_mut(&id)?;
+        let granted = player.inventory.add(item, amount);
+        if granted > 0 {
+            player.inventory_dirty = true;
+        }
+        Some(granted)
+    }
+}
+
+impl Simulation {
     /// Leave a dropped stack at `position`. The authoritative destruction path
     /// calls this for grid and loose-block destruction alike.
     pub(super) fn spawn_drop(&mut self, position: Vec3, item: u8, count: u16) {

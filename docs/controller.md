@@ -4,7 +4,7 @@
 
 ## Shared motor
 
-- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request.
+- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a one-tick `attack` edge the host's combat system consumes (the motor ignores it).
 - `CharacterBody`: feet-anchored AABB dimensions and mass in kilograms.
 - `MovementProfile`: speed, acceleration, braking, air control, strafe fraction, yaw rate, gravity, jump speed, and external-momentum drag.
 - `CharacterState`: motion and facing, sufficient to restore motor state for replay. Horizontal external momentum is separate from controlled movement.

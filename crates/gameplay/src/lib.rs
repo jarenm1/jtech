@@ -1,4 +1,8 @@
-//! Shared gameplay components, independent of movement and collision physics.
+//! Shared gameplay components and rules. Health and inventory stay free of
+//! physics types; `combat` resolves melee swings against voxel terrain and
+//! character shapes.
+
+pub mod combat;
 
 use bevy_ecs::prelude::Component;
 use serde::{Deserialize, Serialize};

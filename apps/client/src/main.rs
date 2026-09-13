@@ -12,7 +12,7 @@ mod projectiles;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bevy::{
@@ -130,6 +130,7 @@ struct ClientSession {
     inventory: Inventory,
     noclip_requested: bool,
     jump_pending: bool,
+    attack_pending: bool,
     pending: VecDeque<PlayerInput>,
     sequence: u64,
     last_tick: u64,
@@ -191,6 +192,7 @@ impl Default for ClientSession {
             inventory: Inventory::default(),
             noclip_requested: false,
             jump_pending: false,
+            attack_pending: false,
             pending: VecDeque::with_capacity(256),
             sequence: 0,
             last_tick: 0,
@@ -225,6 +227,10 @@ impl ClientSession {
     fn consume_jump(&mut self, flight: bool, held: bool) -> bool {
         let pressed = std::mem::take(&mut self.jump_pending);
         if flight { held } else { pressed }
+    }
+    /// One-tick melee request, consumed like jump so a click swings once.
+    fn consume_attack(&mut self) -> bool {
+        std::mem::take(&mut self.attack_pending)
     }
     fn predict_input(
         &mut self,
@@ -304,12 +310,27 @@ impl ClientSession {
 struct RemotePlayer {
     entity: Entity,
     life: u64,
+    health: Health,
     previous: Vec3,
     current: Vec3,
     previous_yaw: f32,
     yaw: f32,
     received: Instant,
 }
+
+struct RemoteActor {
+    entity: Entity,
+    material: Handle<StandardMaterial>,
+    health: Health,
+    previous: Vec3,
+    current: Vec3,
+    yaw: f32,
+    received: Instant,
+    flash_until: Instant,
+}
+
+#[derive(Resource, Default)]
+struct RemoteActors(HashMap<u32, RemoteActor>);
 
 #[derive(Resource, Default)]
 struct RemotePlayers(HashMap<u64, RemotePlayer>);
@@ -318,10 +339,14 @@ struct RemotePlayers(HashMap<u64, RemotePlayer>);
 struct ActorAssets {
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
+    dummy_mesh: Handle<Mesh>,
 }
 
 #[derive(Component)]
 struct PlayerCamera;
+#[derive(Component)]
+struct RemoteActorEntity;
+
 #[derive(Component)]
 struct Selection;
 
@@ -337,6 +362,7 @@ impl Plugin for ClientPlugin {
         );
         app.init_resource::<ClientSession>()
             .init_resource::<RemotePlayers>()
+            .init_resource::<RemoteActors>()
             .init_resource::<pause_menu::PauseMenu>()
             .init_resource::<death_overlay::DeathOverlay>()
             .add_systems(Startup, setup)
@@ -450,6 +476,7 @@ fn setup(
             perceptual_roughness: 1.0,
             ..default()
         }),
+        dummy_mesh: meshes.add(Capsule3d::new(0.32, 1.1)),
     });
     // A translucent shell marks the selected solid voxel without requiring wireframe support.
     commands.spawn((
@@ -478,6 +505,8 @@ fn receive_network(
     mut session: ResMut<ClientSession>,
     mut world: ResMut<VoxelWorld>,
     mut remotes: ResMut<RemotePlayers>,
+    mut actors: ResMut<RemoteActors>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     assets: Res<ActorAssets>,
     mut loose: ResMut<loose_blocks::LooseBlocks>,
     loose_assets: Res<loose_blocks::LooseBlockAssets>,
@@ -668,6 +697,7 @@ fn receive_network(
                     remote.previous_yaw = remote.yaw;
                     remote.current = player.state.position;
                     remote.yaw = player.yaw;
+                    remote.health = player.health;
                     if remote.life != player.life {
                         remote.previous = remote.current;
                         remote.previous_yaw = remote.yaw;
@@ -687,10 +717,60 @@ fn receive_network(
                         .id(),
                     previous: player.state.position,
                     life: player.life,
+                    health: player.health,
                     current: player.state.position,
                     previous_yaw: player.yaw,
                     yaw: player.yaw,
                     received: now,
+                });
+        }
+        actors.0.retain(|id, actor| {
+            if snapshot.actors.iter().any(|a| a.id == *id) {
+                true
+            } else {
+                commands.entity(actor.entity).despawn();
+                false
+            }
+        });
+        for actor in snapshot.actors {
+            actors
+                .0
+                .entry(actor.id)
+                .and_modify(|remote| {
+                    remote.previous = remote.current;
+                    remote.current = actor.state.position;
+                    remote.yaw = actor.yaw;
+                    if actor.health.current() < remote.health.current() {
+                        remote.flash_until = now + Duration::from_millis(120);
+                    }
+                    remote.health = actor.health;
+                    remote.received = now;
+                })
+                .or_insert_with(|| {
+                    let material = materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.85, 0.45, 0.25),
+                        perceptual_roughness: 0.8,
+                        ..default()
+                    });
+                    RemoteActor {
+                        entity: commands
+                            .spawn((
+                                Mesh3d(assets.dummy_mesh.clone()),
+                                MeshMaterial3d(material.clone()),
+                                Transform::from_translation(
+                                    actor.state.position + Vec3::Y * PLAYER_HEIGHT * 0.5,
+                                ),
+                                RemoteActorEntity,
+                            ))
+                            .id(),
+                        material,
+                        health: actor.health,
+                        previous: actor.state.position,
+                        current: actor.state.position,
+                        yaw: actor.yaw,
+                        received: now,
+                        flash_until: now,
+                    }
                 });
         }
     }
@@ -874,6 +954,7 @@ fn predict(
             jump,
             descend,
             noclip: session.noclip_requested,
+            attack: session.consume_attack(),
         };
         session.predict_input(&world, input, loose.colliders());
     }
@@ -900,6 +981,8 @@ fn edit_blocks(
     cursor: Single<&CursorOptions>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
+    actors: Res<RemoteActors>,
+    remotes: Res<RemotePlayers>,
     time: Res<Time>,
     mut bow_repeat: Local<BowRepeat>,
     menu: Res<pause_menu::PauseMenu>,
@@ -914,7 +997,16 @@ fn edit_blocks(
         return;
     }
     let strike = keys.just_pressed(KeyCode::KeyF);
-    let hit = buttons.just_pressed(MouseButton::Left);
+    // Melee: a living actor or remote player under the crosshair within reach
+    // swings instead of mining. The server re-validates; this only routes input.
+    let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
+    let direction = look_direction(session.yaw, session.pitch);
+    let melee = buttons.pressed(MouseButton::Left)
+        && melee_target(&world, origin, direction, &actors, &remotes);
+    if melee {
+        session.attack_pending = true;
+    }
+    let hit = buttons.just_pressed(MouseButton::Left) && !melee;
     let bow_shot = repeat_bow(
         &mut bow_repeat,
         time.elapsed_secs_f64(),
@@ -932,6 +1024,39 @@ fn edit_blocks(
     if let Some(message) = block_action(&mut session, &world, strike, hit, secondary) {
         session.send(message);
     }
+}
+
+/// True when a living actor or remote player is under the crosshair within
+/// melee range and no terrain blocks the swing. Client-side routing only.
+fn melee_target(
+    world: &VoxelWorld,
+    origin: Vec3,
+    direction: Vec3,
+    actors: &RemoteActors,
+    remotes: &RemotePlayers,
+) -> bool {
+    let spec = gameplay::combat::MELEE_HANDS;
+    let wall = world
+        .raycast(origin, direction, spec.range)
+        .map(|hit| hit.distance)
+        .unwrap_or(spec.range);
+    let shape = physics::CollisionShape::default();
+    actors
+        .0
+        .values()
+        .filter(|actor| !actor.health.is_depleted())
+        .any(|actor| {
+            physics::raycast_body(origin, direction, actor.current, shape)
+                .is_some_and(|distance| distance < wall)
+        })
+        || remotes
+            .0
+            .values()
+            .filter(|remote| !remote.health.is_depleted())
+            .any(|remote| {
+                physics::raycast_body(origin, direction, remote.current, shape)
+                    .is_some_and(|distance| distance < wall)
+            })
 }
 
 #[derive(Default)]
@@ -982,7 +1107,10 @@ fn block_action(
     }
     let block = if strike || hit {
         0
-    } else if secondary && (1..=voxel_world::WOOD).contains(&session.selected) {
+    } else if secondary
+        && (1..=voxel_world::WOOD).contains(&session.selected)
+        && session.inventory.count(session.selected) > 0
+    {
         session.selected
     } else {
         return None;
@@ -1013,21 +1141,46 @@ fn present_players(
     time: Res<Time>,
     mut session: ResMut<ClientSession>,
     remotes: Res<RemotePlayers>,
+    actors: Res<RemoteActors>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut focus: ResMut<RenderFocus>,
     mut camera: Single<&mut Transform, With<PlayerCamera>>,
-    mut actors: Query<&mut Transform, Without<PlayerCamera>>,
+    mut transforms: Query<&mut Transform, Without<PlayerCamera>>,
+    mut visibility: Query<&mut Visibility, With<RemoteActorEntity>>,
 ) {
     session.correction *= (-18.0 * time.delta_secs()).exp();
     camera.translation = session.state.position + Vec3::Y * EYE_HEIGHT + session.correction;
     camera.rotation = Quat::from_rotation_y(session.yaw) * Quat::from_rotation_x(session.pitch);
     focus.0 = session.state.position;
     for remote in remotes.0.values() {
-        if let Ok(mut transform) = actors.get_mut(remote.entity) {
+        if let Ok(mut transform) = transforms.get_mut(remote.entity) {
             let alpha = (remote.received.elapsed().as_secs_f32() / 0.05).clamp(0.0, 1.0);
             transform.translation =
                 remote.previous.lerp(remote.current, alpha) + Vec3::Y * PLAYER_HEIGHT * 0.5;
             transform.rotation = Quat::from_rotation_y(remote.previous_yaw)
                 .slerp(Quat::from_rotation_y(remote.yaw), alpha);
+        }
+    }
+    for actor in actors.0.values() {
+        if let Ok(mut transform) = transforms.get_mut(actor.entity) {
+            let alpha = (actor.received.elapsed().as_secs_f32() / 0.05).clamp(0.0, 1.0);
+            transform.translation =
+                actor.previous.lerp(actor.current, alpha) + Vec3::Y * PLAYER_HEIGHT * 0.5;
+            transform.rotation = Quat::from_rotation_y(actor.yaw);
+        }
+        if let Ok(mut visible) = visibility.get_mut(actor.entity) {
+            *visible = if actor.health.is_depleted() {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            };
+        }
+        if let Some(material) = materials.get_mut(&actor.material) {
+            material.base_color = if Instant::now() < actor.flash_until {
+                Color::srgb(1.0, 0.9, 0.7)
+            } else {
+                Color::srgb(0.85, 0.45, 0.25)
+            };
         }
     }
 }

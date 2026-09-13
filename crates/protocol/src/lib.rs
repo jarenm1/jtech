@@ -7,7 +7,7 @@ use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -38,6 +38,7 @@ pub enum EditRejection {
     RevisionExhausted,
     PackageUnavailable,
     Dead,
+    OutOfStock,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -184,11 +185,20 @@ pub struct PlayerSnapshot {
     pub life: u64,
     pub yaw: f32,
 }
+/// Non-player character state at 20 Hz. `id` is stable across respawns.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActorSnapshot {
+    pub id: u32,
+    pub state: PlayerState,
+    pub health: Health,
+    pub yaw: f32,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub tick: u64,
     pub you: PlayerSnapshot,
     pub players: Vec<PlayerSnapshot>,
+    pub actors: Vec<ActorSnapshot>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputPacket {
@@ -255,6 +265,7 @@ mod tests {
             tick: 9,
             you: player.clone(),
             players: vec![player],
+            actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
         let decoded: Snapshot = decode(&bytes, MAX_DATAGRAM).unwrap();
@@ -291,6 +302,7 @@ mod tests {
             tick: u64::MAX,
             you: player.clone(),
             players: vec![player; MAX_PLAYERS - 1],
+            actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
         let decoded: Snapshot = decode(&bytes, MAX_DATAGRAM).unwrap();
@@ -338,6 +350,7 @@ mod tests {
             tick: 12,
             you: player.clone(),
             players: vec![player],
+            actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
         let decoded: Snapshot = decode(&bytes, MAX_DATAGRAM).unwrap();
