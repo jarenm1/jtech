@@ -108,14 +108,16 @@ const OFFSETS: [IVec3; 27] = {
     offsets
 };
 
+/// Material tints: a dark, desaturated palette that reads as one world.
+/// Luminance detail comes from the texture atlas; these carry hue only.
 pub fn block_color(block: u8) -> [f32; 4] {
     match block {
-        GRASS => [0.14, 0.46, 0.07, 1.0],
-        DIRT => [0.28, 0.13, 0.055, 1.0],
-        STONE => [0.32, 0.35, 0.39, 1.0],
-        SAND => [0.72, 0.57, 0.29, 1.0],
-        WOOD => [0.24, 0.095, 0.035, 1.0],
-        BEDROLL => [0.55, 0.42, 0.62, 1.0],
+        GRASS => [0.10, 0.17, 0.055, 1.0],
+        DIRT => [0.13, 0.085, 0.05, 1.0],
+        STONE => [0.115, 0.125, 0.14, 1.0],
+        SAND => [0.26, 0.21, 0.12, 1.0],
+        WOOD => [0.11, 0.065, 0.035, 1.0],
+        BEDROLL => [0.16, 0.075, 0.10, 1.0],
         _ => [0.0; 4],
     }
 }

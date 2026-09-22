@@ -1,15 +1,21 @@
 use std::collections::HashMap;
 
 use bevy::{
-    asset::RenderAssetUsages,
+    asset::{RenderAssetUsages, embedded_asset},
+    image::Image,
     mesh::Indices,
+    pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
-    render::render_resource::PrimitiveTopology,
+    render::render_resource::{AsBindGroup, PrimitiveTopology},
+    shader::ShaderRef,
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
 };
 use voxel_world::{
     AIR, CHUNK_SIZE, ChunkNeighborhood, DIRT, SAND, STONE, VoxelWorld, block_color, chunk_coord,
 };
+
+mod atlas;
+use atlas::texture_atlas;
 
 const MAX_JOBS: usize = 16;
 const STARTS_PER_FRAME: usize = 8;
@@ -35,7 +41,11 @@ pub struct VoxelRenderStats {
 pub struct MeshData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
+    /// rgb = blended material tint; a = blend weight toward the second
+    /// material id in `uvs.y` (0 for single-material vertices).
     pub colors: Vec<[f32; 4]>,
+    /// x = primary material id, y = secondary material id for texture blending.
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
 }
 
@@ -44,6 +54,7 @@ impl MeshData {
         self.positions.len() * 12
             + self.normals.len() * 12
             + self.colors.len() * 16
+            + self.uvs.len() * 8
             + self.indices.len() * 4
     }
 
@@ -56,6 +67,7 @@ impl MeshData {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
         .with_inserted_indices(Indices::U32(self.indices))
     }
 
@@ -68,7 +80,11 @@ impl MeshData {
             (origin + v).to_array(),
         ]);
         self.normals.extend([normal.to_array(); 4]);
-        self.colors.extend([block_color(material); 4]);
+        let mut color = block_color(material);
+        color[3] = 0.0; // alpha carries the secondary-material blend weight
+        self.colors.extend([color; 4]);
+        let m = material as f32;
+        self.uvs.extend([[m, m]; 4]);
         if u.cross(v).dot(normal) > 0.0 {
             self.indices
                 .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -295,7 +311,7 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                         second = Some((i as u8, distance));
                     }
                 }
-                let color = match second {
+                let (color, second_material) = match second {
                     Some((corner_index, second_distance)) => {
                         let other = neighborhood.block(corner(c, corner_index as usize));
                         let first_distance = (position
@@ -308,14 +324,21 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                             * (2.0 - second_distance / (first_distance + 1e-6)))
                         .clamp(0.0, 0.4);
                         let (a, b) = (block_color(material), block_color(other));
-                        [
-                            a[0] + (b[0] - a[0]) * blend,
-                            a[1] + (b[1] - a[1]) * blend,
-                            a[2] + (b[2] - a[2]) * blend,
-                            a[3] + (b[3] - a[3]) * blend,
-                        ]
+                        (
+                            [
+                                a[0] + (b[0] - a[0]) * blend,
+                                a[1] + (b[1] - a[1]) * blend,
+                                a[2] + (b[2] - a[2]) * blend,
+                                blend, // alpha carries the texture blend weight
+                            ],
+                            other,
+                        )
                     }
-                    None => block_color(material),
+                    None => {
+                        let mut color = block_color(material);
+                        color[3] = 0.0;
+                        (color, material)
+                    }
                 };
                 // Displace along the pre-displacement normal (kept as-is: the
                 // bump is sub-voxel, so recomputing the gradient buys nothing).
@@ -327,6 +350,7 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                 mesh.positions.push(position.to_array());
                 mesh.normals.push(normal.to_array());
                 mesh.colors.push(color);
+                mesh.uvs.push([material as f32, second_material as f32]);
             }
         }
     }
@@ -397,6 +421,7 @@ pub fn mesh_chunk(neighborhood: &ChunkNeighborhood) -> MeshData {
     mesh.positions.extend(placed.positions);
     mesh.normals.extend(placed.normals);
     mesh.colors.extend(placed.colors);
+    mesh.uvs.extend(placed.uvs);
     mesh.indices.extend(placed.indices.iter().map(|i| i + base));
     mesh
 }
@@ -405,17 +430,36 @@ pub struct VoxelRenderPlugin;
 
 impl Plugin for VoxelRenderPlugin {
     fn build(&self, app: &mut App) {
+        embedded_asset!(app, "crates/voxel_render/src", "terrain.wgsl");
         app.init_resource::<RenderFocus>()
             .init_resource::<VoxelRenderStats>()
             .init_resource::<Renderer>()
+            .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
             .add_systems(Startup, initialize_material)
             .add_systems(Update, update_chunks);
+    }
+}
+/// Triplanar terrain material: the standard PBR pipeline plus a grayscale
+/// noise atlas sampled by world position. Material ids ride in `uv0`; the
+/// secondary-material blend weight rides in vertex alpha.
+type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct TerrainExtension {
+    #[texture(100)]
+    #[sampler(101)]
+    atlas: Handle<Image>,
+}
+
+impl MaterialExtension for TerrainExtension {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://voxel_render/terrain.wgsl".into()
     }
 }
 
 #[derive(Resource, Default)]
 struct Renderer {
-    material: Handle<StandardMaterial>,
+    material: Handle<TerrainMaterial>,
     chunks: HashMap<IVec3, RenderedChunk>,
     jobs: Vec<MeshJob>,
 }
@@ -435,12 +479,18 @@ struct MeshJob {
 
 fn initialize_material(
     mut renderer: ResMut<Renderer>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
-    renderer.material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 0.95,
-        ..default()
+    renderer.material = materials.add(ExtendedMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.95,
+            ..default()
+        },
+        extension: TerrainExtension {
+            atlas: images.add(texture_atlas()),
+        },
     });
 }
 
@@ -705,11 +755,16 @@ mod tests {
             let min = Vec3::from_array(mesh.positions[start]).as_ivec3();
             let max = Vec3::from_array(mesh.positions[start + 2]).as_ivec3();
             let material = (1..=6)
-                .find(|&b| block_color(b) == mesh.colors[start])
+                .find(|&b| {
+                    let tint = block_color(b);
+                    mesh.colors[start][..3] == tint[..3]
+                })
                 .unwrap();
             for vertex in start..start + 4 {
                 assert_eq!(mesh.normals[vertex], normal.to_array());
-                assert_eq!(mesh.colors[vertex], block_color(material));
+                let mut expected = block_color(material);
+                expected[3] = 0.0; // alpha carries the blend weight
+                assert_eq!(mesh.colors[vertex], expected);
             }
             for j in min[v]..max[v] {
                 for i in min[u]..max[u] {
@@ -817,7 +872,7 @@ mod tests {
             }
             let normal = Vec3::from_array(mesh.normals[i]);
             assert!((normal.length() - 1.0).abs() < 1e-4);
-            assert_eq!(mesh.colors[i], block_color(STONE));
+            assert_eq!(mesh.colors[i][..3], block_color(STONE)[..3]);
             // The interior top surface sits just below y = 16; the missing -y
             // neighbor also yields a fallback bottom surface near y = -0.5.
             if position[0] > 1.0 && position[0] < 31.0 && position[2] > 1.0 && position[2] < 31.0
@@ -938,7 +993,16 @@ mod tests {
             if position[0] + position[1] > 30.0
                 && position.iter().all(|&c| c > 1.0 && c < 31.0)
             {
-                assert_eq!(mesh.colors[i], block_color(GRASS), "vertex at {position:?}");
+                // Surface material dominates; a small dirt blend is allowed.
+                let grass = block_color(GRASS);
+                let dirt = block_color(DIRT);
+                let to_grass: f32 = (0..3)
+                    .map(|c| (mesh.colors[i][c] - grass[c]).abs())
+                    .sum();
+                let to_dirt: f32 = (0..3)
+                    .map(|c| (mesh.colors[i][c] - dirt[c]).abs())
+                    .sum();
+                assert!(to_grass < to_dirt, "vertex at {position:?}");
                 matched += 1;
             }
         }
@@ -1005,9 +1069,11 @@ mod tests {
     fn renderer_app() -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::asset::AssetPlugin::default())
             .init_resource::<VoxelWorld>()
             .init_resource::<Assets<Mesh>>()
-            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<TerrainMaterial>>()
+            .init_resource::<Assets<Image>>()
             .add_plugins(VoxelRenderPlugin);
         app.update();
         app
