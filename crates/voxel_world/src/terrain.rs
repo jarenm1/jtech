@@ -11,7 +11,10 @@
 //! node once into a fixed scratch buffer, so per-column cost is proportional to
 //! the graph size and cannot grow from untrusted package input.
 
-use crate::{AIR, CHUNK_SIZE, Chunk, DIRT, GRASS, SAND, STONE, Storage, WORLD_MAX_Y, WORLD_MIN_Y};
+use crate::{
+    AIR, CHUNK_SIZE, Chunk, DENSITY_AIR, DENSITY_SOLID, DIRT, GRASS, SAND, STONE, Storage, Voxel,
+    WORLD_MAX_Y, WORLD_MIN_Y,
+};
 use glam::IVec3;
 use std::sync::Arc;
 
@@ -226,6 +229,9 @@ pub struct TerrainGenerator {
 pub struct TerrainSample {
     /// Topmost solid block of the column.
     pub height: i32,
+    /// Unclamped, unrounded graph height. The smooth density field crosses
+    /// zero at this world y; `height` is only its rounded, clamped form.
+    pub raw_height: f32,
     /// Biome rule that matched this column.
     pub biome: Biome,
     /// Surface block before the slope override applied during generation.
@@ -613,6 +619,7 @@ impl TerrainGenerator {
         (
             TerrainSample {
                 height,
+                raw_height: raw_height as f32,
                 biome: Biome(biome),
                 surface: definition.surface,
                 subsurface: definition.subsurface,
@@ -908,6 +915,152 @@ fn noise2(spec: &NoiseSpec, x: f64, z: f64, seed: u64) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Caves: seeded 3D value noise carving density below the surface
+// ---------------------------------------------------------------------------
+
+/// World blocks per lattice cell of the lowest cave octave.
+const CAVE_FREQUENCY: f64 = 0.02;
+const CAVE_OCTAVES: u8 = 3;
+/// fBm band that carves: below `CAVE_LO` nothing is removed, above `CAVE_HI`
+/// the full `CAVE_CARVE` is subtracted.
+const CAVE_LO: f64 = 0.62;
+const CAVE_HI: f64 = 0.8;
+/// Maximum density removed by a cave cell. Exceeds the i8 range so a fully
+/// developed cave opens even inside saturated stone.
+const CAVE_CARVE: f64 = 200.0;
+/// Carving fades in over this many blocks below the surface so the terrain
+/// skin is never swiss cheese.
+const CAVE_DEPTH_FADE: f64 = 4.0;
+const CAVE_SALT: u64 = 0xCA7E_5EED_CA7E_5EED;
+
+fn hash3(ix: i64, iy: i64, iz: i64, salt: u64) -> f64 {
+    let value = splitmix64(
+        (ix as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (iy as u64).wrapping_mul(0x85EB_CA6B_8F3B_5B4D)
+            ^ (iz as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ salt,
+    );
+    (value >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
+}
+
+fn value_noise3(x: f64, y: f64, z: f64, salt: u64) -> f64 {
+    const LIMIT: f64 = i64::MAX as f64 - 4096.0;
+    if !x.is_finite()
+        || !y.is_finite()
+        || !z.is_finite()
+        || x.abs() >= LIMIT
+        || y.abs() >= LIMIT
+        || z.abs() >= LIMIT
+    {
+        return f64::NAN;
+    }
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let z0 = z.floor();
+    let u = smooth01(x - x0);
+    let v = smooth01(y - y0);
+    let w = smooth01(z - z0);
+    let (ix, iy, iz) = (x0 as i64, y0 as i64, z0 as i64);
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    let z0_face = lerp(
+        lerp(
+            hash3(ix, iy, iz, salt),
+            hash3(ix + 1, iy, iz, salt),
+            u,
+        ),
+        lerp(
+            hash3(ix, iy + 1, iz, salt),
+            hash3(ix + 1, iy + 1, iz, salt),
+            u,
+        ),
+        v,
+    );
+    let z1_face = lerp(
+        lerp(
+            hash3(ix, iy, iz + 1, salt),
+            hash3(ix + 1, iy, iz + 1, salt),
+            u,
+        ),
+        lerp(
+            hash3(ix, iy + 1, iz + 1, salt),
+            hash3(ix + 1, iy + 1, iz + 1, salt),
+            u,
+        ),
+        v,
+    );
+    lerp(z0_face, z1_face, w)
+}
+
+fn cave_fbm(x: f64, y: f64, z: f64, seed: u64) -> f64 {
+    let mut frequency = CAVE_FREQUENCY;
+    let mut amplitude = 1.0f64;
+    let mut sum = 0.0f64;
+    let mut norm = 0.0f64;
+    let base_salt = seed ^ CAVE_SALT;
+    for octave in 0..CAVE_OCTAVES {
+        let salt = base_salt ^ (u64::from(octave)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        sum += value_noise3(x * frequency, y * frequency, z * frequency, salt) * amplitude;
+        norm += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    sum / norm
+}
+
+/// Upper bound of `cave_fbm` over the world box `[x, x+size) x [y, y+size) x
+/// [z, z+size)`. Value noise is a convex blend of lattice-corner hashes, so
+/// per octave the maximum corner hash over the covering lattice bounds the
+/// field everywhere inside. Lets generation keep the uniform-stone fast path
+/// only where no cave can reach the chunk.
+fn cave_fbm_max(x: i32, y: i32, z: i32, size: i32, seed: u64) -> f64 {
+    let mut frequency = CAVE_FREQUENCY;
+    let mut amplitude = 1.0f64;
+    let mut bound = 0.0f64;
+    let mut norm = 0.0f64;
+    let base_salt = seed ^ CAVE_SALT;
+    for octave in 0..CAVE_OCTAVES {
+        let salt = base_salt ^ (u64::from(octave)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let x0 = (f64::from(x) * frequency).floor() as i64;
+        let x1 = (f64::from(x + size - 1) * frequency).floor() as i64;
+        let y0 = (f64::from(y) * frequency).floor() as i64;
+        let y1 = (f64::from(y + size - 1) * frequency).floor() as i64;
+        let z0 = (f64::from(z) * frequency).floor() as i64;
+        let z1 = (f64::from(z + size - 1) * frequency).floor() as i64;
+        let mut octave_max = 0.0f64;
+        for iz in z0..=z1 + 1 {
+            for iy in y0..=y1 + 1 {
+                for ix in x0..=x1 + 1 {
+                    octave_max = octave_max.max(hash3(ix, iy, iz, salt));
+                }
+            }
+        }
+        bound += octave_max * amplitude;
+        norm += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    bound / norm
+}
+
+/// Signed terrain density at one world voxel: a ramp crossing zero at
+/// `raw_height`, saturated before caves carve so tunnels open at any depth.
+fn terrain_density(x: i64, y: i64, z: i64, raw_height: f32, seed: u64) -> i8 {
+    let base = ((f64::from(raw_height) - y as f64) * 64.0)
+        .max(f64::from(DENSITY_AIR))
+        .min(f64::from(DENSITY_SOLID));
+    let depth = f64::from(raw_height) - CAVE_DEPTH_FADE - y as f64;
+    if base <= f64::from(DENSITY_AIR) || depth <= 0.0 {
+        return base as i8;
+    }
+    let band = (cave_fbm(x as f64, y as f64, z as f64, seed) - CAVE_LO) / (CAVE_HI - CAVE_LO);
+    if band <= 0.0 {
+        return base as i8;
+    }
+    let carve = smooth01(band.min(1.0)) * CAVE_CARVE * (depth / CAVE_DEPTH_FADE).min(1.0);
+    (base - carve).max(f64::from(DENSITY_AIR)) as i8
+}
+
+// ---------------------------------------------------------------------------
 // Column sampling and chunk filling
 // ---------------------------------------------------------------------------
 
@@ -950,8 +1103,21 @@ impl ColumnGrid {
     }
 }
 
-/// Fill one chunk from a compiled generator. Empty and solid chunks collapse to
-/// a uniform storage without touching individual cells.
+/// Per-column material bands resolved once per chunk: `cap` is the topmost
+/// voxel that can hold solid density (`ceil(raw_height) - 1`), `soil_bottom`
+/// the first y of the stone layer.
+#[derive(Clone, Copy)]
+struct Column {
+    raw_height: f32,
+    cap: i32,
+    soil_bottom: i32,
+    surface: u8,
+    subsurface: u8,
+}
+
+/// Fill one chunk from a compiled generator. Chunks whose density is provably
+/// saturated and uncarved collapse to uniform storage without touching
+/// individual cells; everything else writes full voxel state.
 pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerator) -> Chunk {
     if coord.y < crate::MIN_CHUNK_Y {
         return Chunk {
@@ -969,23 +1135,39 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
     let (min_height, max_height) = grid.interior_bounds();
     let base_y = coord.y * CHUNK_SIZE;
     let top_y = base_y + CHUNK_SIZE - 1;
-    if base_y > max_height {
+    // raw_height < height + 0.5, so three blocks above the tallest column the
+    // density ramp has saturated at DENSITY_AIR and caves never reach.
+    if base_y >= max_height + 3 {
         return Chunk {
             revision: 0,
             storage: Storage::Uniform(AIR),
         };
     }
-    if top_y < min_height - i32::from(MAX_SOIL_DEPTH) {
+    // Uniform stone requires every voxel saturated solid (top_y at least two
+    // below the lowest raw surface), below every soil band, and beyond the
+    // reach of any cave cell.
+    if top_y < min_height - i32::from(MAX_SOIL_DEPTH) - 1
+        && cave_fbm_max(
+            coord.x * CHUNK_SIZE,
+            base_y,
+            coord.z * CHUNK_SIZE,
+            CHUNK_SIZE,
+            seed,
+        ) <= CAVE_LO
+    {
         return Chunk {
             revision: 0,
             storage: Storage::Uniform(STONE),
         };
     }
     let stone_slope = generator.stone_slope();
-    let mut chunk = Chunk {
-        revision: 0,
-        storage: Storage::Uniform(AIR),
-    };
+    let mut columns = [Column {
+        raw_height: 0.0,
+        cap: 0,
+        soil_bottom: 0,
+        surface: AIR,
+        subsurface: AIR,
+    }; (CHUNK_SIZE * CHUNK_SIZE) as usize];
     for local_z in 0..CHUNK_SIZE {
         for local_x in 0..CHUNK_SIZE {
             let sample = grid.at(local_x, local_z);
@@ -995,22 +1177,54 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
             } else {
                 (sample.surface, sample.subsurface, i32::from(sample.soil))
             };
-            let surface_y = sample.height;
-            let soil_bottom = surface_y - soil;
-            for local_y in 0..CHUNK_SIZE {
-                let world_y = base_y + local_y;
-                let block = if world_y > surface_y {
+            // `cap` is the topmost voxel that can hold solid density; clamping
+            // to `height` keeps the surface band at the world ceiling when the
+            // raw graph height overshoots the clamp.
+            let cap = ((f64::from(sample.raw_height).ceil() - 1.0) as i32).min(sample.height);
+            columns[(local_z * CHUNK_SIZE + local_x) as usize] = Column {
+                raw_height: sample.raw_height,
+                cap,
+                soil_bottom: cap.saturating_sub(soil),
+                surface,
+                subsurface,
+            };
+        }
+    }
+    let base_x = i64::from(coord.x) * i64::from(CHUNK_SIZE);
+    let base_z = i64::from(coord.z) * i64::from(CHUNK_SIZE);
+    let mut chunk = Chunk {
+        revision: 0,
+        storage: Storage::Uniform(AIR),
+    };
+    for local_y in 0..CHUNK_SIZE {
+        let world_y = base_y + local_y;
+        for local_z in 0..CHUNK_SIZE {
+            for local_x in 0..CHUNK_SIZE {
+                let column = columns[(local_z * CHUNK_SIZE + local_x) as usize];
+                let density = terrain_density(
+                    base_x + i64::from(local_x),
+                    i64::from(world_y),
+                    base_z + i64::from(local_z),
+                    column.raw_height,
+                    seed,
+                );
+                let material = if density <= 0 {
                     AIR
-                } else if world_y == surface_y {
-                    surface
-                } else if world_y >= soil_bottom {
-                    subsurface
+                } else if world_y >= column.cap {
+                    column.surface
+                } else if world_y >= column.soil_bottom {
+                    column.subsurface
                 } else {
                     STONE
                 };
-                if block != AIR {
-                    chunk.set(crate::index(IVec3::new(local_x, local_y, local_z)), block);
-                }
+                chunk.set_voxel(
+                    crate::index(IVec3::new(local_x, local_y, local_z)),
+                    Voxel {
+                        material,
+                        density,
+                        placed: false,
+                    },
+                );
             }
         }
     }
@@ -1319,7 +1533,8 @@ mod tests {
     fn chunk_layering_is_slope_aware_and_has_no_wood() {
         let generator = TerrainGenerator::default();
         let probe = generator.sample(5, 5, 3);
-        let coord = IVec3::new(0, probe.height.div_euclid(CHUNK_SIZE), 0);
+        let probe_cap = (probe.raw_height.ceil() as i32 - 1).min(probe.height);
+        let coord = IVec3::new(0, probe_cap.div_euclid(CHUNK_SIZE), 0);
         let chunk = Chunk::generate_with(coord, 3, &generator);
         let mut checked_surface = false;
         for local_z in 0..CHUNK_SIZE {
@@ -1327,18 +1542,36 @@ mod tests {
                 let world_x = i64::from(local_x);
                 let world_z = i64::from(local_z);
                 let sample = generator.sample(world_x, world_z, 3);
-                let chunk_local_y = sample.height - coord.y * CHUNK_SIZE;
-                if !(0..CHUNK_SIZE).contains(&chunk_local_y) {
-                    continue;
+                let cap = (sample.raw_height.ceil() as i32 - 1).min(sample.height);
+                // The topmost solid voxel is cap or cap - 1: a raw_height
+                // just above an integer truncates the cap's ramp density to 0.
+                let mut top = None;
+                for local_y in (0..CHUNK_SIZE).rev() {
+                    let local = IVec3::new(local_x, local_y, local_z);
+                    if chunk.density(local) > 0 {
+                        top = Some((local_y, local));
+                        break;
+                    }
                 }
-                let surface = chunk.get(IVec3::new(local_x, chunk_local_y, local_z));
-                assert_ne!(surface, AIR, "surface column missing a block");
-                if chunk_local_y + 1 < CHUNK_SIZE {
-                    assert_eq!(
-                        chunk.get(IVec3::new(local_x, chunk_local_y + 1, local_z)),
-                        AIR,
-                        "air must sit above the surface"
-                    );
+                let Some((top_y, top_local)) = top else {
+                    continue;
+                };
+                let world_top = coord.y * CHUNK_SIZE + top_y;
+                assert!(
+                    world_top >= cap - 1,
+                    "top solid at {world_top} fell below cap - 1 = {}",
+                    cap - 1
+                );
+                let density = chunk.density(top_local);
+                assert!(
+                    density < DENSITY_SOLID,
+                    "surface density {density} is saturated, not a ramp value"
+                );
+                assert_ne!(chunk.get(top_local), AIR, "surface column missing a block");
+                for local_y in top_y + 1..CHUNK_SIZE {
+                    let above = IVec3::new(local_x, local_y, local_z);
+                    assert!(chunk.density(above) <= 0);
+                    assert_eq!(chunk.get(above), AIR, "air must sit above the surface");
                 }
                 checked_surface = true;
             }
@@ -1367,22 +1600,38 @@ mod tests {
                     let chunk = Chunk::generate_with(coord, 11, &generator);
                     for z in [0, 1, 30, 31] {
                         for x in [0, 1, 30, 31] {
-                            let height = cx * CHUNK_SIZE + x + cz * CHUNK_SIZE + z;
+                            let world_x = i64::from(cx * CHUNK_SIZE + x);
+                            let world_z = i64::from(cz * CHUNK_SIZE + z);
+                            let raw = (world_x + world_z) as f32;
+                            let cap = raw.ceil() as i32 - 1;
                             for y in 0..CHUNK_SIZE {
                                 let wy = cy * CHUNK_SIZE + y;
-                                let expected = if wy > height {
+                                let local = IVec3::new(x, y, z);
+                                // Above the carve fade the density is the pure
+                                // height ramp; deeper down caves may subtract.
+                                let density = chunk.density(local);
+                                if wy >= cap - 3 {
+                                    let expected = ((raw - wy as f32) * 64.0)
+                                        .clamp(f32::from(DENSITY_AIR), f32::from(DENSITY_SOLID))
+                                        as i8;
+                                    assert_eq!(
+                                        density, expected,
+                                        "coord={coord} local=({x},{y},{z}) raw={raw}"
+                                    );
+                                }
+                                let expected = if density <= 0 {
                                     AIR
-                                } else if wy == height {
+                                } else if wy >= cap {
                                     GRASS
-                                } else if wy >= height - 2 {
+                                } else if wy >= cap - 2 {
                                     DIRT
                                 } else {
                                     STONE
                                 };
                                 assert_eq!(
-                                    chunk.get(IVec3::new(x, y, z)),
+                                    chunk.get(local),
                                     expected,
-                                    "coord={coord} local=({x},{y},{z}) height={height}"
+                                    "coord={coord} local=({x},{y},{z}) raw={raw}"
                                 );
                             }
                         }
@@ -1457,18 +1706,24 @@ mod tests {
         assert!(TerrainGenerator::compile(spec(bad_noise)).is_err());
     }
 
-    #[test]
     fn constant_graph_builds_a_flat_world() {
         let generator = TerrainGenerator::compile(spec(constant(40.0))).unwrap();
         let sample = generator.sample(-9, 12345, 0);
         assert_eq!(sample.height, 40);
+        assert_eq!(sample.raw_height, 40.0);
         assert_eq!(sample.surface, GRASS);
         assert_eq!(sample.subsurface, DIRT);
+        // raw_height 40 puts the density zero-crossing exactly on y=40: the
+        // cap voxel at y=39 carries the surface material and a half-ramp
+        // density, y=40 is air.
         let chunk = Chunk::generate_with(IVec3::new(0, 1, 0), 0, &generator);
-        assert_eq!(chunk.get(IVec3::new(0, 8, 0)), GRASS);
-        assert_eq!(chunk.get(IVec3::new(0, 7, 0)), DIRT);
+        assert_eq!(chunk.get(IVec3::new(0, 8, 0)), AIR);
+        assert_eq!(chunk.density(IVec3::new(0, 8, 0)), 0);
+        assert_eq!(chunk.get(IVec3::new(0, 7, 0)), GRASS);
+        assert_eq!(chunk.density(IVec3::new(0, 7, 0)), 64);
+        assert_eq!(chunk.get(IVec3::new(0, 6, 0)), DIRT);
+        assert_eq!(chunk.get(IVec3::new(0, 5, 0)), DIRT);
         assert_eq!(chunk.get(IVec3::new(0, 4, 0)), STONE);
-        assert_eq!(chunk.get(IVec3::new(0, 9, 0)), AIR);
     }
     #[test]
     fn mask_primitives_have_correct_edges_and_midpoints() {
@@ -1507,10 +1762,58 @@ mod tests {
             let generator = TerrainGenerator::compile(spec(constant(height))).unwrap();
             let coord = IVec3::new(0, height as i32 / CHUNK_SIZE - 1, 0);
             let chunk = Chunk::generate_with(coord, 0, &generator);
-            assert_eq!(chunk.get(IVec3::new(0, 31, 0)), DIRT);
+            // Integer raw_height puts the cap voxel at height - 1; the soil
+            // band sits directly under it.
+            assert_eq!(chunk.get(IVec3::new(0, 31, 0)), GRASS);
             assert_eq!(chunk.get(IVec3::new(0, 30, 0)), DIRT);
-            assert_eq!(chunk.get(IVec3::new(0, 29, 0)), STONE);
+            assert_eq!(chunk.get(IVec3::new(0, 29, 0)), DIRT);
+            assert_eq!(chunk.get(IVec3::new(0, 28, 0)), STONE);
         }
+    }
+
+    #[test]
+    fn caves_carve_air_pockets_below_the_surface() {
+        let generator = TerrainGenerator::default();
+        let mut found = false;
+        'outer: for seed in [0u64, 1, 7, 42, 2024] {
+            for coord in [
+                IVec3::new(0, -1, 0),
+                IVec3::new(0, -2, 0),
+                IVec3::new(1, -1, 0),
+                IVec3::new(-1, -2, 1),
+                IVec3::new(2, -3, -1),
+            ] {
+                let chunk = Chunk::generate_with(coord, seed, &generator);
+                if matches!(chunk.storage, Storage::Uniform(_)) {
+                    continue;
+                }
+                for local_z in 0..CHUNK_SIZE {
+                    for local_x in 0..CHUNK_SIZE {
+                        let sample = generator.sample(
+                            i64::from(coord.x * CHUNK_SIZE + local_x),
+                            i64::from(coord.z * CHUNK_SIZE + local_z),
+                            seed,
+                        );
+                        let cap = sample.raw_height.ceil() as i32 - 1;
+                        for local_y in 0..CHUNK_SIZE {
+                            let world_y = coord.y * CHUNK_SIZE + local_y;
+                            // Air strictly below the cap is a carved pocket:
+                            // without caves every voxel under the cap is solid.
+                            if world_y < cap
+                                && chunk.get(IVec3::new(local_x, local_y, local_z)) == AIR
+                            {
+                                assert!(
+                                    chunk.density(IVec3::new(local_x, local_y, local_z)) <= 0
+                                );
+                                found = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found, "no cave pocket found across seeds and chunks");
     }
 
     #[test]
