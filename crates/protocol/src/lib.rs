@@ -7,7 +7,7 @@ use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -141,6 +141,8 @@ pub enum ServerMessage {
         revision: u64,
         packages: Vec<PackageStatus>,
         bow_shots_per_second: u32,
+        /// Merged melee weapon table across loaded melee packages.
+        melee_weapons: Vec<MeleeWeaponInfo>,
     },
     /// Authoritative owned-item counts for the receiving player, sent reliably on change.
     Inventory {
@@ -167,6 +169,27 @@ pub struct PackageStatus {
     pub generation: u64,
     pub state: PackageState,
     pub error: Option<String>,
+}
+
+/// How an item behaves in inventories: stackable resources merge counts;
+/// equipment is unique — a player carries at most one and it drops on death.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ItemKind {
+    Stack,
+    Equipment,
+}
+
+/// One authored melee weapon as clients need it: display name plus the swing
+/// parameters used for crosshair routing and future combat UI.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MeleeWeaponInfo {
+    pub item: u8,
+    pub name: String,
+    pub kind: ItemKind,
+    pub range: f32,
+    pub damage: u16,
+    pub cooldown_ticks: u32,
+    pub knockback: f32,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PhysicsBodySnapshot {
@@ -431,16 +454,13 @@ mod tests {
 
     #[test]
     fn inventory_decode_rejects_malformed_stacks() {
-        // Item 0, zero counts and duplicate ids are not valid inventories.
-        for entries in [
-            vec![(0_u8, 5_u32)],
-            vec![(3, 0)],
-            vec![(3, 1), (3, 2)],
-        ] {
+        // Item 0 and zero counts are not valid inventories; duplicate ids are
+        // legal because equipment occupies one entry per instance.
+        for entries in [vec![(0_u8, 5_u32)], vec![(3, 0)]] {
             let bytes = encode(&entries, MAX_FRAME).unwrap();
             assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_err());
         }
-        let bytes = encode(&vec![(3_u8, 5_u32), (7, 2)], MAX_FRAME).unwrap();
+        let bytes = encode(&vec![(3_u8, 5_u32), (7, 1), (7, 1)], MAX_FRAME).unwrap();
         assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_ok());
     }
 

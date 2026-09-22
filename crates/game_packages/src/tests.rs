@@ -15,11 +15,19 @@ impl Fixture {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(root.join(BOW_PACKAGE)).unwrap();
+        fs::create_dir_all(&root).unwrap();
         Self(root)
     }
+    fn package(&self, id: &str) -> PathBuf {
+        let directory = self.0.join(id);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
     fn write(&self, source: &str) {
-        fs::write(self.0.join(BOW_PACKAGE).join("server.scm"), source).unwrap();
+        fs::write(self.package(BOW_PACKAGE).join("server.scm"), source).unwrap();
+    }
+    fn write_package(&self, id: &str, source: &str) {
+        fs::write(self.package(id).join("server.scm"), source).unwrap();
     }
 }
 impl Drop for Fixture {
@@ -37,9 +45,17 @@ fn compile(source: &str) -> Result<BowPackage, String> {
         1,
     )
 }
+
+fn status(host: &PackageHost, id: &str) -> PackageStatus {
+    host.statuses()
+        .into_iter()
+        .find(|status| status.id == id)
+        .unwrap_or_else(|| panic!("no package slot {id}"))
+}
+
 fn drain(host: &mut PackageHost) {
     let deadline = Instant::now() + Duration::from_secs(15);
-    while host.pending.is_some() {
+    while host.slots.values().any(|slot| slot.pending.is_some()) {
         assert!(Instant::now() < deadline, "package loader did not finish");
         std::thread::sleep(Duration::from_millis(5));
         host.poll();
@@ -85,11 +101,11 @@ fn edited_package_changes_new_shots_and_retains_in_flight_generation() {
             .replace("second 25", "second 10"),
     );
     poll_disk(&mut host);
-    assert_eq!(host.status.state, PackageState::Reloading);
-    assert_eq!(host.status.generation, 1);
+    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Reloading);
+    assert_eq!(status(&host, BOW_PACKAGE).generation, 1);
     drain(&mut host);
-    assert_eq!(host.status.state, PackageState::Loaded);
-    assert_eq!(host.status.generation, 2);
+    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Loaded);
+    assert_eq!(status(&host, BOW_PACKAGE).generation, 2);
     assert_eq!(host.shots_per_second(), 10);
     let new = host.fire(BowPower::Standard).unwrap();
     assert_eq!(new.projectile.speed, 48.0);
@@ -107,9 +123,9 @@ fn failed_reload_retains_last_good_package_and_recovers_after_save() {
     fixture.write("(define broken");
     poll_disk(&mut host);
     drain(&mut host);
-    assert_eq!(host.status.state, PackageState::Error);
-    assert!(host.status.error.is_some());
-    assert_eq!(host.status.generation, 1);
+    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Error);
+    assert!(status(&host, BOW_PACKAGE).error.is_some());
+    assert_eq!(status(&host, BOW_PACKAGE).generation, 1);
     assert_eq!(
         host.fire(BowPower::Standard).unwrap().impact().energy,
         6000.0
@@ -120,21 +136,21 @@ fn failed_reload_retains_last_good_package_and_recovers_after_save() {
     fixture.write(BOW);
     poll_disk(&mut host);
     drain(&mut host);
-    assert_eq!(host.status.state, PackageState::Loaded);
-    assert!(host.status.error.is_none());
-    assert_eq!(host.status.generation, 2);
+    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Loaded);
+    assert!(status(&host, BOW_PACKAGE).error.is_none());
+    assert_eq!(status(&host, BOW_PACKAGE).generation, 2);
 }
 
 #[test]
 fn missing_initial_package_disables_bow_until_created() {
     let fixture = Fixture::new();
     let mut host = PackageHost::new(&fixture.0);
-    assert_eq!(host.status.state, PackageState::Error);
+    assert!(host.statuses().is_empty());
     assert_eq!(host.shots_per_second(), 0);
     assert!(host.fire(BowPower::Low).is_err());
     fixture.write(BOW);
     poll_disk(&mut host);
-    assert_eq!(host.status.state, PackageState::Loading);
+    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Loading);
     drain(&mut host);
     assert!(host.fire(BowPower::Low).is_ok());
 }
@@ -152,7 +168,7 @@ fn a_second_save_supersedes_an_unpublished_candidate() {
         host.fire(BowPower::Standard).unwrap().projectile.speed,
         50.0
     );
-    assert_eq!(host.status.generation, 2);
+    assert_eq!(status(&host, BOW_PACKAGE).generation, 2);
 }
 
 #[test]
@@ -185,6 +201,72 @@ fn runaway_callback_is_interrupted() {
 fn package_host_is_a_thread_safe_simulation_resource() {
     fn require_send_sync<T: Send + Sync>() {}
     require_send_sync::<PackageHost>();
+}
+
+const MELEE: &str = include_str!("../../../packages/melee/server.scm");
+
+fn compile_melee(source: &str) -> Result<Package, String> {
+    let fixture = Fixture::new();
+    let path = fixture.package("melee").join("server.scm");
+    fs::write(&path, source).unwrap();
+    Package::compile(source.to_owned(), path, 1)
+}
+
+#[test]
+fn melee_package_registers_weapons_and_spawn_items() {
+    let Package::Melee(package) = compile_melee(MELEE).unwrap() else {
+        panic!("melee source compiled to another kind");
+    };
+    assert_eq!(package.weapons.len(), 3);
+    assert_eq!(package.weapons[0].id, 7);
+    assert_eq!(package.weapons[0].name, "Knife");
+    assert_eq!(package.weapons[0].spec.damage, 8);
+    assert_eq!(package.spawn_items, vec![(7, 1), (8, 1), (9, 1)]);
+}
+
+#[test]
+fn melee_packages_merge_and_conflicting_ids_error_the_later_package() {
+    const BLADE: &str = r#"
+(define package-api-version 1)
+(define package-kind "melee")
+(define weapons (list (melee-weapon 10 "Blade" 3.0 12 24 300.0)))
+(define spawn-items (list (list 10 1)))
+"#;
+    let fixture = Fixture::new();
+    fixture.write_package("melee", MELEE);
+    fixture.write_package("z-blade", BLADE);
+    let mut host = PackageHost::new(&fixture.0);
+    let table = host.melee_table();
+    assert!(table.spec(7).is_some() && table.spec(10).is_some());
+    assert_eq!(table.spawn_items(), &[(7, 1), (8, 1), (9, 1), (10, 1)]);
+
+    // Sorted order: "melee" claims id 7 first; the conflicting reload of
+    // "z-blade" errors while the winner stays loaded.
+    fixture.write_package("z-blade", &BLADE.replace("10", "7"));
+    poll_disk(&mut host);
+    drain(&mut host);
+    let conflict = status(&host, "z-blade");
+    assert_eq!(conflict.state, PackageState::Error);
+    assert!(conflict.error.unwrap().contains("item id 7"));
+    assert!(host.melee_table().spec(7).is_some());
+}
+
+#[test]
+fn invalid_melee_packages_are_rejected() {
+    for (from, to) in [
+        ("(melee-weapon 7", "(melee-weapon 6"),
+        ("(melee-weapon 7", "(melee-weapon 7.5"),
+        ("2.5 8 18", "2.5 8 18.5"),
+        ("2.5 8 18", "20.0 8 18"),
+        ("(list 7 1)", "(list 7 0)"),
+        ("(list 9 1)", "(list 42 1)"),
+        ("\"melee\"", "\"sword\""),
+    ] {
+        assert!(
+            compile_melee(&MELEE.replace(from, to)).is_err(),
+            "accepted {from} -> {to}"
+        );
+    }
 }
 
 const TERRAIN: &str = include_str!("../../../packages/terrain/server.scm");

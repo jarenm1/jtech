@@ -2281,7 +2281,9 @@ dependencies = [
 name = "game_packages"
 version = "0.1.0"
 dependencies = [
+ "gameplay",
  "glam",
+ "parking_lot",
  "protocol",
  "steel-core",
  "voxel_world",

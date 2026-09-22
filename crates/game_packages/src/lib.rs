@@ -1,22 +1,34 @@
 //! Server-side Steel packages. Native simulation owns entities and physics;
-//! Scheme authors validated native weapon policies during package loading.
+//! Scheme authors validated native policies during package loading.
+//!
+//! Every subdirectory of the packages root (except the startup-only terrain
+//! package) is a live-reloadable package slot. Each `server.scm` declares a
+//! `package-kind`; the host compiles it into the matching native policy and
+//! merges contributions into shared views the simulation reads. Two packages
+//! may both author melee weapons: their item ids merge into one table, and a
+//! conflicting id rejects the later package in sorted order.
 mod budget;
 mod terrain;
 
 pub use terrain::{TERRAIN_PACKAGE, load_terrain};
 
 use budget::Budget;
+use gameplay::combat::MeleeSpec;
+use parking_lot::Mutex;
 use protocol::{BowPower, PackageState, PackageStatus};
 use std::{
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 use steel::{SteelVal, steel_vm::engine::Engine};
 
+/// Directory name of the bow package; also the id clients display for it.
 pub const BOW_PACKAGE: &str = "explosive-bow";
+
 const MAX_SOURCE_BYTES: u64 = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CALLBACK_BUDGET: Duration = Duration::from_millis(20);
@@ -25,6 +37,8 @@ const API: &str = "
 (define (projectile speed gravity travel lifetime) (list speed gravity travel lifetime))
 (define (explosion radius energy player-speed absorbed pulse)
   (list radius energy player-speed absorbed pulse))
+(define (melee-weapon id name range damage cooldown-ticks knockback)
+  (list id name range damage cooldown-ticks knockback))
 ";
 
 /// Prefer packages beside the executable, then the working directory. The final
@@ -106,17 +120,17 @@ fn diagnostic(engine: &Engine, error: steel::SteelErr) -> String {
     let fallback = error.to_string();
     engine.raise_error_to_string(error).unwrap_or(fallback)
 }
-/// Immutable policy for the four network power presets. The VM is discarded
-/// after loading; simulation ticks only read validated native values.
-pub struct BowPackage {
-    generation: u64,
-    shots_per_second: u32,
-    projectiles: [ProjectileSpec; 4],
-    blasts: [BlastSpec; 4],
+
+/// A compiled package. The VM is discarded after loading; simulation ticks only
+/// read validated native values.
+#[derive(Clone)]
+enum Package {
+    Bow(Arc<BowPackage>),
+    Melee(Arc<MeleePackage>),
 }
 
-impl BowPackage {
-    pub fn compile(source: String, path: PathBuf, generation: u64) -> Result<Self, String> {
+impl Package {
+    fn compile(source: String, path: PathBuf, generation: u64) -> Result<Self, String> {
         let mut vm = Vm::new()?;
         vm.run(LOAD_BUDGET, |engine| {
             engine.run(API).map_err(|error| diagnostic(engine, error))?;
@@ -132,6 +146,50 @@ impl BowPackage {
         if !matches!(api, SteelVal::IntV(1)) {
             return Err("package-api-version must be 1".into());
         }
+        let kind = vm
+            .engine
+            .extract_value("package-kind")
+            .map_err(|_| "package-kind must be a string".to_string())?;
+        let SteelVal::StringV(kind) = kind else {
+            return Err("package-kind must be a string".into());
+        };
+        match kind.as_str() {
+            "bow" => Ok(Self::Bow(Arc::new(BowPackage::from_vm(
+                &mut vm, generation,
+            )?))),
+            "melee" => Ok(Self::Melee(Arc::new(MeleePackage::from_vm(
+                &mut vm, generation,
+            )?))),
+            other => Err(format!("unknown package-kind {other:?}")),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Bow(package) => package.generation,
+            Self::Melee(package) => package.generation,
+        }
+    }
+}
+
+/// Immutable policy for the four network power presets.
+pub struct BowPackage {
+    generation: u64,
+    shots_per_second: u32,
+    projectiles: [ProjectileSpec; 4],
+    blasts: [BlastSpec; 4],
+}
+
+impl BowPackage {
+    /// Compile a standalone bow package; `package-kind` must be `"bow"`.
+    pub fn compile(source: String, path: PathBuf, generation: u64) -> Result<Self, String> {
+        match Package::compile(source, path, generation)? {
+            Package::Bow(package) => Ok((*package).clone()),
+            _ => unreachable!("kind dispatch returned a non-bow package"),
+        }
+    }
+
+    fn from_vm(vm: &mut Vm, generation: u64) -> Result<Self, String> {
         let rate = vm
             .engine
             .extract_value("shots-per-second")
@@ -159,6 +217,17 @@ impl BowPackage {
     }
     pub fn impact(&self, power: BowPower) -> BlastSpec {
         self.blasts[power as usize]
+    }
+}
+
+impl Clone for BowPackage {
+    fn clone(&self) -> Self {
+        Self {
+            generation: self.generation,
+            shots_per_second: self.shots_per_second,
+            projectiles: self.projectiles,
+            blasts: self.blasts,
+        }
     }
 }
 
@@ -201,6 +270,154 @@ fn blast_spec(value: SteelVal) -> Result<BlastSpec, String> {
     })
 }
 
+/// A melee weapon one package contributes to the shared item table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeleeWeapon {
+    /// Item id; must exceed `protocol::EXPLOSIVE_BOW_ITEM` so it cannot shadow
+    /// hands, block materials, or the bow.
+    pub id: u8,
+    /// Display name for logs and a future presentation API.
+    pub name: String,
+    pub spec: MeleeSpec,
+}
+
+/// Immutable melee policy: authored weapons plus the items granted to every
+/// player on spawn and respawn.
+pub struct MeleePackage {
+    generation: u64,
+    weapons: Vec<MeleeWeapon>,
+    spawn_items: Vec<(u8, u32)>,
+}
+
+impl MeleePackage {
+    fn from_vm(vm: &mut Vm, generation: u64) -> Result<Self, String> {
+        let value = vm
+            .engine
+            .extract_value("weapons")
+            .map_err(|_| "weapons must be a list of melee-weapon values".to_string())?;
+        let SteelVal::ListV(entries) = value else {
+            return Err("weapons must be a list of melee-weapon values".into());
+        };
+        let mut weapons = Vec::with_capacity(entries.len());
+        let mut seen = HashSet::new();
+        for entry in entries.iter() {
+            let weapon = melee_weapon(entry.clone())?;
+            if !seen.insert(weapon.id) {
+                return Err(format!("weapons declares item id {} twice", weapon.id));
+            }
+            weapons.push(weapon);
+        }
+        let spawn_items = match vm.engine.extract_value("spawn-items") {
+            Ok(SteelVal::ListV(entries)) => entries
+                .iter()
+                .map(|entry| spawn_item(entry.clone()))
+                .collect::<Result<_, _>>()?,
+            Ok(_) => return Err("spawn-items must be a list of (id count) pairs".into()),
+            Err(_) => Vec::new(),
+        };
+        let registered: HashSet<u8> = weapons.iter().map(|weapon| weapon.id).collect();
+        for &(item, _) in &spawn_items {
+            if !registered.contains(&item) {
+                return Err(format!(
+                    "spawn-items grants item {item} that this package does not register"
+                ));
+            }
+        }
+        Ok(Self {
+            generation,
+            weapons,
+            spawn_items,
+        })
+    }
+}
+
+fn melee_weapon(value: SteelVal) -> Result<MeleeWeapon, String> {
+    let SteelVal::ListV(fields) = value else {
+        return Err("each weapon must be a melee-weapon value".into());
+    };
+    if fields.len() != 6 {
+        return Err("melee-weapon takes id, name, range, damage, cooldown-ticks, knockback".into());
+    }
+    let id = integer(&fields[0], "weapon id")?;
+    if !(0..=u8::MAX as isize).contains(&id) || id as u8 <= protocol::EXPLOSIVE_BOW_ITEM {
+        return Err(format!(
+            "weapon id must be an integer in {}..=255",
+            protocol::EXPLOSIVE_BOW_ITEM + 1
+        ));
+    }
+    let SteelVal::StringV(name) = &fields[1] else {
+        return Err("weapon name must be a string".into());
+    };
+    let name: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect();
+    if name.is_empty() {
+        return Err("weapon name must not be empty".into());
+    }
+    let range = number(&fields[2], "weapon range")?;
+    let damage = integer(&fields[3], "weapon damage")?;
+    let cooldown = integer(&fields[4], "weapon cooldown ticks")?;
+    let knockback = number(&fields[5], "weapon knockback")?;
+    let spec = MeleeSpec {
+        range,
+        damage: u16::try_from(damage).unwrap_or(u16::MAX),
+        cooldown_ticks: u32::try_from(cooldown).unwrap_or(u32::MAX),
+        knockback,
+    }
+    .bounded()
+    .ok_or_else(|| {
+        format!(
+            "weapon {name} tuning out of range: range 0.1..=16, damage 1..=65535, \
+             cooldown 0..=600 ticks, knockback 0..=10000"
+        )
+    })?;
+    Ok(MeleeWeapon {
+        id: id as u8,
+        name,
+        spec,
+    })
+}
+
+fn spawn_item(value: SteelVal) -> Result<(u8, u32), String> {
+    let SteelVal::ListV(pair) = value else {
+        return Err("spawn-items entries must be (id count) pairs".into());
+    };
+    if pair.len() != 2 {
+        return Err("spawn-items entries must be (id count) pairs".into());
+    }
+    let id = integer(&pair[0], "spawn item id")?;
+    let count = integer(&pair[1], "spawn item count")?;
+    if !(0..=u8::MAX as isize).contains(&id) {
+        return Err("spawn item id must be an integer in 0..=255".into());
+    }
+    // Equipment grants one inventory entry per count; keep the loadout bounded.
+    if !(1..=64).contains(&count) {
+        return Err("spawn item count must be an integer in 1..=64".into());
+    }
+    Ok((id as u8, count as u32))
+}
+
+fn integer(value: &SteelVal, name: &str) -> Result<isize, String> {
+    match value {
+        SteelVal::IntV(value) => Ok(*value),
+        _ => Err(format!("{name} must be an integer")),
+    }
+}
+
+fn number(value: &SteelVal, name: &str) -> Result<f32, String> {
+    let value = match value {
+        SteelVal::IntV(value) => *value as f32,
+        SteelVal::NumV(value) => *value as f32,
+        _ => return Err(format!("{name} must be a real number")),
+    };
+    if !value.is_finite() {
+        return Err(format!("{name} must be finite"));
+    }
+    Ok(value)
+}
+
 fn numbers<const N: usize>(value: SteelVal, callback: &str) -> Result<[f32; N], String> {
     let SteelVal::ListV(values) = value else {
         return Err(format!("{callback} must return a list of {N} numbers"));
@@ -230,6 +447,42 @@ fn bound(name: &str, value: f32, min: f32, max: f32) -> Result<(), String> {
     }
 }
 
+/// Merged melee view across every loaded melee package. Item ids are unique
+/// across packages: the host rejects a package whose ids collide with an
+/// already-loaded one.
+#[derive(Clone, Default)]
+pub struct MeleeTable {
+    weapons: Arc<HashMap<u8, MeleeWeapon>>,
+    spawn_items: Arc<Vec<(u8, u32)>>,
+}
+
+impl MeleeTable {
+    /// Authored spec for a registered weapon item; `None` for hands, blocks,
+    /// the bow, and unknown ids.
+    pub fn spec(&self, item: u8) -> Option<MeleeSpec> {
+        self.weapons.get(&item).map(|weapon| weapon.spec)
+    }
+
+    /// Every registered weapon, for replication to clients.
+    pub fn weapons(&self) -> impl Iterator<Item = &MeleeWeapon> {
+        self.weapons.values()
+    }
+
+    /// Registered weapons are equipment; everything else stacks.
+    pub fn kind(&self, item: u8) -> protocol::ItemKind {
+        if self.weapons.contains_key(&item) {
+            protocol::ItemKind::Equipment
+        } else {
+            protocol::ItemKind::Stack
+        }
+    }
+
+    /// Items every player receives on spawn and respawn, merged across packages.
+    pub fn spawn_items(&self) -> &[(u8, u32)] {
+        &self.spawn_items
+    }
+}
+
 pub struct Shot {
     pub projectile: ProjectileSpec,
     pub power: BowPower,
@@ -245,110 +498,33 @@ impl Shot {
     }
 }
 
-type LoadResult = Result<Arc<BowPackage>, String>;
+type LoadResult = Result<Package, String>;
 
-/// One server weapon slot in this first package API. Disk changes compile on a
-/// background thread; the simulation publishes successful candidates at tick boundaries.
-pub struct PackageHost {
+/// One package directory: a watched `server.scm` with its own reload lifecycle.
+struct PackageSlot {
     path: PathBuf,
     observed: Result<String, String>,
-    next_poll: Instant,
     pending: Option<Mutex<mpsc::Receiver<LoadResult>>>,
     pending_since: Option<Instant>,
-    active: Option<Arc<BowPackage>>,
+    active: Option<Package>,
     status: PackageStatus,
-    revision: u64,
 }
 
-impl PackageHost {
-    pub fn new(directory: &Path) -> Self {
-        let path = directory.join(BOW_PACKAGE).join("server.scm");
-        let observed = read_source(&path);
-        let result = observed
-            .clone()
-            .and_then(|source| BowPackage::compile(source, path.clone(), 1).map(Arc::new));
-        let mut host = Self {
+impl PackageSlot {
+    fn new(path: PathBuf, id: String) -> Self {
+        Self {
             path,
-            observed,
-            next_poll: Instant::now() + POLL_INTERVAL,
+            observed: Err("not read yet".into()),
             pending: None,
             pending_since: None,
             active: None,
-            revision: 0,
             status: PackageStatus {
-                id: BOW_PACKAGE.into(),
+                id,
                 generation: 0,
                 state: PackageState::Loading,
                 error: None,
             },
-        };
-        host.install(result);
-        host
-    }
-
-    pub fn status(&self) -> &PackageStatus {
-        &self.status
-    }
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-    pub fn shots_per_second(&self) -> u32 {
-        self.active.as_ref().map_or(0, |p| p.shots_per_second)
-    }
-
-    pub fn fire(&self, power: BowPower) -> Result<Shot, String> {
-        let package = self
-            .active
-            .clone()
-            .ok_or_else(|| "explosive-bow is unavailable".to_string())?;
-        Ok(Shot {
-            projectile: package.projectile(power),
-            power,
-            package,
-        })
-    }
-
-    /// Call before admitting simulation commands. Returns true when the active
-    /// firing rate changed, so callers can reset deadlines expressed in rate units.
-    pub fn poll(&mut self) -> bool {
-        let old_rate = self.shots_per_second();
-        let result =
-            self.pending
-                .as_ref()
-                .and_then(|receiver| match receiver.lock().unwrap().try_recv() {
-                    Ok(result) => Some(result),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        Some(Err("package loader stopped unexpectedly".into()))
-                    }
-                });
-        if let Some(result) = result {
-            self.pending = None;
-            self.pending_since = None;
-            // A second save during compilation supersedes this candidate.
-            let current = read_source(&self.path);
-            if current == self.observed {
-                self.install(result);
-            } else {
-                self.begin_reload(current);
-            }
         }
-        if self.pending.is_none() && Instant::now() >= self.next_poll {
-            self.next_poll = Instant::now() + POLL_INTERVAL;
-            let source = read_source(&self.path);
-            if source != self.observed {
-                self.begin_reload(source);
-            }
-        }
-        if self
-            .pending_since
-            .is_some_and(|started| started.elapsed() > LOAD_BUDGET + Duration::from_secs(1))
-        {
-            self.set_status(PackageState::Error, Some(
-                "Loader exceeded its deadline. If it does not recover, fix the package and restart the server.".into(),
-            ));
-        }
-        old_rate != self.shots_per_second()
     }
 
     fn begin_reload(&mut self, source: Result<String, String>) {
@@ -356,7 +532,7 @@ impl PackageHost {
         let source = match source {
             Ok(source) => source,
             Err(error) => {
-                self.install(Err(error));
+                self.set_status(PackageState::Error, Some(error));
                 return;
             }
         };
@@ -374,26 +550,25 @@ impl PackageHost {
         match std::thread::Builder::new()
             .name("scheme-package-load".into())
             .spawn(move || {
-                let result = BowPackage::compile(source, path, generation).map(Arc::new);
+                let result = Package::compile(source, path, generation);
                 let _ = send.send(result);
             }) {
             Ok(_) => {
                 self.pending = Some(Mutex::new(receive));
                 self.pending_since = Some(Instant::now());
             }
-            Err(error) => self.install(Err(format!("cannot start package loader: {error}"))),
+            Err(error) => self.set_status(
+                PackageState::Error,
+                Some(format!("cannot start package loader: {error}")),
+            ),
         }
     }
 
-    fn install(&mut self, result: LoadResult) {
-        match result {
-            Ok(package) => {
-                self.status.generation = package.generation;
-                self.active = Some(package);
-                self.set_status(PackageState::Loaded, None);
-            }
-            Err(error) => self.set_status(PackageState::Error, Some(error)),
-        }
+    /// Record a compiled candidate. Conflict checks ran in the host before this.
+    fn install(&mut self, package: Package) {
+        self.status.generation = package.generation();
+        self.active = Some(package);
+        self.set_status(PackageState::Loaded, None);
     }
 
     fn set_status(&mut self, state: PackageState, error: Option<String>) {
@@ -409,7 +584,6 @@ impl PackageHost {
         }
         self.status.state = state;
         self.status.error = error;
-        self.revision += 1;
         eprintln!(
             "package {} generation={} {:?}{}",
             self.status.id,
@@ -421,6 +595,258 @@ impl PackageHost {
                 .map_or(String::new(), |e| format!(": {e}"))
         );
     }
+}
+
+/// Live-reloadable package set. Disk changes compile on background threads; the
+/// simulation publishes successful candidates at tick boundaries. Packages are
+/// discovered and dropped as directories appear and vanish.
+pub struct PackageHost {
+    directory: PathBuf,
+    slots: BTreeMap<String, PackageSlot>,
+    next_poll: Instant,
+    revision: u64,
+    active_bow: Option<Arc<BowPackage>>,
+    melee: MeleeTable,
+}
+
+impl PackageHost {
+    pub fn new(directory: &Path) -> Self {
+        let mut host = Self {
+            directory: directory.to_path_buf(),
+            slots: BTreeMap::new(),
+            next_poll: Instant::now() + POLL_INTERVAL,
+            revision: 0,
+            active_bow: None,
+            melee: MeleeTable::default(),
+        };
+        for id in discover(directory) {
+            let path = directory.join(&id).join("server.scm");
+            let observed = read_source(&path);
+            let result = observed
+                .clone()
+                .and_then(|source| Package::compile(source, path.clone(), 1));
+            let mut slot = PackageSlot::new(path, id);
+            slot.observed = observed;
+            host.install_slot(slot, result);
+        }
+        host
+    }
+
+    /// Statuses of every known package slot, sorted by package id.
+    pub fn statuses(&self) -> Vec<PackageStatus> {
+        self.slots
+            .values()
+            .map(|slot| slot.status.clone())
+            .collect()
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn shots_per_second(&self) -> u32 {
+        self.active_bow.as_ref().map_or(0, |p| p.shots_per_second)
+    }
+    /// Merged melee weapon table across loaded melee packages.
+    pub fn melee_table(&self) -> MeleeTable {
+        self.melee.clone()
+    }
+
+    pub fn fire(&self, power: BowPower) -> Result<Shot, String> {
+        let package = self
+            .active_bow
+            .clone()
+            .ok_or_else(|| "no bow package is loaded".to_string())?;
+        Ok(Shot {
+            projectile: package.projectile(power),
+            power,
+            package,
+        })
+    }
+
+    /// Call before admitting simulation commands. Returns true when the active
+    /// bow firing rate changed, so callers can reset deadlines expressed in
+    /// rate units.
+    pub fn poll(&mut self) -> bool {
+        let old_rate = self.shots_per_second();
+        let mut ready = Vec::new();
+        for (id, slot) in &mut self.slots {
+            let result = slot
+                .pending
+                .as_ref()
+                .and_then(|receiver| match receiver.lock().try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("package loader stopped unexpectedly".into()))
+                    }
+                });
+            if let Some(result) = result {
+                slot.pending = None;
+                slot.pending_since = None;
+                // A second save during compilation supersedes this candidate.
+                let current = read_source(&slot.path);
+                if current == slot.observed {
+                    ready.push((id.clone(), result));
+                } else {
+                    slot.begin_reload(current);
+                }
+            }
+        }
+        for (id, result) in ready {
+            self.install_result(&id, result);
+        }
+        if Instant::now() >= self.next_poll {
+            self.next_poll = Instant::now() + POLL_INTERVAL;
+            for id in discover(&self.directory) {
+                if !self.slots.contains_key(&id) {
+                    let path = self.directory.join(&id).join("server.scm");
+                    let mut slot = PackageSlot::new(path.clone(), id.clone());
+                    slot.begin_reload(read_source(&path));
+                    self.revision += 1;
+                    self.slots.insert(id, slot);
+                }
+            }
+            let removed: Vec<String> = self
+                .slots
+                .keys()
+                .filter(|id| !self.directory.join(id).is_dir())
+                .cloned()
+                .collect();
+            for id in removed {
+                self.slots.remove(&id);
+                self.revision += 1;
+            }
+            for slot in self.slots.values_mut() {
+                if slot.pending.is_none() {
+                    let source = read_source(&slot.path);
+                    if source != slot.observed {
+                        slot.begin_reload(source);
+                    }
+                }
+            }
+        }
+        let mut deadline_hit = false;
+        for slot in self.slots.values_mut() {
+            if slot
+                .pending_since
+                .is_some_and(|started| started.elapsed() > LOAD_BUDGET + Duration::from_secs(1))
+            {
+                slot.set_status(PackageState::Error, Some(
+                    "Loader exceeded its deadline. If it does not recover, fix the package and restart the server.".into(),
+                ));
+                deadline_hit = true;
+            }
+        }
+        if deadline_hit {
+            self.revision += 1;
+        }
+        old_rate != self.shots_per_second()
+    }
+
+    fn install_slot(&mut self, slot: PackageSlot, result: LoadResult) {
+        let id = slot.status.id.clone();
+        self.slots.insert(id.clone(), slot);
+        self.install_result(&id, result);
+    }
+
+    fn install_result(&mut self, id: &str, result: LoadResult) {
+        match result {
+            Ok(package) => {
+                if let Err(error) = self.check_conflicts(id, &package) {
+                    self.slots
+                        .get_mut(id)
+                        .unwrap()
+                        .set_status(PackageState::Error, Some(error));
+                } else {
+                    self.slots.get_mut(id).unwrap().install(package);
+                }
+            }
+            Err(error) => self
+                .slots
+                .get_mut(id)
+                .unwrap()
+                .set_status(PackageState::Error, Some(error)),
+        }
+        self.revision += 1;
+        self.rebuild_views();
+    }
+
+    /// Item ids are a shared namespace: a melee package may not claim an id an
+    /// already-loaded package owns, and only one bow package may be active.
+    /// Sorted slot order makes the winner deterministic; the loser reports an
+    /// error until its ids change or the winner unloads.
+    fn check_conflicts(&self, id: &str, package: &Package) -> Result<(), String> {
+        match package {
+            Package::Bow(_) => self
+                .slots
+                .iter()
+                .find(|(other, slot)| {
+                    *other != id && matches!(slot.active, Some(Package::Bow(_)))
+                })
+                .map_or(Ok(()), |(other, _)| {
+                    Err(format!("bow already provided by package {other}"))
+                }),
+            Package::Melee(melee) => {
+                for (other, slot) in &self.slots {
+                    if *other == id {
+                        continue;
+                    }
+                    let Some(Package::Melee(active)) = &slot.active else {
+                        continue;
+                    };
+                    for weapon in &melee.weapons {
+                        if let Some(claimed) = active
+                            .weapons
+                            .iter()
+                            .find(|claimed| claimed.id == weapon.id)
+                        {
+                            return Err(format!(
+                                "item id {} ({}) already provided by package {other} ({})",
+                                weapon.id, weapon.name, claimed.name
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn rebuild_views(&mut self) {
+        self.active_bow = None;
+        let mut weapons = HashMap::new();
+        let mut spawn_items = Vec::new();
+        for slot in self.slots.values() {
+            match &slot.active {
+                Some(Package::Bow(package)) => self.active_bow = Some(package.clone()),
+                Some(Package::Melee(package)) => {
+                    for weapon in &package.weapons {
+                        weapons.insert(weapon.id, weapon.clone());
+                    }
+                    spawn_items.extend_from_slice(&package.spawn_items);
+                }
+                None => {}
+            }
+        }
+        self.melee = MeleeTable {
+            weapons: Arc::new(weapons),
+            spawn_items: Arc::new(spawn_items),
+        };
+    }
+}
+
+/// Package directories eligible for live hosting: every subdirectory except the
+/// startup-only terrain package.
+fn discover(directory: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|id| id != TERRAIN_PACKAGE)
+        .collect();
+    ids.sort();
+    ids
 }
 
 fn read_source(path: &Path) -> Result<String, String> {

@@ -104,11 +104,19 @@ knockback, and collides with terrain exactly like a player. At zero health it
 disappears and respawns at its spawn point after five seconds. Actor state
 replicates in the 20 Hz snapshot (`ActorSnapshot`) filtered by chunk interest;
 clients render a capsule that flashes on damage.
-
 `MeleeSpec` (range, damage, cooldown ticks, knockback) is the extension point
-for authored weapons; `MELEE_HANDS` is the built-in default and every current
-item resolves to it. Enemy policies write `CharacterIntent.attack` the same way
-human input maps to it.
+for authored weapons; `MELEE_HANDS` is the built-in unarmed default. The
+`melee` server package registers weapons into a shared item table — Knife (7),
+War Hammer (8), Spear (9) — and declares a spawn loadout granted on connect and
+respawn. Multiple melee packages merge into the same table; conflicting item
+ids error the later package. Weapons are equipment: each copy occupies its own
+inventory slot (duplicates collect normally — future per-item meta needs the
+slot), they drop singly on death, and their tiles show no stack count.
+Registered weapons require ownership: selecting an unowned weapon refuses the
+swing, while blocks, the bow, and
+empty hands swing the unarmed default. Specs, names, and item kind replicate
+in the package message; enemy policies write `CharacterIntent.attack` the same
+way human input maps to it.
 
 Swings land in hit zones: the top quarter of the target's height is the head
 zone and takes double damage.

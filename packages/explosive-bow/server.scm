@@ -1,6 +1,7 @@
 ;; Explosive bow, server package API v1.
 ;; Edit and save this file to reload. Existing arrows retain their firing generation.
 (define package-api-version 1)
+(define package-kind "bow")
 (define shots-per-second 25)
 
 ;; Power is 0 (low), 1 (standard), 2 (high), or 3 (extreme).

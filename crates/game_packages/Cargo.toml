@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 voxel_world.workspace = true
 protocol.workspace = true
+gameplay.workspace = true
+parking_lot = "0.12"
 steel = { package = "steel-core", version = "=0.8.2", default-features = false, features = ["std", "sandbox", "interrupt"] }
 
 [dev-dependencies]

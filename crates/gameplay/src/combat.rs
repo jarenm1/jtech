@@ -42,12 +42,6 @@ pub const MELEE_HANDS: MeleeSpec = MeleeSpec {
 };
 
 
-/// Melee profile for the held item; the extension point for authored weapons.
-/// Every current item swings hands.
-pub fn melee_spec(_item: u8) -> MeleeSpec {
-    MELEE_HANDS
-}
-
 /// Fraction of the target's height counting as the head zone (top quarter).
 pub const HEAD_ZONE: f32 = 0.25;
 /// Damage multiplier for head-zone hits.
@@ -219,11 +213,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legs.damage, MELEE_HANDS.damage);
-    }
-
-    #[test]
-    fn every_item_swings_hands() {
-        assert_eq!(melee_spec(0), MELEE_HANDS);
-        assert_eq!(melee_spec(6), MELEE_HANDS);
     }
 }
