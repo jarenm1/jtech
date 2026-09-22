@@ -13,7 +13,7 @@ At yaw zero, forward is world -Z and right is +X. Positive yaw/turn rotates left
 
 Call `step_character` directly, or spawn the four components together and use the plugin. `movement` and `turn` persist until replaced. `jump` is consumed during a valid tick even when airborne or jumping is disabled. A policy deciding every N ticks should submit jump once and retain held actions across those ticks. Include actions, initial state, profiles, timesteps, terrain and collider snapshots when reproducing an episode. Exact replay tests cover the same executable and inputs, not cross-platform floating-point determinism.
 
-A small animal can use a shorter, longer AABB, lighter mass, gradual acceleration, reduced turning, `strafe: 0.0`, and `jump_speed: 0.0`. AABBs are axis-aligned even when facing changes. Ground locomotion includes sliding, support detection, jumping, and loose-cube contacts; it does not climb voxel steps automatically.
+Ground locomotion includes sliding, support detection, jumping, and loose-cube contacts; it does not climb voxel steps automatically. Terrain collision is a smooth density sweep: the leading face samples trilinear `VoxelWorld::density_at`, so actors rest on the iso surface and walk up slopes rising less than a step height per tick. Placed cubes and unloaded chunks stay discrete solids.
 
 ## Bevy hosts and headless execution
 

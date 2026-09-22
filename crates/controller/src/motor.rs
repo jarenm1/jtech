@@ -96,18 +96,25 @@ pub fn step_character(
         state.velocity.z = 0.0;
         state.external_velocity.y = 0.0;
     }
-    let downward = state.velocity.y < 0.0;
+    let upward = state.velocity.y > 0.0;
+    // Grounded actors snap down a full step so descending slopes keep support.
+    let snap = state.grounded && state.velocity.y <= 0.0;
+    let fall = if snap {
+        (state.velocity.y * dt).min(-physics::STEP_HEIGHT)
+    } else {
+        state.velocity.y * dt
+    };
     if physics::sweep_with_bodies(
         world,
         &mut state.position,
         1,
-        state.velocity.y * dt,
+        fall,
         bodies,
         None,
         body.shape,
     ) {
         state.velocity.y = 0.0;
-        state.grounded = downward;
+        state.grounded = !upward;
     } else {
         // Zero gravity still has support; probe again after horizontal travel so
         // walking off an edge clears grounded during this same tick.

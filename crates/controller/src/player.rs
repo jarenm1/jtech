@@ -5,7 +5,7 @@ use crate::{
 use glam::{IVec3, Vec2, Vec3};
 use physics::{DynamicCollider, PlayerState, look_direction};
 use serde::{Deserialize, Serialize};
-use voxel_world::{AIR, VoxelWorld};
+use voxel_world::VoxelWorld;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default)]
 pub struct PlayerInput {
@@ -29,8 +29,10 @@ const EPSILON: f32 = 0.0001;
 fn bounds(position: Vec3) -> (Vec3, Vec3) {
     physics::bounds(position, physics::CollisionShape::default())
 }
+/// Discrete solids for noclip clearance: placed cubes only. Smooth terrain is
+/// checked through `density_at`; unloaded cells stay passable as before.
 fn solid(world: &VoxelWorld, cell: IVec3) -> bool {
-    world.block(cell) != Some(AIR)
+    world.voxel(cell).is_some_and(|v| v.placed)
 }
 
 pub fn step_player(world: &VoxelWorld, state: &mut PlayerState, input: &PlayerInput, dt: f32) {
