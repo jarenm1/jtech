@@ -2,7 +2,6 @@
 //! physics types; `combat` resolves melee swings against voxel terrain and
 //! character shapes.
 
-pub mod building;
 pub mod combat;
 
 use bevy_ecs::prelude::Component;
@@ -90,45 +89,37 @@ impl Health {
     }
 }
 
-/// Item kinds addressable by an inventory. Ids 1 through 6 mirror the placeable
-/// block materials and 0 is empty; a later item registry can widen the mapping
-/// without changing the container shape.
-pub const INVENTORY_SLOTS: usize = 10;
-/// Ceiling for one item kind's count.
-pub const MAX_STACK: u16 = 999;
+/// One owned stack: an item id and its count. Item 0 is never stored.
+pub type ItemStack = (u8, u32);
 
-/// Bounded per-item counts gathered from the world. The server owns mutations;
-/// clients display the replicated copy.
-#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "InventoryCounts")]
+/// Unbounded per-item stacks gathered from the world, in first-seen order.
+/// The server owns mutations; clients display the replicated copy. Counts are
+/// uncapped: `add` saturates at `u32::MAX` rather than rejecting.
+#[derive(Component, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "InventoryEntries")]
 pub struct Inventory {
-    counts: [u16; INVENTORY_SLOTS],
+    entries: Vec<ItemStack>,
 }
 
-// Validate the same invariants on the wire as in the mutators.
+// Reject malformed wire data: item 0, zero counts, or duplicate ids.
 #[derive(Deserialize)]
-struct InventoryCounts {
-    counts: [u16; INVENTORY_SLOTS],
+struct InventoryEntries {
+    entries: Vec<ItemStack>,
 }
 
-impl TryFrom<InventoryCounts> for Inventory {
+impl TryFrom<InventoryEntries> for Inventory {
     type Error = &'static str;
 
-    fn try_from(value: InventoryCounts) -> Result<Self, Self::Error> {
-        if value.counts.iter().any(|&count| count > MAX_STACK) {
-            return Err("inventory counts exceed the stack ceiling");
+    fn try_from(value: InventoryEntries) -> Result<Self, Self::Error> {
+        let mut seen = std::collections::HashSet::new();
+        for &(item, count) in &value.entries {
+            if item == 0 || count == 0 || !seen.insert(item) {
+                return Err("inventory entries must be unique, nonzero stacks");
+            }
         }
         Ok(Self {
-            counts: value.counts,
+            entries: value.entries,
         })
-    }
-}
-
-impl Default for Inventory {
-    fn default() -> Self {
-        Self {
-            counts: [0; INVENTORY_SLOTS],
-        }
     }
 }
 
@@ -137,45 +128,57 @@ impl Inventory {
         Self::default()
     }
 
-    fn slot(item: u8) -> Option<usize> {
-        (1..INVENTORY_SLOTS as u8)
-            .contains(&item)
-            .then_some(item as usize)
+    fn position(&self, item: u8) -> Option<usize> {
+        self.entries.iter().position(|&(id, _)| id == item)
     }
 
-    pub fn count(self, item: u8) -> u16 {
-        Self::slot(item).map_or(0, |slot| self.counts[slot])
+    pub fn count(&self, item: u8) -> u32 {
+        self.position(item).map_or(0, |index| self.entries[index].1)
     }
 
-    pub fn total(self) -> u32 {
-        self.counts.iter().map(|&count| u32::from(count)).sum()
+    pub fn total(&self) -> u64 {
+        self.entries.iter().map(|&(_, count)| u64::from(count)).sum()
     }
 
-    pub fn is_empty(self) -> bool {
-        self.counts.iter().all(|&count| count == 0)
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
-    pub fn counts(&self) -> &[u16; INVENTORY_SLOTS] {
-        &self.counts
+    /// Owned stacks in first-seen order.
+    pub fn entries(&self) -> &[ItemStack] {
+        &self.entries
     }
 
-    /// Add up to `amount`, returning how many were accepted before the ceiling.
-    pub fn add(&mut self, item: u8, amount: u16) -> u16 {
-        let Some(slot) = Self::slot(item) else {
+    /// Add `amount`, appending a new stack for unseen items. Returns the
+    /// amount accepted; only item 0 or a saturated count is refused.
+    pub fn add(&mut self, item: u8, amount: u32) -> u32 {
+        if item == 0 || amount == 0 {
+            return 0;
+        }
+        match self.position(item) {
+            Some(index) => {
+                let accepted = amount.min(u32::MAX - self.entries[index].1);
+                self.entries[index].1 += accepted;
+                accepted
+            }
+            None => {
+                self.entries.push((item, amount));
+                amount
+            }
+        }
+    }
+
+    /// Remove up to `amount`, returning how many were taken. Empty stacks are
+    /// dropped from the list.
+    pub fn take(&mut self, item: u8, amount: u32) -> u32 {
+        let Some(index) = self.position(item) else {
             return 0;
         };
-        let accepted = amount.min(MAX_STACK - self.counts[slot]);
-        self.counts[slot] += accepted;
-        accepted
-    }
-
-    /// Remove up to `amount`, returning how many were taken.
-    pub fn take(&mut self, item: u8, amount: u16) -> u16 {
-        let Some(slot) = Self::slot(item) else {
-            return 0;
-        };
-        let taken = amount.min(self.counts[slot]);
-        self.counts[slot] -= taken;
+        let taken = amount.min(self.entries[index].1);
+        self.entries[index].1 -= taken;
+        if self.entries[index].1 == 0 {
+            self.entries.remove(index);
+        }
         taken
     }
 }
@@ -221,31 +224,32 @@ mod tests {
     }
 
     #[test]
-    fn inventory_adds_takes_and_rejects_unknown_items() {
-        // Item ids 1 through 5 are the placeable block materials.
+    fn inventory_adds_takes_and_appends_new_items() {
         let mut inventory = Inventory::new();
         assert!(inventory.is_empty());
         assert_eq!(inventory.total(), 0);
         assert_eq!(inventory.add(0, 5), 0);
-        assert_eq!(inventory.add(INVENTORY_SLOTS as u8, 5), 0);
         assert_eq!(inventory.add(3, 3), 3);
         assert_eq!(inventory.add(3, 2), 2);
+        assert_eq!(inventory.add(7, 4), 4);
         assert_eq!(inventory.count(3), 5);
+        assert_eq!(inventory.count(7), 4);
         assert_eq!(inventory.count(2), 0);
-        assert_eq!(inventory.total(), 5);
+        assert_eq!(inventory.total(), 9);
+        assert_eq!(inventory.entries(), &[(3, 5), (7, 4)]);
         assert_eq!(inventory.take(3, 2), 2);
         assert_eq!(inventory.take(3, 99), 3);
+        assert_eq!(inventory.entries(), &[(7, 4)]);
+        assert_eq!(inventory.take(7, 4), 4);
         assert!(inventory.is_empty());
         assert_eq!(inventory.take(3, 1), 0);
     }
 
     #[test]
-    fn inventory_saturates_at_the_stack_ceiling() {
+    fn inventory_counts_saturate_instead_of_rejecting() {
         let mut inventory = Inventory::new();
-        assert_eq!(inventory.add(5, MAX_STACK - 1), MAX_STACK - 1);
-        assert_eq!(inventory.add(5, u16::MAX), 1);
-        assert_eq!(inventory.count(5), MAX_STACK);
-        assert_eq!(inventory.add(5, 1), 0);
-        assert_eq!(inventory.counts()[5], MAX_STACK);
+        assert_eq!(inventory.add(5, u32::MAX - 1), u32::MAX - 1);
+        assert_eq!(inventory.add(5, 10), 1);
+        assert_eq!(inventory.count(5), u32::MAX);
     }
 }

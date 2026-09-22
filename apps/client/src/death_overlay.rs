@@ -5,14 +5,10 @@
 //! gated. The server owns revival: this module never restores local health, it
 //! only asks the server to respawn at the life counter currently observed.
 
-use bevy::{
-    prelude::*,
-    ui::FocusPolicy,
-    window::{CursorGrabMode, CursorOptions},
-};
+use bevy::{prelude::*, ui::FocusPolicy};
 
 use crate::{
-    ClientSession, Options,
+    ClientSession,
     game_hud::{GameplayHud, palette},
     pause_menu::{self, PauseMenu},
 };
@@ -165,11 +161,9 @@ fn request(session: &mut ClientSession, overlay: &mut DeathOverlay) {
 #[allow(clippy::too_many_arguments)] // Synchronize independent cursor and UI components.
 pub(crate) fn sync(
     buttons: Res<ButtonInput<MouseButton>>,
-    options: Res<Options>,
     session: Res<ClientSession>,
     mut menu: ResMut<PauseMenu>,
     mut overlay: ResMut<DeathOverlay>,
-    mut cursor: Single<&mut CursorOptions>,
     mut panel: Single<&mut Node, With<DeathPanel>>,
     mut hud: Query<&mut Visibility, With<GameplayHud>>,
     mut respawn_buttons: Query<(&Interaction, &mut BackgroundColor), With<DeathAction>>,
@@ -179,12 +173,6 @@ pub(crate) fn sync(
         menu.hold_for_mouse_release();
     }
     overlay.dead = dead;
-    cursor.visible = dead || menu.open || options.bot;
-    cursor.grab_mode = if cursor.visible {
-        CursorGrabMode::None
-    } else {
-        CursorGrabMode::Locked
-    };
     panel.display = if dead { Display::Flex } else { Display::None };
     for mut visibility in &mut hud {
         *visibility = if menu.open || dead {

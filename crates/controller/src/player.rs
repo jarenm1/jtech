@@ -19,7 +19,7 @@ pub struct PlayerInput {
     pub noclip: bool,
     /// One-tick melee request; the redundant input tail makes the edge reliable.
     pub attack: bool,
-    /// Selected hotbar slot; the server maps it to the held item for melee specs.
+    /// Held item id; the server maps it to melee specs.
     pub selected: u8,
 }
 

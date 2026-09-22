@@ -45,7 +45,7 @@ fn setup(
 ) {
     commands.insert_resource(DropAssets {
         mesh: meshes.add(Cuboid::from_length(DROP_RADIUS * 2.0)),
-        materials: (0..=voxel_world::BEDROLL)
+        materials: (0..=voxel_world::WOOD)
             .map(|id| {
                 let [r, g, b, _] = voxel_world::block_color(id);
                 materials.add(StandardMaterial {
@@ -83,7 +83,7 @@ impl Drops {
             .take(MAX_DROPS)
             .filter(|drop| {
                 drop.position.is_finite()
-                    && (1..=voxel_world::BEDROLL).contains(&drop.item)
+                    && (1..=voxel_world::WOOD).contains(&drop.item)
                     && drop.count > 0
             })
             .collect();

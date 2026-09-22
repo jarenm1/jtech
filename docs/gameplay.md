@@ -11,7 +11,7 @@ can read `Simulation::player_health` and use `damage_player`, `heal_player`, or
 `restore_player_health`. Unknown or disconnected player IDs return `None`.
 Clients receive health in the welcome message and the 20 Hz player snapshots,
 and display it in the HUD. Health is not predicted during movement replay.
-Protocol version 14 requires matching client and server builds.
+Protocol version 18 requires matching client and server builds.
 
 ## Blast damage and respawn
 
@@ -87,11 +87,6 @@ owned counts on the hotbar tiles; it holds no authoritative drop or item state.
 Item ids currently match block materials; richer item behavior can be added
 through a future registry.
 
-Placing a block spends one owned item of that material: the server rejects an
-empty stack with `EditRejection::OutOfStock` and decrements the count only after
-the world mutation succeeds. The client skips sending placements for empty
-slots and dims the hotbar swatch while a stack is at zero.
-
 ## Melee combat
 
 Left click swings when a living actor or remote player is under the crosshair
@@ -111,15 +106,12 @@ replicates in the 20 Hz snapshot (`ActorSnapshot`) filtered by chunk interest;
 clients render a capsule that flashes on damage.
 
 `MeleeSpec` (range, damage, cooldown ticks, knockback) is the extension point
-for authored weapons; `MELEE_HANDS` is the built-in default. Enemy policies
-write `CharacterIntent.attack` the same way human input maps to it.
+for authored weapons; `MELEE_HANDS` is the built-in default and every current
+item resolves to it. Enemy policies write `CharacterIntent.attack` the same way
+human input maps to it.
 
 Swings land in hit zones: the top quarter of the target's height is the head
-zone and takes double damage. The held item sets the profile — hands (10),
-rock (15), pickaxe (20), hatchet (25) — via `combat::melee_spec`; the
-replicated `selected` hotbar slot resolves identically on both sides through
-`combat::slot_item`. Tools are items 7-9 on hotbar slots 8/9/0; they swing
-instead of placing.
+zone and takes double damage.
 
 Death is full-loot: the transition to zero health scatters the carried
 inventory as drops around the body and empties the corpse. Drops behave like
@@ -127,21 +119,19 @@ mined items — a short pickup delay, then any living player within reach
 collects them. Respawning restores health only; gear must be recovered or
 replaced.
 
-## Respawn binding
-
-The bedroll (hotbar **7**) is a placeable respawn anchor. Placing one spends
-the item and binds the owner's respawn to that block; dying respawns near the
-bedroll instead of world spawn. It is soft — cheap to mine or blast — and
-destroying it unbinds every player anchored to it, so raiding a base's
-bedroll sends defenders back to world spawn. An unbound or destroyed-bedroll
-player respawns at world spawn as before.
-
 ## Game interface
 
-Select a hotbar slot with **1–7**. Read health at the lower left, the selected
+Select a hotbar slot with **1–0**. Read health at the lower left, the selected
 item above the centered hotbar, and owned item counts on the hotbar tiles.
 Package status and reload errors appear at the upper right; the FPS counter is at
 the upper left.
+
+**Tab** opens the inventory panel: a scrollable grid of every owned stack plus
+the explosive bow. Drag a cell onto a hotbar slot to assign it, drag between
+hotbar slots to swap, and drop a hotbar item back on the grid to clear the
+slot. The panel releases the cursor and blocks gameplay input; **Esc** closes
+it before the pause menu. Inventories are unbounded — new item kinds append to
+the grid and stack counts are uncapped.
 
 Press **Esc** to open the translucent pause menu. Choose **Resume** or press
 **Esc** again to return, adjust **Bow power**, or choose **Quit game** to exit.

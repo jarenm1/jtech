@@ -37,12 +37,7 @@ impl Simulation {
             player.body_push_velocity = Vec3::ZERO;
             // Full-loot death: the carried inventory scatters as drops.
             let position = player.state.position + Vec3::Y * 0.5;
-            let mut spilled = Vec::new();
-            for (item, &count) in player.inventory.counts().iter().enumerate() {
-                if count > 0 {
-                    spilled.push((item as u8, count));
-                }
-            }
+            let spilled = player.inventory.entries().to_vec();
             player.inventory = gameplay::Inventory::new();
             player.inventory_dirty = true;
             self.cancel_player_strikes(id);
@@ -137,16 +132,12 @@ impl Simulation {
         {
             return false;
         }
-        let mut bodies = self
+        let bodies = self
             .physics
             .as_ref()
             .map(|physics| physics.dynamic_colliders())
             .unwrap_or_default();
-        bodies.extend(self.piece_colliders());
-        let anchor = player
-            .respawn_point
-            .and_then(|piece| self.pieces.get(&piece))
-            .map_or(self.spawn, |piece| piece.position);
+        let anchor = self.spawn;
         let Some(position) = terrain_stream::available_spawn(world, anchor, &bodies) else {
             self.spawn_chunks
                 .extend(terrain_stream::spawn_search_chunks(anchor));
@@ -231,7 +222,7 @@ mod tests {
 
         assert!(sim.players[&1].inventory.is_empty());
         assert!(sim.players[&1].inventory_dirty);
-        let dropped: Vec<(u8, u16)> = sim
+        let dropped: Vec<(u8, u32)> = sim
             .drops
             .iter()
             .map(|drop| (drop.snapshot.item, drop.snapshot.count))

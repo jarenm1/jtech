@@ -5,7 +5,7 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 
-use crate::{ClientSession, Options, game_hud::GameplayHud};
+use crate::{ClientSession, Options, game_hud::GameplayHud, inventory_ui::InventoryUi};
 
 #[derive(Resource, Default)]
 pub(crate) struct PauseMenu {
@@ -132,13 +132,18 @@ pub(crate) fn input(
     window: Single<&Window>,
     options: Res<Options>,
     mut menu: ResMut<PauseMenu>,
+    mut inventory: ResMut<InventoryUi>,
 ) {
     menu.suppress_frame = false;
     if !buttons.any_pressed([MouseButton::Left, MouseButton::Right]) {
         menu.wait_for_release = false;
     }
     if keys.just_pressed(KeyCode::Escape) && window.focused {
-        if menu.open {
+        if inventory.open {
+            // Escape peels the topmost layer first: panel, then menu.
+            inventory.open = false;
+            menu.hold_for_mouse_release();
+        } else if menu.open {
             menu.resume();
         } else {
             menu.open = true;
@@ -184,20 +189,12 @@ pub(crate) fn button_color(interaction: Interaction) -> Color {
 #[allow(clippy::too_many_arguments)] // Synchronize independent cursor and UI components.
 pub(crate) fn sync(
     menu: Res<PauseMenu>,
-    options: Res<Options>,
     session: Res<ClientSession>,
-    mut cursor: Single<&mut CursorOptions>,
     mut panel: Single<&mut Node, With<PausePanel>>,
     mut hud: Query<&mut Visibility, With<GameplayHud>>,
     mut buttons: Query<(&Interaction, &mut BackgroundColor), With<MenuAction>>,
     mut power: Single<&mut Text, With<PowerText>>,
 ) {
-    cursor.visible = menu.open || options.bot;
-    cursor.grab_mode = if cursor.visible {
-        CursorGrabMode::None
-    } else {
-        CursorGrabMode::Locked
-    };
     panel.display = if menu.open {
         Display::Flex
     } else {
@@ -216,6 +213,25 @@ pub(crate) fn sync(
     power.0 = format!("Bow power   {}", session.bow_power.label());
 }
 
+/// Single writer for cursor state. Any overlay that needs the mouse — pause
+/// menu, inventory panel, death screen — releases the grab here so systems
+/// cannot fight over `CursorOptions`.
+pub(crate) fn sync_cursor(
+    menu: Res<PauseMenu>,
+    inventory: Res<InventoryUi>,
+    session: Res<ClientSession>,
+    options: Res<Options>,
+    mut cursor: Single<&mut CursorOptions>,
+) {
+    cursor.visible =
+        menu.open || inventory.open || session.health.is_depleted() || options.bot;
+    cursor.grab_mode = if cursor.visible {
+        CursorGrabMode::None
+    } else {
+        CursorGrabMode::Locked
+    };
+}
+
 pub(crate) fn gameplay_enabled(menu: Res<PauseMenu>) -> bool {
     !menu.blocks_gameplay()
 }
@@ -228,6 +244,7 @@ mod tests {
     fn app() -> App {
         let mut app = App::new();
         app.init_resource::<PauseMenu>()
+            .init_resource::<InventoryUi>()
             .init_resource::<ClientSession>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()
@@ -280,7 +297,7 @@ mod tests {
             .delta = Vec2::splat(50.0);
         app.update();
         assert!(app.world().resource::<PauseMenu>().open);
-        assert_eq!(app.world().resource::<ClientSession>().selected, 3);
+        assert_eq!(app.world().resource::<ClientSession>().selected, 6);
         assert_eq!(app.world().resource::<ClientSession>().yaw, yaw);
         let cursor = app
             .world_mut()
