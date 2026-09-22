@@ -118,16 +118,32 @@ impl PhysicsSlice {
     }
 
     pub fn release(&mut self, target: IVec3, material: u8, damage: f32, impulse: Vec3) {
-        assert!(self.can_detach(target));
-        let mut body = Body::new(
-            (target.as_vec3() + Vec3::splat(0.5)).to_array(),
-            material as u32,
+        self.release_at(
+            target.as_vec3() + Vec3::splat(0.5),
+            target,
+            material,
+            damage,
+            impulse,
         );
+    }
+
+    /// Launch a body at a continuous position; `origin` is the restore cell
+    /// used when the backend fails before the body can be regridded.
+    pub fn release_at(
+        &mut self,
+        position: Vec3,
+        origin: IVec3,
+        material: u8,
+        damage: f32,
+        impulse: Vec3,
+    ) {
+        assert!(self.can_detach(origin));
+        let mut body = Body::new(position.to_array(), material as u32);
         body.set_damage_joules(damage);
         self.impulses.push((self.next_id, impulse.to_array()));
         self.bodies.push(body);
         self.ids.push(self.next_id);
-        self.origins.push(target);
+        self.origins.push(origin);
         self.revision += 1;
         self.next_id += 1;
         self.bodies_dirty = true;
@@ -271,6 +287,14 @@ impl PhysicsSlice {
                 )
             })
             .collect()
+    }
+
+    /// Latest observed body position; `None` for unknown ids.
+    pub fn body_position(&self, id: u32) -> Option<Vec3> {
+        self.ids
+            .iter()
+            .position(|&old| old == id)
+            .map(|slot| Vec3::from_array(self.bodies[slot].position))
     }
 
     pub fn body_damage(&self, id: u32) -> f32 {

@@ -559,8 +559,9 @@ fn receive_network(
             ServerMessage::Chunk {
                 coord,
                 revision,
-                runs,
-            } => match Chunk::from_runs(revision, &runs) {
+                material_runs,
+                density_runs,
+            } => match Chunk::from_voxel_runs(revision, &material_runs, &density_runs) {
                 Ok(chunk) => {
                     world.insert(coord, chunk);
                     session.resyncing.remove(&coord);
@@ -574,27 +575,38 @@ fn receive_network(
                 coord,
                 from,
                 to,
-                local_index,
-                block,
+                voxels,
             } => {
                 let valid = world
                     .chunks
                     .get(&coord)
                     .is_some_and(|chunk| chunk.revision == from)
-                    && to == from.saturating_add(1)
-                    && usize::from(local_index) < voxel_world::CHUNK_VOLUME
-                    && block <= 5;
+                    && to == from.saturating_add(voxels.len() as u64)
+                    && voxels.iter().all(|(cell, voxel)| {
+                        usize::from(*cell) < voxel_world::CHUNK_VOLUME
+                            && voxel.material <= voxel_world::BEDROLL
+                    });
                 if !valid {
                     session.resync(coord);
                     continue;
                 }
-                let index = i32::from(local_index);
-                let local = IVec3::new(
-                    index % CHUNK_SIZE,
-                    index / (CHUNK_SIZE * CHUNK_SIZE),
-                    (index / CHUNK_SIZE) % CHUNK_SIZE,
-                );
-                if world.set_block(coord * CHUNK_SIZE + local, block) != Some((from, to)) {
+                for (cell, voxel) in voxels {
+                    let cell = i32::from(cell);
+                    let local = IVec3::new(
+                        cell % CHUNK_SIZE,
+                        cell / (CHUNK_SIZE * CHUNK_SIZE),
+                        (cell / CHUNK_SIZE) % CHUNK_SIZE,
+                    );
+                    let _ = world.set_voxel(
+                        coord * CHUNK_SIZE + local,
+                        voxel_world::Voxel {
+                            material: voxel.material,
+                            density: voxel.density,
+                            placed: voxel.placed,
+                        },
+                    );
+                }
+                if world.chunks[&coord].revision != to {
                     session.resync(coord);
                 }
             }

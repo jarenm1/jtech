@@ -37,13 +37,21 @@ use std::{
 };
 use terrain_stream::interests;
 use voxel_world::{
-    CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, VoxelWorld, chunk_coord, index, local_coord,
+    BrushEdit, CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, Voxel, VoxelWorld, chunk_coord, index,
+    local_coord,
 };
 
 const MAX_INPUT_QUEUE: usize = 32;
 const MAX_JOURNAL_BLOCKS: usize = 1_000_000;
 const MAX_QUEUED_STRIKES: usize = 4;
 const STRIKE_QUEUE_TICKS: u64 = 60;
+/// Pickaxe sphere: carves a smooth ~3.2 m cavity into the terrain.
+const STRIKE_DIG_RADIUS: f32 = 1.6;
+/// How far past the raycast surface the dig center sits, so the sphere bites
+/// into the face instead of skimming it.
+const STRIKE_DIG_DEPTH: f32 = 0.3;
+/// Settled debris deposits a smooth mound instead of regridding one cube.
+const SETTLE_RADIUS: f32 = 1.2;
 
 type EditOutcome = Result<Option<f32>, EditRejection>;
 
@@ -284,7 +292,8 @@ impl Player {
 #[derive(Default)]
 struct Journal {
     revision: u64,
-    blocks: BTreeMap<u16, u8>,
+    /// Post-edit voxel state per cell; restore must reproduce all three fields.
+    voxels: BTreeMap<u16, Voxel>,
 }
 #[derive(Default, Debug)]
 pub struct SimulationMetrics {
@@ -332,6 +341,11 @@ pub struct Simulation {
 impl Simulation {
     pub fn player_count(&self) -> usize {
         self.players.len()
+    }
+    /// Chunks a player is currently interested in; empty for unknown ids.
+    /// Smoke tests assert client residency stays inside this set.
+    pub fn player_interest(&self, id: u64) -> Option<&HashSet<IVec3>> {
+        self.players.get(&id).map(|p| &p.interest)
     }
     pub fn print_metrics(&self, loaded_chunks: usize) {
         let mut times: Vec<_> = self.tick_times.iter().copied().collect();
@@ -475,7 +489,7 @@ impl Simulation {
             || self
                 .journal
                 .get(&chunk_coord(target))
-                .is_some_and(|j| j.blocks.contains_key(&(index(local_coord(target)) as u16)))
+                .is_some_and(|j| j.voxels.contains_key(&(index(local_coord(target)) as u16)))
     }
 
     /// Install one asynchronously generated chunk without clobbering live edits.
@@ -530,32 +544,22 @@ impl Simulation {
             self.finish_edit(id, request, Err(reason));
             return;
         }
-        if strike {
-            let rejection = self
-                .physics
-                .as_ref()
-                .map_or(Some(EditRejection::PhysicsUnavailable), |p| {
-                    p.detach_rejection(target)
+        // Strikes dig smooth terrain without GPU physics, but a queued strike
+        // still waits for an in-flight batch so its revision check stays honest.
+        if strike && self.physics.as_ref().is_some_and(|p| p.is_busy()) {
+            if self.strikes.iter().filter(|s| s.id == id).count() >= MAX_QUEUED_STRIKES {
+                self.finish_edit(id, request, Err(EditRejection::QueueFull));
+            } else {
+                self.strikes.push_back(QueuedStrike {
+                    id,
+                    request,
+                    target,
+                    revision: expected_revision,
+                    expires: self.tick.saturating_add(STRIKE_QUEUE_TICKS),
                 });
-            if let Some(reason) = rejection {
-                self.finish_edit(id, request, Err(reason));
-                return;
+                self.players.get_mut(&id).unwrap().highest_request = request;
             }
-            if self.physics.as_ref().is_some_and(|p| p.is_busy()) {
-                if self.strikes.iter().filter(|s| s.id == id).count() >= MAX_QUEUED_STRIKES {
-                    self.finish_edit(id, request, Err(EditRejection::QueueFull));
-                } else {
-                    self.strikes.push_back(QueuedStrike {
-                        id,
-                        request,
-                        target,
-                        revision: expected_revision,
-                        expires: self.tick.saturating_add(STRIKE_QUEUE_TICKS),
-                    });
-                    self.players.get_mut(&id).unwrap().highest_request = request;
-                }
-                return;
-            }
+            return;
         }
         let outcome = self.execute_edit(world, id, target, block, strike);
         self.finish_edit(id, request, outcome);
@@ -626,26 +630,28 @@ impl Simulation {
         {
             return Err(EditRejection::Occupied);
         }
-        let detached = if strike {
-            let physics = self
-                .physics
-                .as_ref()
-                .ok_or(EditRejection::PhysicsUnavailable)?;
-            if let Some(reason) = physics.detach_rejection(target) {
-                return Err(reason);
-            }
-            if physics.is_busy() {
-                return Err(EditRejection::PhysicsUnavailable);
-            }
+        if strike {
+            // Re-raycast the validated aim: the dig sphere centers just inside
+            // the struck surface, not on the cell the client named.
             let player = &self.players[&id];
-            Some((
-                world.block(target).ok_or(EditRejection::InvalidTarget)?,
-                look_direction(player.input.yaw, player.input.pitch),
-                self.damage.get(&target).map_or(0.0, |state| state.joules),
-            ))
-        } else {
-            None
-        };
+            let eye = player.state.position + Vec3::Y * EYE_HEIGHT;
+            let direction = look_direction(player.input.yaw, player.input.pitch);
+            let hit = world
+                .raycast(eye, direction, 6.0)
+                .filter(|hit| hit.block == target)
+                .ok_or(EditRejection::OutOfReach)?;
+            let center = eye + direction * (hit.distance + STRIKE_DIG_DEPTH);
+            let edits = world.brush_dig(center, STRIKE_DIG_RADIUS);
+            if edits.is_empty() {
+                return Err(EditRejection::InvalidTarget);
+            }
+            // One unit of the dominant destroyed material, matching the old
+            // single-block yield.
+            if let Some(material) = self.record_brush(edits) {
+                self.destroyed(target, material, None);
+            }
+            return Ok(None);
+        }
         let (from, to) = world
             .set_block(target, block)
             .ok_or(EditRejection::RevisionExhausted)?;
@@ -658,16 +664,7 @@ impl Simulation {
                 player.respawn_point = Some(target);
             }
         }
-        if let Some((material, direction, damage)) = detached {
-            // F is a debug energy source; material damage is carried into the body.
-            self.physics.as_mut().unwrap().release(
-                target,
-                material,
-                damage,
-                direction * 5.0 + Vec3::Y * 20.0,
-            );
-        }
-        self.record_change(world, target, block, from, to);
+        self.record_change(world, target, Voxel::placed(block), from, to);
         Ok(None)
     }
 
@@ -680,8 +677,10 @@ impl Simulation {
         let journal_space = self.has_journal_space(target);
         let result =
             material_damage::apply_to_grid(world, &mut self.damage, contact, journal_space)?;
-        if let Some((from, to)) = result.destroyed_revision {
-            self.record_change(world, target, 0, from, to);
+        if let Some(edits) = result.destroyed_edits {
+            for edit in &edits {
+                self.record_voxels(edit);
+            }
             self.destroyed(target, contact.material as u8, None);
         }
         Ok(result.fraction)
@@ -703,10 +702,60 @@ impl Simulation {
         }
     }
     /// One authoritative voxel transaction path for edits, detachment, and settlement.
-    fn record_change(&mut self, _world: &VoxelWorld, target: IVec3, block: u8, from: u64, to: u64) {
-        self.damage.remove(&target);
+    fn record_change(&mut self, _world: &VoxelWorld, target: IVec3, voxel: Voxel, from: u64, to: u64) {
         let coord = chunk_coord(target);
-        let local_index = index(local_coord(target)) as u16;
+        let cell = index(local_coord(target)) as u16;
+        self.record_chunk_edit(coord, from, to, &[(cell, voxel)]);
+    }
+
+    /// Journal and broadcast one brush edit's per-chunk voxel list.
+    fn record_voxels(&mut self, edit: &BrushEdit) {
+        let voxels: Vec<(u16, Voxel)> = edit
+            .voxels
+            .iter()
+            .map(|&(cell, _, after)| (cell, after))
+            .collect();
+        self.record_chunk_edit(edit.coord, edit.from, edit.to, &voxels);
+    }
+
+    /// Record a brush's edits and clear respawns anchored inside it. Returns
+    /// the dominant destroyed material; ties resolve to the lowest id.
+    fn record_brush(&mut self, edits: Vec<BrushEdit>) -> Option<u8> {
+        let mut counts = BTreeMap::new();
+        let mut unbound = Vec::new();
+        for edit in &edits {
+            for &(cell, before, after) in &edit.voxels {
+                if before.material != voxel_world::AIR && after.material == voxel_world::AIR {
+                    *counts.entry(before.material).or_insert(0u32) += 1;
+                    // A bedroll destroyed anywhere in the sphere unbinds
+                    // every respawn anchored to that cell.
+                    if before.material == voxel_world::BEDROLL {
+                        let cell = i32::from(cell);
+                        unbound.push(
+                            edit.coord * CHUNK_SIZE
+                                + IVec3::new(cell % 32, cell / 1024, (cell / 32) % 32),
+                        );
+                    }
+                }
+            }
+        }
+        for pos in unbound {
+            for player in self.players.values_mut() {
+                if player.respawn_point == Some(pos) {
+                    player.respawn_point = None;
+                }
+            }
+        }
+        for edit in &edits {
+            self.record_voxels(edit);
+        }
+        counts
+            .iter()
+            .max_by_key(|&(_, &count)| count)
+            .map(|(&material, _)| material)
+    }
+
+    fn record_chunk_edit(&mut self, coord: IVec3, from: u64, to: u64, voxels: &[(u16, Voxel)]) {
         if !self.journal.contains_key(&coord) {
             // Other players must discover new construction beyond natural surfaces.
             for player in self.players.values_mut() {
@@ -715,12 +764,38 @@ impl Simulation {
         }
         let journal = self.journal.entry(coord).or_default();
         journal.revision = to;
-        if journal.blocks.insert(local_index, block).is_none() {
-            self.journal_blocks += 1;
+        for &(cell, voxel) in voxels {
+            if journal.voxels.insert(cell, voxel).is_none() {
+                self.journal_blocks += 1;
+            }
+            let cell = i32::from(cell);
+            let pos = coord * CHUNK_SIZE + IVec3::new(cell % 32, cell / 1024, (cell / 32) % 32);
+            // Fracture progress is bound to material identity; a density-only
+            // change keeps it, a material change clears it.
+            if self
+                .damage
+                .get(&pos)
+                .is_some_and(|state| state.material != voxel.material)
+            {
+                self.damage.remove(&pos);
+            }
+            if let Some(physics) = &mut self.physics {
+                physics.set_voxel(pos, voxel.material);
+            }
         }
-        if let Some(physics) = &mut self.physics {
-            physics.set_voxel(target, block);
-        }
+        let wire: Vec<(u16, protocol::Voxel)> = voxels
+            .iter()
+            .map(|&(cell, voxel)| {
+                (
+                    cell,
+                    protocol::Voxel {
+                        material: voxel.material,
+                        density: voxel.density,
+                        placed: voxel.placed,
+                    },
+                )
+            })
+            .collect();
         let recipients: Vec<_> = self
             .players
             .iter()
@@ -734,8 +809,7 @@ impl Simulation {
                     coord,
                     from,
                     to,
-                    local_index,
-                    block,
+                    voxels: wire.clone(),
                 },
             ) {
                 self.players
@@ -788,7 +862,7 @@ impl Simulation {
                 // The solver already reacted the collision impulse into the grid.
                 physics.release(target, state.material, state.joules, Vec3::ZERO);
                 physics.set_voxel(target, 0);
-                self.record_change(world, target, 0, from, to);
+                self.record_change(world, target, Voxel::AIR, from, to);
             }
         }
         // Stable body IDs establish deterministic order for competing cell claims.
@@ -797,9 +871,9 @@ impl Simulation {
                 let coord = chunk_coord(target);
                 let has_journal_space = self.journal_blocks < MAX_JOURNAL_BLOCKS
                     || self.journal.get(&coord).is_some_and(|j| {
-                        j.blocks.contains_key(&(index(local_coord(target)) as u16))
+                        j.voxels.contains_key(&(index(local_coord(target)) as u16))
                     });
-                if has_journal_space
+                if !(has_journal_space
                     && (if physics.failed() {
                         world.block(target) == Some(0)
                             && !self
@@ -812,25 +886,45 @@ impl Simulation {
                     && !physics.overlaps_except(target, id)
                     && (self.damage.len() < MAX_DAMAGED_BLOCKS
                         || self.damage.contains_key(&target)
-                        || physics.body_damage(id) == 0.0)
-                    && let Some((from, to)) = world.set_block(target, material)
+                        || physics.body_damage(id) == 0.0))
                 {
-                    let damage = physics.body_damage(id);
-                    physics.remove(id);
-                    physics.set_voxel(target, material);
-                    self.record_change(world, target, material, from, to);
-                    if damage > 0.0 {
-                        self.damage.insert(
-                            target,
-                            DamageState {
-                                material,
-                                joules: damage,
-                                release: false,
-                            },
+                    continue;
+                }
+                // Failed physics restores at the source cell; a live body
+                // deposits where it came to rest.
+                let center = if physics.failed() {
+                    target.as_vec3() + Vec3::splat(0.5)
+                } else {
+                    physics.body_position(id).unwrap_or(target.as_vec3() + Vec3::splat(0.5))
+                };
+                let edits = world.brush_add(center, SETTLE_RADIUS, material);
+                if edits.is_empty() {
+                    continue;
+                }
+                let damage = physics.body_damage(id);
+                physics.remove(id);
+                for edit in &edits {
+                    for &(cell, _, _) in &edit.voxels {
+                        let cell = i32::from(cell);
+                        physics.set_voxel(
+                            edit.coord * CHUNK_SIZE
+                                + IVec3::new(cell % 32, cell / 1024, (cell / 32) % 32),
+                            material,
                         );
                     }
-                    break;
+                    self.record_voxels(edit);
                 }
+                if damage > 0.0 {
+                    self.damage.insert(
+                        target,
+                        DamageState {
+                            material,
+                            joules: damage,
+                            release: false,
+                        },
+                    );
+                }
+                break;
             }
         }
         let mut players: Vec<_> = self.players.iter().collect();
@@ -970,15 +1064,16 @@ fn valid_coord(coord: IVec3) -> bool {
 fn restore(world: &mut VoxelWorld, coord: IVec3, journal: Option<&Journal>) {
     world.ensure_chunk(coord);
     if let Some(journal) = journal {
-        for (&cell, &block) in &journal.blocks {
+        for (&cell, &voxel) in &journal.voxels {
             let cell = cell as i32;
             let local = IVec3::new(cell % 32, cell / 1024, (cell / 32) % 32);
-            world.set_block(coord * CHUNK_SIZE + local, block);
+            world.set_voxel(coord * CHUNK_SIZE + local, voxel);
         }
-        let runs = world.chunks[&coord].runs();
+        let (material_runs, density_runs) = world.chunks[&coord].voxel_runs();
         world.insert(
             coord,
-            Chunk::from_runs(journal.revision, &runs).expect("journal contains valid blocks"),
+            Chunk::from_voxel_runs(journal.revision, &material_runs, &density_runs)
+                .expect("journal contains valid voxels"),
         );
     }
 }
@@ -1274,12 +1369,14 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         });
         for coord in available {
             let chunk = &world.chunks[&coord];
+            let (material_runs, density_runs) = chunk.voxel_runs();
             if !sim.send(
                 *id,
                 &ServerMessage::Chunk {
                     coord,
                     revision: chunk.revision,
-                    runs: chunk.runs(),
+                    material_runs,
+                    density_runs,
                 },
             ) {
                 break;
@@ -1349,17 +1446,18 @@ mod tests {
         let target = IVec3::new(1, 20, 1);
         let mut world = VoxelWorld::default();
         world.ensure_chunk(coord);
-        let original = world.block(target).unwrap();
-        let changed = if original == 0 { 3 } else { 0 };
+        let original = world.voxel(target).unwrap();
+        let changed = if original.material == 0 { 3 } else { 0 };
         world.set_block(target, changed).unwrap();
-        let (_, revision) = world.set_block(target, original).unwrap();
+        let (_, revision) = world.set_block(target, original.material).unwrap();
+        let restored = world.voxel(target).unwrap();
         let journal = Journal {
             revision,
-            blocks: BTreeMap::from([(index(target) as u16, original)]),
+            voxels: BTreeMap::from([(index(target) as u16, restored)]),
         };
         world.remove(coord);
         restore(&mut world, coord, Some(&journal));
-        assert_eq!(world.block(target), Some(original));
+        assert_eq!(world.voxel(target), Some(restored));
         assert_eq!(world.chunks[&coord].revision, 2);
     }
 
@@ -1398,12 +1496,15 @@ mod tests {
         let (_, to) = world.set_block(destination, 5).unwrap();
         let journal = Journal {
             revision: to,
-            blocks: BTreeMap::from([(index(source) as u16, 0), (index(destination) as u16, 5)]),
+            voxels: BTreeMap::from([
+                (index(source) as u16, Voxel::AIR),
+                (index(destination) as u16, Voxel::placed(5)),
+            ]),
         };
         world.remove(IVec3::ZERO);
         restore(&mut world, IVec3::ZERO, Some(&journal));
-        assert_eq!(world.block(source), Some(0));
-        assert_eq!(world.block(destination), Some(5));
+        assert_eq!(world.voxel(source), Some(Voxel::AIR));
+        assert_eq!(world.voxel(destination), Some(Voxel::placed(5)));
         assert_eq!(world.chunks[&IVec3::ZERO].revision, to);
     }
 
@@ -1590,6 +1691,7 @@ mod tests {
         assert!(expected.motion.position.x > initial.motion.position.x);
     }
 
+
     fn headless_app(radius: i32) -> App {
         let mut app = App::new();
         app.add_plugins(
@@ -1644,7 +1746,7 @@ mod tests {
             coord,
             Journal {
                 revision: 501,
-                blocks: BTreeMap::from([(cell, 5)]),
+                voxels: BTreeMap::from([(cell, Voxel::placed(5))]),
             },
         );
 
