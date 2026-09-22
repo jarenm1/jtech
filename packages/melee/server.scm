@@ -12,8 +12,8 @@
 
 (define weapons
   (list
-    ;; Fast, weak, short reach.
-    (melee-weapon 7 "Knife" 2.5 8 18 200.0)
+    ;; Fast, weak, short reach; ships a 3D model under assets/.
+    (melee-weapon 7 "Knife" 2.5 8 18 200.0 "knife.glb")
     ;; Slow, heavy, crushing.
     (melee-weapon 8 "War Hammer" 3.0 30 60 900.0)
     ;; Long reach, moderate everything.

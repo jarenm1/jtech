@@ -103,7 +103,7 @@ server uses the same existing projectile/explosion messages for presentation.
 
 | Export | Contract |
 | --- | --- |
-| `weapons` | List of `(melee-weapon id name range damage cooldown-ticks knockback)` |
+| `weapons` | List of `(melee-weapon id name range damage cooldown-ticks knockback [model])` |
 | `spawn-items` | Optional list of `(id count)` pairs granted on spawn and respawn |
 
 `melee-weapon` is a host-provided constructor. `id` is an integer above 6 and
@@ -112,6 +112,8 @@ clients; `range` is metres 0.1–16; `damage` is whole health points 1–65535;
 `cooldown-ticks` is fixed60 ticks 0–600; `knockback` is kg·m/s 0–10000.
 Head-zone hits double damage; unarmed hands stay the fallback for unregistered
 items. `spawn-items` entries must reference ids the same package registers.
+The optional `model` is a `.glb` path under the package's `assets/` directory;
+see [Package assets](#package-assets).
 
 Weapons are equipment, not stacks: every copy occupies its own inventory slot,
 so picking up a duplicate adds a second entry rather than merging or being
@@ -121,6 +123,27 @@ they carry; selecting an unowned weapon refuses the swing entirely rather than
 downgrading to hands. Weapon specs, names, and item kind replicate in the
 package message so clients route swings and display authored names without
 hardcoding.
+
+## Package assets
+
+Files under a package's `assets/` directory ship to clients. The host hashes
+them into a manifest carried in the Packages message; clients request missing
+files, receive them in reliable 64 KiB chunks, and expose them to Bevy through
+a `pkg://` asset source backed by a content-addressed cache in the temp dir.
+Files are capped at 16 MiB and only served while their package is loaded.
+Editing an asset bumps the manifest hash, so clients re-download on the next
+sync without a restart.
+
+The startup-only `terrain` package has no live slot but ships its scatter
+models the same way: files under `packages/terrain/assets/` are always in the
+manifest, and the species table in the Welcome message names them. See
+[terrain generation](terrain.md#organic-scatter).
+
+A melee weapon's optional trailing `model` argument names a `.glb` under
+`assets/`; the loader fails the package if the file is missing, and clients
+render the model for dropped copies (a colored cube until the download lands,
+a neutral cube for weapons without a model). Models only affect drop
+presentation — hotbar tiles and held items still use swatches.
 
 ## Execution boundary
 

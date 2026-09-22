@@ -10,8 +10,9 @@ use crate::{LOAD_BUDGET, Vm, diagnostic, read_source};
 use std::path::Path;
 use steel::{SteelVal, steel_vm::engine::Engine};
 use voxel_world::terrain::{
-    BiomeSpec, MAX_BIOMES, MAX_CURVE_POINTS, MAX_GRAPH_DEPTH, MAX_GRAPH_NODES, NoiseSpec,
-    TERRAIN_API_VERSION, TerrainExpr, TerrainGenerator, TerrainSpec,
+    BiomeSpec, MAX_BIOMES, MAX_CURVE_POINTS, MAX_GRAPH_DEPTH, MAX_GRAPH_NODES, MAX_SPECIES,
+    NoiseSpec, ScatterSpec, SpeciesSpec, TERRAIN_API_VERSION, TerrainExpr, TerrainGenerator,
+    TerrainSpec,
 };
 use voxel_world::{DIRT, GRASS, SAND, STONE};
 
@@ -56,6 +57,14 @@ const API: &str = r#"
   (list 'biome name surface subsurface depth
         min-temperature max-temperature
         min-moisture max-moisture min-height max-height))
+(define (species name model spacing density slope-max
+                 min-altitude max-altitude min-moisture max-moisture
+                 min-scale max-scale sink cluster-frequency cluster-threshold)
+  (list 'species name model spacing density slope-max
+        min-altitude max-altitude min-moisture max-moisture
+        min-scale max-scale sink cluster-frequency cluster-threshold))
+(define (scatter-rule biome species)
+  (list 'scatter-rule biome species))
 "#;
 
 /// Evaluate `directory/terrain/server.scm` once and compile its terrain graph.
@@ -87,6 +96,15 @@ pub fn load_terrain(directory: &Path) -> Result<TerrainGenerator, String> {
     let moisture = expression(engine, "terrain-moisture", &mut graph_nodes)?;
     let soil = expression(engine, "terrain-soil", &mut graph_nodes)?;
     let biomes = biome_list(engine, "biomes")?;
+    let package_dir = directory.join(TERRAIN_PACKAGE);
+    let species = match engine.extract_value("scatter-species") {
+        Ok(value) => species_list(&value, &package_dir)?,
+        Err(_) => Vec::new(),
+    };
+    let scatter_biomes = match engine.extract_value("scatter-rules") {
+        Ok(value) => scatter_rules(&value, &species, &biomes)?,
+        Err(_) => Vec::new(),
+    };
     TerrainGenerator::compile(TerrainSpec {
         identity,
         version: version as u32,
@@ -96,6 +114,10 @@ pub fn load_terrain(directory: &Path) -> Result<TerrainGenerator, String> {
         moisture,
         soil,
         biomes,
+        scatter: ScatterSpec {
+            species,
+            biomes: scatter_biomes,
+        },
     })
 }
 
@@ -138,9 +160,12 @@ fn number_value(value: &SteelVal, name: &str) -> Result<f64, String> {
 
 fn arguments<'a>(value: &'a SteelVal, name: &str) -> Result<Vec<&'a SteelVal>, String> {
     match value {
-        // The biome table is the widest valid list. Keep one excess item so all
-        // callers reject oversized lists without allocating in proportion to input.
-        SteelVal::ListV(items) => Ok(items.iter().take(MAX_BIOMES + 1).collect()),
+        // The species table is the widest valid list. Keep one excess item so
+        // all callers reject oversized lists without allocating in proportion
+        // to input.
+        SteelVal::ListV(items) => {
+            Ok(items.iter().take(MAX_SPECIES.max(MAX_BIOMES) + 1).collect())
+        }
         _ => Err(format!("{name} must be a list")),
     }
 }
@@ -422,6 +447,134 @@ fn biome_from_steel(value: &SteelVal) -> Result<BiomeSpec, String> {
             number_value(args[9], "biome max height")? as f32,
         ),
     })
+}
+
+fn species_list(value: &SteelVal, package_dir: &Path) -> Result<Vec<SpeciesSpec>, String> {
+    let items = arguments(value, "species")?;
+    if items.len() > MAX_SPECIES {
+        return Err(format!(
+            "terrain declares more than {MAX_SPECIES} scatter species"
+        ));
+    }
+    let mut species = Vec::with_capacity(items.len());
+    for item in items {
+        species.push(species_from_steel(item, package_dir)?);
+    }
+    Ok(species)
+}
+
+fn species_from_steel(value: &SteelVal, package_dir: &Path) -> Result<SpeciesSpec, String> {
+    let args = arguments(value, "species")?;
+    let Some(SteelVal::SymbolV(head)) = args.first() else {
+        return Err("species must start with the species symbol".into());
+    };
+    if head.to_string() != "species" {
+        return Err(format!("expected species, found {head}"));
+    }
+    let args = &args[1..];
+    expect(args, 14, "species")?;
+    let name = match args[0] {
+        SteelVal::StringV(value) => value.to_string(),
+        _ => return Err("species name must be a string".into()),
+    };
+    let model = match args[1] {
+        SteelVal::StringV(value) => value.to_string(),
+        _ => return Err(format!("species {name} model must be a string")),
+    };
+    validate_model(package_dir, &name, &model)?;
+    let range = |low: &SteelVal, high: &SteelVal, label: &str| -> Result<(f32, f32), String> {
+        Ok((
+            number_value(low, &format!("species {name} {label} min"))? as f32,
+            number_value(high, &format!("species {name} {label} max"))? as f32,
+        ))
+    };
+    let altitude = range(args[5], args[6], "altitude")?;
+    let moisture = range(args[7], args[8], "moisture")?;
+    let scale = range(args[9], args[10], "scale")?;
+    let sink = number_value(args[11], "species sink")? as f32;
+    let cluster = range(args[12], args[13], "cluster")?;
+    Ok(SpeciesSpec {
+        name,
+        model,
+        spacing: number_value(args[2], "species spacing")? as f32,
+        density: number_value(args[3], "species density")? as f32,
+        slope_max: number_value(args[4], "species slope-max")? as f32,
+        altitude,
+        moisture,
+        scale,
+        sink,
+        cluster,
+    })
+}
+
+/// A declared model must be a relative `.glb` inside the package's `assets/`
+/// directory, so a typo fails the package rather than the client.
+fn validate_model(package_dir: &Path, species: &str, model: &str) -> Result<(), String> {
+    let relative = Path::new(model);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("species {species} model {model:?} escapes assets/"));
+    }
+    if !package_dir.join("assets").join(relative).is_file() {
+        return Err(format!(
+            "species {species} model {model:?} not found in assets/"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve `scatter-rules` into per-biome species indices, in biome order.
+fn scatter_rules(
+    value: &SteelVal,
+    species: &[SpeciesSpec],
+    biomes: &[BiomeSpec],
+) -> Result<Vec<Vec<u16>>, String> {
+    let items = arguments(value, "scatter-rules")?;
+    let mut rules: Vec<Vec<u16>> = vec![Vec::new(); biomes.len()];
+    let mut seen = vec![false; biomes.len()];
+    for item in items {
+        let args = arguments(item, "scatter-rule")?;
+        let Some(SteelVal::SymbolV(head)) = args.first() else {
+            return Err("scatter-rule must start with the scatter-rule symbol".into());
+        };
+        if head.to_string() != "scatter-rule" {
+            return Err(format!("expected scatter-rule, found {head}"));
+        }
+        let args = &args[1..];
+        expect(args, 2, "scatter-rule")?;
+        let biome_name = match args[0] {
+            SteelVal::StringV(value) => value.to_string(),
+            _ => return Err("scatter-rule biome name must be a string".into()),
+        };
+        let biome = biomes
+            .iter()
+            .position(|entry| entry.name == biome_name)
+            .ok_or_else(|| format!("scatter-rule references unknown biome {biome_name:?}"))?;
+        if seen[biome] {
+            return Err(format!("duplicate scatter-rule for biome {biome_name:?}"));
+        }
+        seen[biome] = true;
+        let names = arguments(args[1], "scatter-rule species")?;
+        let mut list = Vec::with_capacity(names.len());
+        for entry in names {
+            let species_name = match entry {
+                SteelVal::StringV(value) => value.to_string(),
+                _ => return Err("scatter-rule species must be strings".into()),
+            };
+            let index = species
+                .iter()
+                .position(|entry| entry.name == species_name)
+                .ok_or_else(|| {
+                    format!("scatter-rule references unknown species {species_name:?}")
+                })?;
+            list.push(index as u16);
+        }
+        rules[biome] = list;
+    }
+    Ok(rules)
 }
 
 #[cfg(test)]

@@ -2,10 +2,14 @@
 name = "voxel-client"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+
+[features]
+tracy = ["bevy/trace", "bevy/trace_tracy"]
 
 [dependencies]
 bevy.workspace = true
+image = "0.25"
+serde_json.workspace = true
 voxel_world.workspace = true
 voxel_render.workspace = true
 physics.workspace = true

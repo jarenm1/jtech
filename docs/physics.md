@@ -14,7 +14,7 @@ In another terminal, open the client:
 cargo run --release -p voxel-client
 ```
 
-Aim at a highlighted grid block and click **M1** repeatedly to fracture it. Use **1–5** and **right click** to place blocks. Press **6** to equip the **Explosive Bow**, then hold **right click** to fire explosive arrows at **25 shots per second** with the default package. Aim beyond the highlighted-block range or at loose blocks. Press **F** for a debug launch. A chipped block carries its damage while loose and after settling into another grid cell.
+Aim at a grid block under the center-screen crosshair and click **M1** repeatedly to fracture it. Use **1–5** and **right click** to place blocks. Press **6** to equip the **Explosive Bow**, then hold **right click** to fire explosive arrows at **25 shots per second** with the default package. Aim beyond block-reach or at loose blocks. Press **F** for a debug launch. A chipped block carries its damage while loose and after settling into another grid cell.
 
 Rebuild and restart both processes for protocol version **9**, including bow power presets and player blast momentum. Press **V** to toggle flight, **Space** to rise, and **Ctrl** to descend. Connect a second client to observe authoritative arrows, explosions, destruction, loose-body motion, and settlement.
 

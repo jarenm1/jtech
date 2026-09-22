@@ -10,7 +10,8 @@ impl Plugin for DropsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Drops>()
             .add_systems(Startup, setup)
-            .add_systems(Update, present.after(super::receive_network));
+            .add_systems(Update, present.after(super::receive_network))
+            .add_systems(Update, upgrade_models.after(super::receive_network));
     }
 }
 
@@ -24,7 +25,12 @@ struct DropVisual {
     current: Vec3,
     received: Instant,
     phase: f32,
+    /// Authored model the drop wants once its file is downloaded.
+    model: Option<(String, String)>,
+    /// The spawned entity is already the model scene.
+    model_loaded: bool,
 }
+
 
 #[derive(Resource, Default)]
 pub struct Drops {
@@ -36,6 +42,8 @@ pub struct Drops {
 pub struct DropAssets {
     mesh: Handle<Mesh>,
     materials: Vec<Handle<StandardMaterial>>,
+    /// Neutral swatch for equipment items without an authored model.
+    equipment: Handle<StandardMaterial>,
 }
 
 fn setup(
@@ -55,6 +63,11 @@ fn setup(
                 })
             })
             .collect(),
+        equipment: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.55, 0.55, 0.6),
+            perceptual_roughness: 0.6,
+            ..default()
+        }),
     });
 }
 
@@ -72,6 +85,7 @@ impl Drops {
         drops: &[DropSnapshot],
         commands: &mut Commands,
         assets: &DropAssets,
+        packages: &crate::package_hud::ServerPackages,
         now: Instant,
     ) {
         if self.tick.is_some_and(|old| tick <= old) {
@@ -83,8 +97,9 @@ impl Drops {
             .take(MAX_DROPS)
             .filter(|drop| {
                 drop.position.is_finite()
-                    && (1..=voxel_world::WOOD).contains(&drop.item)
                     && drop.count > 0
+                    && ((1..=voxel_world::WOOD).contains(&drop.item)
+                        || packages.is_equipment(drop.item))
             })
             .collect();
         let ids: HashSet<_> = valid.iter().map(|drop| drop.id).collect();
@@ -97,9 +112,16 @@ impl Drops {
             }
         });
         for drop in valid {
-            let Some(material) = assets.materials.get(drop.item as usize) else {
-                continue;
-            };
+            let model = packages
+                .melee_weapons
+                .iter()
+                .find(|weapon| weapon.item == drop.item)
+                .and_then(|weapon| {
+                    weapon
+                        .model
+                        .as_ref()
+                        .map(|path| (weapon.package.clone(), path.clone()))
+                });
             self.items
                 .entry(drop.id)
                 .and_modify(|visual| {
@@ -110,23 +132,68 @@ impl Drops {
                     visual.current = drop.position;
                     visual.received = now;
                 })
-                .or_insert_with(|| DropVisual {
-                    entity: commands
-                        .spawn((
-                            Mesh3d(assets.mesh.clone()),
-                            MeshMaterial3d(material.clone()),
-                            Transform::from_translation(drop.position),
-                        ))
-                        .id(),
-                    previous: drop.position,
-                    current: drop.position,
-                    received: now,
-                    phase: drop.id as f32 * 0.7,
+                .or_insert_with(|| {
+                    // Cube placeholder; `upgrade_models` swaps in the authored
+                    // model once the glTF resolves.
+                    let material = assets
+                        .materials
+                        .get(drop.item as usize)
+                        .unwrap_or(&assets.equipment);
+                    DropVisual {
+                        entity: commands
+                            .spawn((
+                                Mesh3d(assets.mesh.clone()),
+                                MeshMaterial3d(material.clone()),
+                                Transform::from_translation(drop.position),
+                            ))
+                            .id(),
+                        previous: drop.position,
+                        current: drop.position,
+                        received: now,
+                        phase: drop.id as f32 * 0.7,
+                        model,
+                        model_loaded: false,
+                    }
                 });
         }
     }
 }
 
+/// Swap a placeholder cube for the authored model once its file is in the
+/// package asset cache.
+fn upgrade_models(
+    mut commands: Commands,
+    mut drops: ResMut<Drops>,
+    package_assets: Res<crate::package_assets::PackageAssets>,
+    asset_server: Res<AssetServer>,
+) {
+    for visual in drops.items.values_mut() {
+        if visual.model_loaded {
+            continue;
+        }
+        let Some((package, path)) = &visual.model else {
+            continue;
+        };
+        let (Some(uri), Some(bytes)) = (
+            package_assets.uri(package, path),
+            package_assets.bytes(package, path),
+        ) else {
+            continue;
+        };
+        let Some(entity) = crate::package_assets::spawn_gltf(
+            &mut commands,
+            &asset_server,
+            &uri,
+            &bytes,
+            Transform::from_translation(visual.current),
+        ) else {
+            continue;
+        };
+        commands.entity(visual.entity).despawn();
+        visual.entity = entity;
+        visual.model_loaded = true;
+    }
+}
 fn present(time: Res<Time>, drops: Res<Drops>, mut transforms: Query<&mut Transform>) {
     let seconds = time.elapsed_secs();
     for item in drops.items.values() {
@@ -152,7 +219,9 @@ mod tests {
         let assets = DropAssets {
             mesh: Handle::default(),
             materials: vec![Handle::default(); 6],
+            equipment: Handle::default(),
         };
+        let packages = crate::package_hud::ServerPackages::default();
         let snapshot = DropSnapshot {
             id: 7,
             item: 3,
@@ -164,6 +233,7 @@ mod tests {
             &[snapshot],
             &mut Commands::new(&mut queue, &world),
             &assets,
+            &packages,
             Instant::now(),
         );
         queue.apply(&mut world);
@@ -176,6 +246,7 @@ mod tests {
             &[],
             &mut Commands::new(&mut queue, &world),
             &assets,
+            &packages,
             Instant::now(),
         );
         queue.apply(&mut world);
@@ -197,6 +268,7 @@ mod tests {
             &[moved, invalid],
             &mut Commands::new(&mut queue, &world),
             &assets,
+            &packages,
             Instant::now(),
         );
         queue.apply(&mut world);
@@ -209,6 +281,7 @@ mod tests {
             &[],
             &mut Commands::new(&mut queue, &world),
             &assets,
+            &packages,
             Instant::now(),
         );
         queue.apply(&mut world);

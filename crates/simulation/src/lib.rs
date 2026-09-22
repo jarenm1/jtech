@@ -156,6 +156,17 @@ impl Plugin for SimulationPlugin {
         for &coord in &spawn_chunks {
             world.ensure_chunk(coord);
         }
+        // Eagerly generated spawn chunks bypass the streaming worker, so seed
+        // their scatter here to keep every resident chunk's entry present.
+        let scatter: HashMap<IVec3, Vec<protocol::ScatterInstance>> = spawn_chunks
+            .iter()
+            .map(|&coord| {
+                (
+                    coord,
+                    wire_scatter(self.generator.scatter_chunk(coord, self.config.seed)),
+                )
+            })
+            .collect();
         let physics = self.physics.lock().take();
         app.insert_resource(world)
             .insert_resource(Simulation {
@@ -182,6 +193,7 @@ impl Plugin for SimulationPlugin {
                 needed: HashSet::new(),
                 physics,
                 terrain: self.terrain.lock().take().expect("plugin built once"),
+                scatter,
                 spawn,
                 spawn_chunks,
                 actors: HashMap::new(),
@@ -228,6 +240,17 @@ struct Player {
     attack_ready: u64,
     inventory: Inventory,
     inventory_dirty: bool,
+    /// Requested package assets waiting for paced transmission.
+    asset_queue: VecDeque<AssetDownload>,
+}
+
+/// One package file a player asked for; `bytes` caches the read so a file that
+/// is edited mid-transfer still completes coherently.
+struct AssetDownload {
+    package: String,
+    path: String,
+    bytes: std::sync::Arc<Vec<u8>>,
+    offset: u32,
 }
 impl Player {
     fn new() -> Self {
@@ -255,6 +278,7 @@ impl Player {
             inventory: Inventory::default(),
             attack_ready: 0,
             inventory_dirty: false,
+            asset_queue: VecDeque::new(),
         }
     }
     fn snapshot(&self, id: u64) -> PlayerSnapshot {
@@ -330,6 +354,8 @@ pub struct Simulation {
     sent_drop_revision: u64,
     packages: game_packages::PackageHost,
     terrain: terrain_stream::TerrainStream,
+    /// Scatter instances per resident chunk, sent once alongside the chunk.
+    scatter: HashMap<IVec3, Vec<protocol::ScatterInstance>>,
     spawn: Vec3,
     spawn_chunks: HashSet<IVec3>,
     actors: actors::ActorMap,
@@ -490,11 +516,18 @@ impl Simulation {
     }
 
     /// Install one asynchronously generated chunk without clobbering live edits.
-    fn install_generated(&mut self, world: &mut VoxelWorld, coord: IVec3, chunk: Chunk) {
+    fn install_generated(
+        &mut self,
+        world: &mut VoxelWorld,
+        coord: IVec3,
+        chunk: Chunk,
+        scatter: Vec<voxel_world::terrain::ScatterInstance>,
+    ) {
         // Ignore stale completions and never replace a chunk edited while work was pending.
         if self.needed.contains(&coord) && !world.chunks.contains_key(&coord) {
             world.insert(coord, chunk);
             restore(world, coord, self.journal.get(&coord));
+            self.scatter.insert(coord, wire_scatter(scatter));
             self.metrics.generated += 1;
         }
     }
@@ -1002,6 +1035,23 @@ fn valid_coord(coord: IVec3) -> bool {
         && coord.z.abs_diff(0) <= 1_000_000
         && (MIN_CHUNK_Y..=MAX_CHUNK_Y).contains(&coord.y)
 }
+/// Convert compiled scatter instances to their wire form.
+fn wire_scatter(
+    instances: Vec<voxel_world::terrain::ScatterInstance>,
+) -> Vec<protocol::ScatterInstance> {
+    instances
+        .into_iter()
+        .map(|instance| protocol::ScatterInstance {
+            species: instance.species,
+            x: instance.x,
+            y: instance.y,
+            z: instance.z,
+            yaw: instance.yaw,
+            scale: instance.scale,
+        })
+        .collect()
+}
+
 fn restore(world: &mut VoxelWorld, coord: IVec3, journal: Option<&Journal>) {
     world.ensure_chunk(coord);
     if let Some(journal) = journal {
@@ -1023,8 +1073,8 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     let sim = &mut *simulation;
     sim.tick += 1;
     sim.poll_packages();
-    for (coord, chunk) in sim.terrain.poll() {
-        sim.install_generated(&mut world, coord, chunk);
+    for (coord, chunk, scatter) in sim.terrain.poll() {
+        sim.install_generated(&mut world, coord, chunk, scatter);
     }
     sim.observe_physics(&mut world);
     let incoming = match sim.transport.as_mut().map_or_else(
@@ -1067,6 +1117,13 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         let health = player.health;
         let inventory = player.inventory.clone();
         sim.players.insert(id, player);
+        let scatter_species = (0..world.generator.species_count())
+            .map(|index| protocol::ScatterSpeciesInfo {
+                name: world.generator.species_name(index as u16).to_string(),
+                package: game_packages::TERRAIN_PACKAGE.to_string(),
+                model: world.generator.species_model(index as u16).to_string(),
+            })
+            .collect();
         sim.send(
             id,
             &ServerMessage::Welcome {
@@ -1076,6 +1133,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 spawn,
                 health,
                 inventory,
+                scatter_species,
             },
         );
         eprintln!("connect id={id}");
@@ -1208,6 +1266,9 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             ClientMessage::Respawn { life } => {
                 sim.request_respawn(id, life);
             }
+            ClientMessage::AssetRequest { package, path } => {
+                sim.request_asset(id, &package, &path);
+            }
             ClientMessage::Hello { .. } => {}
         }
     }
@@ -1219,6 +1280,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     sim.advance_drops(&world);
     sim.collect_drops();
     sim.replicate_inventory();
+    sim.advance_assets();
     if sim.tick.is_multiple_of(3) {
         sim.replicate_drops();
     }
@@ -1280,6 +1342,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         .collect();
     for coord in evicted {
         world.remove(coord);
+        sim.scatter.remove(&coord);
         sim.last_needed.remove(&coord);
     }
     // A player can abandon a desired chunk before its generation turn. Those
@@ -1320,13 +1383,26 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         for coord in available {
             let chunk = &world.chunks[&coord];
             let (material_runs, density_runs) = chunk.voxel_runs();
+            let revision = chunk.revision;
+            // Every resident chunk should already carry an entry; compute on
+            // demand so a future eager install path cannot silently drop it.
+            let scatter = match sim.scatter.get(&coord) {
+                Some(instances) => instances.clone(),
+                None => {
+                    let instances =
+                        wire_scatter(world.generator.scatter_chunk(coord, sim.config.seed));
+                    sim.scatter.insert(coord, instances.clone());
+                    instances
+                }
+            };
             if !sim.send(
                 *id,
                 &ServerMessage::Chunk {
                     coord,
-                    revision: chunk.revision,
+                    revision,
                     material_runs,
                     density_runs,
+                    scatter,
                 },
             ) {
                 break;
@@ -1689,6 +1765,7 @@ mod tests {
             &mut world,
             coord,
             Chunk::generate_with(coord, seed, &generator),
+            generator.scatter_chunk(coord, seed),
         );
         assert_eq!(world.chunks[&coord].revision, 77);
         assert_eq!(world.block(target), Some(3));
@@ -1699,6 +1776,7 @@ mod tests {
             &mut world,
             coord,
             Chunk::generate_with(coord, seed, &generator),
+            generator.scatter_chunk(coord, seed),
         );
         assert_eq!(world.block(target), Some(5));
         assert_eq!(world.chunks[&coord].revision, 501);
@@ -1709,6 +1787,7 @@ mod tests {
             &mut world,
             coord,
             Chunk::generate_with(coord, seed, &generator),
+            generator.scatter_chunk(coord, seed),
         );
         assert_eq!(world.chunks[&coord].revision, 501);
         assert_eq!(sim.metrics.generated, generated);
@@ -1729,6 +1808,7 @@ mod tests {
             &mut world,
             coord,
             Chunk::generate_with(coord, seed, &generator),
+            generator.scatter_chunk(coord, seed),
         );
         assert!(!world.chunks.contains_key(&coord));
         assert_eq!(sim.metrics.generated, before);

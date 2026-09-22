@@ -945,3 +945,39 @@ fn ground_jump_edge_survives_render_only_frames_and_fires_once_per_catchup() {
     assert!(session.consume_jump(true, true));
     assert!(!session.consume_jump(true, false));
 }
+
+#[test]
+fn left_click_plays_swing_animation_without_a_melee_target() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut app = App::new();
+    app.init_resource::<ButtonInput<MouseButton>>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .init_resource::<pause_menu::PauseMenu>()
+        .init_resource::<RemoteActors>()
+        .init_resource::<RemotePlayers>()
+        .insert_resource(arena())
+        .insert_resource(Time::<()>::default())
+        .insert_resource(ClientSession {
+            transport: Some(
+                ClientTransport::connect(listener.local_addr().unwrap()).unwrap(),
+            ),
+            id: Some(1),
+            ..default()
+        })
+        .add_systems(Update, edit_blocks);
+    app.world_mut().spawn(CursorOptions {
+        visible: false,
+        grab_mode: CursorGrabMode::Locked,
+        ..default()
+    });
+    app.update();
+    assert!(app.world().resource::<ClientSession>().swing_at.is_none());
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .press(MouseButton::Left);
+    app.update();
+    let session = app.world().resource::<ClientSession>();
+    assert!(session.swing_at.is_some());
+    // No actor or remote player under the crosshair, so nothing attacks.
+    assert!(!session.attack_pending);
+}

@@ -39,6 +39,7 @@
               cmake
               ninja
               gdb
+              tracy
             ];
 
             buildInputs = with pkgs; [

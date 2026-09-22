@@ -209,7 +209,19 @@ fn compile_melee(source: &str) -> Result<Package, String> {
     let fixture = Fixture::new();
     let path = fixture.package("melee").join("server.scm");
     fs::write(&path, source).unwrap();
+    copy_melee_assets(&fixture);
     Package::compile(source.to_owned(), path, 1)
+}
+
+/// The real melee package ships `assets/knife.glb`; model validation requires
+/// the file to exist beside the fixture's server.scm.
+fn copy_melee_assets(fixture: &Fixture) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/melee/assets");
+    let target = fixture.package("melee").join("assets");
+    fs::create_dir_all(&target).unwrap();
+    for entry in fs::read_dir(&source).unwrap().flatten() {
+        fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+    }
 }
 
 #[test]
@@ -233,6 +245,7 @@ fn melee_packages_merge_and_conflicting_ids_error_the_later_package() {
 (define spawn-items (list (list 10 1)))
 "#;
     let fixture = Fixture::new();
+    copy_melee_assets(&fixture);
     fixture.write_package("melee", MELEE);
     fixture.write_package("z-blade", BLADE);
     let mut host = PackageHost::new(&fixture.0);
@@ -295,7 +308,16 @@ impl TerrainFixture {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(root.join(TERRAIN_PACKAGE)).unwrap();
+        let terrain = root.join(TERRAIN_PACKAGE);
+        fs::create_dir_all(terrain.join("assets")).unwrap();
+        // Ship the real models so species model validation sees them.
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/terrain/assets");
+        if let Ok(entries) = fs::read_dir(&source) {
+            for entry in entries.flatten() {
+                let _ = fs::copy(entry.path(), terrain.join("assets").join(entry.file_name()));
+            }
+        }
         Self(root)
     }
 
@@ -343,6 +365,58 @@ fn shipped_terrain_package_matches_the_native_default() {
         loaded.column_bounds(-4, 6, 9),
         native.column_bounds(-4, 6, 9)
     );
+    // The scatter tables must not drift either.
+    assert_eq!(loaded.species_count(), native.species_count());
+    for seed in [0u64, 3, 77] {
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in -2..=3 {
+                    let coord = glam::IVec3::new(cx, cy, cz);
+                    assert_eq!(
+                        loaded.scatter_chunk(coord, seed),
+                        native.scatter_chunk(coord, seed),
+                        "scatter mismatch at {coord:?} seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scatter_rules_are_validated_and_compiled() {
+    let generator = load_terrain_source(TERRAIN).unwrap();
+    assert_eq!(generator.species_count(), 3);
+    assert_eq!(generator.species_name(0), "oak");
+    assert_eq!(generator.species_model(0), "oak.glb");
+    let placed: usize = (-6..=6)
+        .flat_map(|cx| {
+            (-6..=6).flat_map(move |cz| (-2..=3).map(move |cy| glam::IVec3::new(cx, cy, cz)))
+        })
+        .map(|coord| generator.scatter_chunk(coord, 7).len())
+        .sum();
+    assert!(placed > 0, "shipped package placed no scatter");
+
+    let cases = [
+        (
+            "(scatter-rule \"plains\"",
+            "(scatter-rule \"swamp\"",
+            "unknown biome",
+        ),
+        (
+            "(list \"oak\" \"boulder\")",
+            "(list \"willow\" \"boulder\")",
+            "unknown species",
+        ),
+        ("\"oak.glb\"", "\"missing.glb\"", "missing model"),
+        ("\"oak.glb\"", "\"../oak.glb\"", "escaping model"),
+    ];
+    for (from, to, label) in cases {
+        assert!(
+            load_terrain_source(&TERRAIN.replace(from, to)).is_err(),
+            "accepted {label}"
+        );
+    }
 }
 
 #[test]

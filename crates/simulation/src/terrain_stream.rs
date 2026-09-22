@@ -8,7 +8,8 @@ use std::{
 use glam::{IVec2, IVec3, Vec3};
 use parking_lot::Mutex;
 use voxel_world::{
-    CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, chunk_coord, terrain::TerrainGenerator,
+    CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, chunk_coord,
+    terrain::{ScatterInstance, TerrainGenerator},
 };
 
 use crate::{streaming::nearest_chunks, valid_coord};
@@ -24,7 +25,7 @@ enum Work {
 }
 enum Completed {
     Survey(IVec2, (i32, i32)),
-    Generate(IVec3, Chunk),
+    Generate(IVec3, Chunk, Vec<ScatterInstance>),
 }
 
 pub(super) struct TerrainStream {
@@ -52,6 +53,7 @@ impl TerrainStream {
                         Work::Generate(coord) => Completed::Generate(
                             coord,
                             Chunk::generate_with(coord, seed, &generator),
+                            generator.scatter_chunk(coord, seed),
                         ),
                     };
                     if finished.send(result).is_err() {
@@ -69,7 +71,7 @@ impl TerrainStream {
         })
     }
 
-    pub fn poll(&mut self) -> Vec<(IVec3, Chunk)> {
+    pub fn poll(&mut self) -> Vec<(IVec3, Chunk, Vec<ScatterInstance>)> {
         let mut chunks = Vec::new();
         let receiver = self.results.get_mut();
         // At most MAX_PENDING results can exist, including stale requests.
@@ -87,9 +89,9 @@ impl TerrainStream {
                     self.bounds.insert(column, bounds);
                     self.revision += 1;
                 }
-                Completed::Generate(coord, chunk) => {
+                Completed::Generate(coord, chunk, scatter) => {
                     self.pending_chunks.remove(&coord);
-                    chunks.push((coord, chunk));
+                    chunks.push((coord, chunk, scatter));
                 }
             }
         }
@@ -362,7 +364,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut received = 0;
         while received < MAX_PENDING_CHUNKS || !stream.pending_columns.is_empty() {
-            for (coord, chunk) in stream.poll() {
+            for (coord, chunk, _) in stream.poll() {
                 assert_eq!(
                     chunk.runs(),
                     Chunk::generate_with(coord, 7, &generator).runs()

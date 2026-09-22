@@ -7,7 +7,7 @@ use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -53,6 +53,30 @@ pub struct Voxel {
     pub placed: bool,
 }
 
+/// One placed organic scatter instance. `y` is the rendered surface height, so
+/// a model authored with its base at the origin sits on the ground.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScatterInstance {
+    /// Index into the species table announced in `Welcome`.
+    pub species: u16,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Rotation about the vertical axis, in radians.
+    pub yaw: f32,
+    pub scale: f32,
+}
+
+/// One scatter species: the model a chunk instance index refers to.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScatterSpeciesInfo {
+    pub name: String,
+    /// Package owning the model, e.g. `terrain`.
+    pub package: String,
+    /// Model path relative to the package's `assets/` directory.
+    pub model: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     Hello {
@@ -82,6 +106,11 @@ pub enum ClientMessage {
     Respawn {
         life: u64,
     },
+    /// Request one package asset file announced in the Packages manifest.
+    AssetRequest {
+        package: String,
+        path: String,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
@@ -92,6 +121,8 @@ pub enum ServerMessage {
         spawn: PlayerState,
         health: Health,
         inventory: Inventory,
+        /// Scatter species table; chunk instances index into it.
+        scatter_species: Vec<ScatterSpeciesInfo>,
     },
     Chunk {
         coord: IVec3,
@@ -99,6 +130,8 @@ pub enum ServerMessage {
         /// Material runs with the placed flag packed into the high bit.
         material_runs: Vec<(u16, u8)>,
         density_runs: Vec<(u16, i8)>,
+        /// Organic scatter anchored inside this chunk, sent once with it.
+        scatter: Vec<ScatterInstance>,
     },
     Delta {
         coord: IVec3,
@@ -143,6 +176,17 @@ pub enum ServerMessage {
         bow_shots_per_second: u32,
         /// Merged melee weapon table across loaded melee packages.
         melee_weapons: Vec<MeleeWeaponInfo>,
+        /// Files shipped by loaded packages under `assets/`, for client download.
+        assets: Vec<PackageAssetInfo>,
+    },
+    /// One chunk of a requested package asset; `offset` orders reassembly and
+    /// `total` is the full file size. Chunks arrive reliably in order.
+    AssetData {
+        package: String,
+        path: String,
+        offset: u32,
+        total: u32,
+        data: Vec<u8>,
     },
     /// Authoritative owned-item counts for the receiving player, sent reliably on change.
     Inventory {
@@ -184,12 +228,28 @@ pub enum ItemKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MeleeWeaponInfo {
     pub item: u8,
+    /// Package that authored this weapon; namespaces its asset paths.
+    pub package: String,
     pub name: String,
     pub kind: ItemKind,
     pub range: f32,
     pub damage: u16,
     pub cooldown_ticks: u32,
     pub knockback: f32,
+    /// Asset path relative to the owning package's `assets/` dir, if the weapon
+    /// ships a 3D model.
+    pub model: Option<String>,
+}
+
+/// One file a loaded package ships under its `assets/` directory. `hash`
+/// versions the content so clients can cache by content, not name.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackageAssetInfo {
+    pub package: String,
+    /// Path relative to the package's `assets/` directory, e.g. `knife.glb`.
+    pub path: String,
+    pub size: u32,
+    pub hash: u64,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PhysicsBodySnapshot {
@@ -280,6 +340,11 @@ mod tests {
             spawn: PlayerState::default(),
             health,
             inventory: Inventory::default(),
+            scatter_species: vec![ScatterSpeciesInfo {
+                name: "oak".into(),
+                package: "terrain".into(),
+                model: "oak.glb".into(),
+            }],
         };
         let bytes = encode(&welcome, MAX_FRAME).unwrap();
         let ServerMessage::Welcome {
@@ -471,11 +536,20 @@ mod tests {
             revision: 41,
             material_runs: vec![(32760, 3), (1, 0x80 | 5), (7, 0)],
             density_runs: vec![(32760, 127), (8, -128)],
+            scatter: vec![ScatterInstance {
+                species: 2,
+                x: 1.5,
+                y: 44.0,
+                z: -3.25,
+                yaw: 1.25,
+                scale: 1.1,
+            }],
         };
         let bytes = encode(&chunk, MAX_FRAME).unwrap();
         let ServerMessage::Chunk {
             material_runs,
             density_runs,
+            scatter,
             ..
         } = decode(&bytes, MAX_FRAME).unwrap()
         else {
@@ -483,6 +557,9 @@ mod tests {
         };
         assert_eq!(material_runs[1], (1, 0x85));
         assert_eq!(density_runs, vec![(32760, 127), (8, -128)]);
+        assert_eq!(scatter.len(), 1);
+        assert_eq!(scatter[0].species, 2);
+        assert_eq!(scatter[0].z, -3.25);
 
         let delta = ServerMessage::Delta {
             coord: IVec3::ZERO,

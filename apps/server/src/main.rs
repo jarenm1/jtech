@@ -7,6 +7,13 @@ use std::{
 use voxel_world::VoxelWorld;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(tracing_tracy::TracyLayer::default())
+            .init();
+    }
     let mut config = ServerConfig::default();
     let mut ticks = None;
     let mut args = std::env::args().skip(1);
@@ -62,6 +69,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::thread::sleep(deadline - now);
         }
         app.update();
+        #[cfg(feature = "tracy")]
+        tracing::info!(tracy.frame_mark = true);
         deadline += step;
         // At most three immediate catch-up ticks; discard excess wall-clock debt.
         if Instant::now().saturating_duration_since(deadline) > step * 3 {

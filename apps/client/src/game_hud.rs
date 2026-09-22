@@ -129,44 +129,25 @@ pub(crate) fn update_fps(
     }
 }
 fn spawn_crosshair(commands: &mut Commands) {
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: percent(50),
-                top: percent(50),
-                width: px(12),
-                height: px(12),
-                margin: UiRect {
-                    left: px(-6),
-                    top: px(-6),
-                    ..default()
-                },
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: percent(50),
+            top: percent(50),
+            width: px(4),
+            height: px(4),
+            margin: UiRect {
+                left: px(-2),
+                top: px(-2),
                 ..default()
             },
-            GlobalZIndex(10),
-            GameplayHud,
-        ))
-        .with_children(|cross| {
-            for (left, top, width, height) in [
-                (5.0_f32, 0.0, 2.0, 4.0),
-                (5.0, 8.0, 2.0, 4.0),
-                (0.0, 5.0, 4.0, 2.0),
-                (8.0, 5.0, 4.0, 2.0),
-            ] {
-                cross.spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: px(left),
-                        top: px(top),
-                        width: px(width),
-                        height: px(height),
-                        ..default()
-                    },
-                    BackgroundColor(palette::IVORY),
-                ));
-            }
-        });
+            ..default()
+        },
+        BackgroundColor(Color::WHITE),
+        BorderRadius::all(px(2)),
+        GlobalZIndex(10),
+        GameplayHud,
+    ));
 }
 
 fn spawn_status(commands: &mut Commands) {

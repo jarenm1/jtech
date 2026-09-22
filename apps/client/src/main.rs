@@ -4,12 +4,15 @@ mod death_overlay;
 mod drops;
 mod game_hud;
 mod health_hud;
+mod held_item;
 mod inventory_ui;
 mod lighting;
 mod loose_blocks;
 mod package_hud;
+mod package_assets;
 mod pause_menu;
 mod projectiles;
+mod scatter;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
@@ -132,6 +135,8 @@ struct ClientSession {
     noclip_requested: bool,
     jump_pending: bool,
     attack_pending: bool,
+    /// When the last melee swing started, for the held-item swing animation.
+    swing_at: Option<Instant>,
     pending: VecDeque<PlayerInput>,
     sequence: u64,
     last_tick: u64,
@@ -198,6 +203,7 @@ impl Default for ClientSession {
             jump_pending: false,
             attack_pending: false,
             pending: VecDeque::with_capacity(256),
+            swing_at: None,
             sequence: 0,
             last_tick: 0,
             accumulator: 0.0,
@@ -365,8 +371,6 @@ struct PlayerCamera;
 #[derive(Component)]
 struct RemoteActorEntity;
 
-#[derive(Component)]
-struct Selection;
 
 struct ClientPlugin;
 
@@ -383,6 +387,8 @@ impl Plugin for ClientPlugin {
             .init_resource::<pause_menu::PauseMenu>()
             .init_resource::<death_overlay::DeathOverlay>()
             .init_resource::<inventory_ui::InventoryUi>()
+            .init_resource::<package_assets::PackageAssets>()
+            .init_resource::<scatter::ScatterWorld>()
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
@@ -406,15 +412,22 @@ impl Plugin for ClientPlugin {
                     bow_power_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
                     predict,
                     edit_blocks,
+                    held_item::update,
                     present_players,
-                    select_voxel,
                     game_hud::update,
                     game_hud::update_fps,
                     health_hud::update,
                     bow_power_hud::update,
                     package_hud::update,
+                    scatter::sync_scatter,
                 )
                     .chain(),
+            )
+            .add_systems(
+                Update,
+                auto_hotbar
+                    .after(receive_network)
+                    .before(controls),
             );
     }
 }
@@ -424,7 +437,19 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(2)
     });
-    App::new()
+    let cache = package_assets::PackageAssets::cache_dir();
+    let _ = std::fs::create_dir_all(&cache);
+    let mut app = App::new();
+    // Asset sources must register before AssetPlugin (inside DefaultPlugins);
+    // `pkg://` serves downloaded package files from the cache dir.
+    app.register_asset_source(
+        bevy::asset::io::AssetSourceId::from("pkg"),
+        bevy::asset::io::AssetSourceBuilder::platform_default(
+            cache.to_str().unwrap_or("/tmp/voxel-package-assets"),
+            None,
+        ),
+    );
+    app
         .insert_resource(options.lighting)
         .insert_resource(options)
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -440,6 +465,7 @@ fn main() {
             bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
             WorldPlugin,
             VoxelRenderPlugin,
+            lighting::LightingPlugin,
             ClientPlugin,
             loose_blocks::LooseBlocksPlugin,
             projectiles::ProjectilesPlugin,
@@ -465,6 +491,7 @@ fn setup(
     mut session: ResMut<ClientSession>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut cursor: Single<&mut CursorOptions>,
 ) {
     match ClientTransport::connect(options.server) {
@@ -501,23 +528,10 @@ fn setup(
         }),
         dummy_mesh: meshes.add(Capsule3d::new(0.32, 1.1)),
     });
-    // A translucent shell marks the selected solid voxel without requiring wireframe support.
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::from_length(1.006))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 0.87, 0.3, 0.16),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            ..default()
-        })),
-        Transform::default(),
-        Visibility::Hidden,
-        Selection,
-    ));
     inventory_ui::spawn(&mut commands);
     game_hud::spawn(&mut commands);
     pause_menu::spawn(&mut commands);
-    death_overlay::spawn(&mut commands);
+    death_overlay::spawn(&mut commands, &mut images);
     health_hud::spawn(&mut commands);
     bow_power_hud::spawn(&mut commands);
     package_hud::spawn(&mut commands);
@@ -538,6 +552,8 @@ fn receive_network(
     projectile_assets: Res<projectiles::ProjectileAssets>,
     mut drops: ResMut<drops::Drops>,
     drop_assets: Res<drops::DropAssets>,
+    mut package_assets: ResMut<package_assets::PackageAssets>,
+    mut scatter: ResMut<scatter::ScatterWorld>,
 ) {
     let Some(transport) = &mut session.transport else {
         return;
@@ -561,9 +577,11 @@ fn receive_network(
                 spawn,
                 health,
                 inventory,
+                scatter_species,
             } => {
                 projectiles.clear(&mut commands);
                 drops.clear(&mut commands);
+                scatter.begin_session(&mut commands, scatter_species);
                 session.packages = package_hud::ServerPackages::default();
                 session.id = Some(id);
                 session.session = token;
@@ -585,9 +603,11 @@ fn receive_network(
                 revision,
                 material_runs,
                 density_runs,
+                scatter: instances,
             } => match Chunk::from_voxel_runs(revision, &material_runs, &density_runs) {
                 Ok(chunk) => {
                     world.insert(coord, chunk);
+                    scatter.receive(coord, instances);
                     session.resyncing.remove(&coord);
                 }
                 Err(error) => {
@@ -636,6 +656,7 @@ fn receive_network(
             }
             ServerMessage::Forget { coord } => {
                 world.remove(coord);
+                scatter.forget(coord, &mut commands);
                 session.resyncing.remove(&coord);
             }
             ServerMessage::EditResult {
@@ -685,10 +706,23 @@ fn receive_network(
                 packages,
                 bow_shots_per_second,
                 melee_weapons,
+                assets,
             } => {
                 session
                     .packages
                     .receive(revision, packages, bow_shots_per_second, melee_weapons);
+                for request in package_assets.sync(assets) {
+                    session.send(request);
+                }
+            }
+            ServerMessage::AssetData {
+                package,
+                path,
+                offset,
+                total,
+                data,
+            } => {
+                package_assets.receive_chunk(&package, &path, offset, total, &data);
             }
             ServerMessage::Inventory { inventory } => {
                 session.inventory = inventory;
@@ -702,6 +736,7 @@ fn receive_network(
                     &snapshots,
                     &mut commands,
                     &drop_assets,
+                    &session.packages,
                     Instant::now(),
                 );
             }
@@ -1040,13 +1075,18 @@ fn edit_blocks(
     }
     let strike = keys.just_pressed(KeyCode::KeyF);
     // Melee: a living actor or remote player under the crosshair within reach
-    // swings instead of mining. The server re-validates; this only routes input.
+    // sets the attack flag instead of mining. The server re-validates; this
+    // only routes input. The swing animation plays on every left click —
+    // mining, whiffing, or hitting — so the held item always reacts.
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
     let direction = look_direction(session.yaw, session.pitch);
     let melee = buttons.pressed(MouseButton::Left)
         && melee_target(&world, origin, direction, &actors, &remotes, &session);
     if melee {
         session.attack_pending = true;
+    }
+    if buttons.just_pressed(MouseButton::Left) {
+        session.swing_at = Some(Instant::now());
     }
     let hit = buttons.just_pressed(MouseButton::Left) && !melee;
     let bow_shot = repeat_bow(
@@ -1220,25 +1260,6 @@ fn present_players(
     }
 }
 
-fn select_voxel(
-    world: Res<VoxelWorld>,
-    session: Res<ClientSession>,
-    menu: Res<pause_menu::PauseMenu>,
-    inventory: Res<inventory_ui::InventoryUi>,
-    mut selection: Single<(&mut Transform, &mut Visibility), With<Selection>>,
-) {
-    if menu.blocks_gameplay() || inventory.open || session.health.is_depleted() {
-        *selection.1 = Visibility::Hidden;
-        return;
-    }
-    let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
-    if let Some(hit) = world.raycast(origin, look_direction(session.yaw, session.pitch), 6.0) {
-        selection.0.translation = hit.block.as_vec3() + Vec3::splat(0.5);
-        *selection.1 = Visibility::Visible;
-    } else {
-        *selection.1 = Visibility::Hidden;
-    }
-}
 
 fn capture_screenshot(
     mut commands: Commands,
@@ -1253,6 +1274,7 @@ fn capture_screenshot(
         let path = options
             .screenshot
             .clone()
+
             .unwrap_or_else(|| format!("/tmp/voxel-{}.png", session.frame));
         commands
             .spawn(Screenshot::primary_window())
@@ -1261,12 +1283,50 @@ fn capture_screenshot(
         info!("CAPTURE {path}");
     }
 }
+/// Granted equipment lands in empty hotbar slots so spawn loadouts are usable
+fn auto_hotbar(mut session: ResMut<ClientSession>, options: Res<Options>) {
+    let weapons: Vec<u8> = session
+        .packages
+        .melee_weapons
+        .iter()
+        .map(|weapon| weapon.item)
+        .collect();
+    if weapons.is_empty() {
+        return;
+    }
+    for item in weapons {
+        if session.inventory.count(item) == 0
+            || session.hotbar.iter().flatten().any(|held| *held == item)
+        {
+            continue;
+        }
+        if let Some(slot) = session.hotbar.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(item);
+        }
+    }
+    if options.bot {
+        // Bots can't pick slots; hold a weapon that ships a model so rendered
+        // captures exercise the package asset path.
+        if let Some(slot) = session
+            .packages
+            .melee_weapons
+            .iter()
+            .find(|weapon| weapon.model.is_some())
+            .and_then(|weapon| {
+                session.hotbar.iter().position(|held| *held == Some(weapon.item))
+            })
+        {
+            session.selected = slot as u8 + 1;
+        }
+    }
+}
 
 fn record_metrics(
     time: Res<Time>,
     options: Res<Options>,
     world: Res<VoxelWorld>,
     stats: Res<VoxelRenderStats>,
+    scatter: Res<scatter::ScatterWorld>,
     mut session: ResMut<ClientSession>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1285,7 +1345,7 @@ fn record_metrics(
             }
         };
         info!(
-            "CLIENT_METRICS elapsed_s={:.1} frames={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} chunks={} meshes={} triangles={} jobs={} upload_bytes={} stale_jobs={} pending_inputs={} max_correction={:.3}",
+            "CLIENT_METRICS elapsed_s={:.1} frames={} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} chunks={} meshes={} triangles={} jobs={} upload_bytes={} stale_jobs={} pending_inputs={} scatter={} grass={} max_correction={:.3}",
             session.started.elapsed().as_secs_f64(),
             session.frame,
             percentile(0.5),
@@ -1298,6 +1358,8 @@ fn record_metrics(
             stats.uploaded_bytes,
             stats.stale_jobs,
             session.pending.len(),
+            scatter.instance_count(),
+            stats.grass_blades,
             session.max_correction
         );
         session.frame_times.clear();

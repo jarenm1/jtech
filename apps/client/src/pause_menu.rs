@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_blocks_look_and_selection_and_resume_does_not_click_through() {
+    fn escape_blocks_look_and_resume_does_not_click_through() {
         let mut app = app();
         {
             let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
