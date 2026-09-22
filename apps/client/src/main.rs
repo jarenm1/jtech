@@ -684,10 +684,11 @@ fn receive_network(
                 revision,
                 packages,
                 bow_shots_per_second,
+                melee_weapons,
             } => {
                 session
                     .packages
-                    .receive(revision, packages, bow_shots_per_second);
+                    .receive(revision, packages, bow_shots_per_second, melee_weapons);
             }
             ServerMessage::Inventory { inventory } => {
                 session.inventory = inventory;
@@ -1043,7 +1044,7 @@ fn edit_blocks(
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
     let direction = look_direction(session.yaw, session.pitch);
     let melee = buttons.pressed(MouseButton::Left)
-        && melee_target(&world, origin, direction, &actors, &remotes, session.held_item());
+        && melee_target(&world, origin, direction, &actors, &remotes, &session);
     if melee {
         session.attack_pending = true;
     }
@@ -1068,20 +1069,19 @@ fn edit_blocks(
 }
 
 /// True when a living actor or remote player is under the crosshair within
-/// melee range and no terrain blocks the swing. Client-side routing only.
 fn melee_target(
     world: &VoxelWorld,
     origin: Vec3,
     direction: Vec3,
     actors: &RemoteActors,
     remotes: &RemotePlayers,
-    selected: u8,
+    session: &ClientSession,
 ) -> bool {
-    let spec = gameplay::combat::melee_spec(selected);
+    let range = session.packages.melee_range(session.held_item());
     let wall = world
-        .raycast(origin, direction, spec.range)
+        .raycast(origin, direction, range)
         .map(|hit| hit.distance)
-        .unwrap_or(spec.range);
+        .unwrap_or(range);
     let shape = physics::CollisionShape::default();
     actors
         .0

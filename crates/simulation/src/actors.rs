@@ -116,6 +116,7 @@ impl Simulation {
     /// apply to misses and hits alike; dead players and noclip attackers cannot
     /// swing.
     pub(super) fn resolve_attacks(&mut self, world: &VoxelWorld) {
+        let melee = self.packages.melee_table();
         let attackers: Vec<u64> = self
             .players
             .iter()
@@ -124,6 +125,11 @@ impl Simulation {
                     && !player.state.noclip
                     && player.input.attack
                     && self.tick >= player.attack_ready
+                    // Registered weapons require ownership; hands, blocks and
+                    // the bow swing the unarmed default as before.
+                    && melee
+                        .spec(player.input.selected)
+                        .is_none_or(|_| player.inventory.count(player.input.selected) > 0)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -143,7 +149,9 @@ impl Simulation {
             self.swing_actor(world, actor_id);
         }
         for id in attackers {
-            let spec = gameplay::combat::melee_spec(self.players[&id].input.selected);
+            let spec = melee
+                .spec(self.players[&id].input.selected)
+                .unwrap_or(gameplay::combat::MELEE_HANDS);
             let player = &self.players[&id];
             let origin = player.state.position + Vec3::Y * EYE_HEIGHT;
             let direction = look_direction(player.input.yaw, player.input.pitch);
@@ -196,7 +204,11 @@ impl Simulation {
     /// One actor swing: level aim along the actor's yaw against every other
     /// living actor and player. Consumes the intent edge and starts cooldown.
     fn swing_actor(&mut self, world: &VoxelWorld, id: u32) {
-        let spec = gameplay::combat::melee_spec(self.actors[&id].intent.held_item);
+        let spec = self
+            .packages
+            .melee_table()
+            .spec(self.actors[&id].intent.held_item)
+            .unwrap_or(gameplay::combat::MELEE_HANDS);
         let actor = &self.actors[&id];
         let origin = actor.state.motion.position + Vec3::Y * EYE_HEIGHT;
         let direction = look_direction(actor.state.yaw, 0.0);

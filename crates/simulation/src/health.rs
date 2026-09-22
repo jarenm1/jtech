@@ -144,6 +144,7 @@ impl Simulation {
             return false;
         };
         self.cancel_player_strikes(id);
+        let loadout: Vec<(u8, u32)> = self.packages.melee_table().spawn_items().to_vec();
         let player = self.players.get_mut(&id).expect("respawn checked player");
         player.state.position = position;
         player.state.velocity = Vec3::ZERO;
@@ -160,6 +161,18 @@ impl Simulation {
         player.pending.clear();
         player.body_push_velocity = Vec3::ZERO;
         player.health = Health::default();
+        // Death scatters the old inventory; the package loadout replaces it.
+        let melee = self.packages.melee_table();
+        for (item, count) in loadout {
+            if melee.kind(item) == protocol::ItemKind::Equipment {
+                for _ in 0..count {
+                    player.inventory.add_equipment(item);
+                }
+            } else {
+                player.inventory.add(item, count);
+            }
+        }
+        player.inventory_dirty = true;
         player.life = next_life;
         player.respawn_requested = false;
         player.physics_revision = None;
@@ -364,6 +377,10 @@ mod tests {
         assert!(sim.respawn_player(&world, 1, 0));
         assert_eq!(sim.players[&1].life, 1);
         assert_eq!(sim.player_health(1), Some(Health::default()));
+        // The package loadout is re-granted after death scattered the old gear.
+        for item in [7u8, 8, 9] {
+            assert_eq!(sim.players[&1].inventory.count(item), 1);
+        }
         let player = &sim.players[&1];
         assert!(!player.state.noclip);
         assert_eq!(player.state.velocity, Vec3::ZERO);

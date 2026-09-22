@@ -1053,6 +1053,16 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             continue;
         };
         player.state.position = position;
+        let melee = sim.packages.melee_table();
+        for &(item, count) in melee.spawn_items() {
+            if melee.kind(item) == protocol::ItemKind::Equipment {
+                for _ in 0..count {
+                    player.inventory.add_equipment(item);
+                }
+            } else {
+                player.inventory.add(item, count);
+            }
+        }
         let spawn = player.state;
         let health = player.health;
         let inventory = player.inventory.clone();
@@ -1518,6 +1528,51 @@ mod tests {
     }
 
     #[test]
+    fn package_weapons_require_ownership_and_apply_their_spec() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set_block(IVec3::new(x, 0, z), voxel_world::STONE).unwrap();
+            }
+        }
+        let dummy = sim.spawn_actor(Vec3::new(2.5, 1.0, 0.5)).unwrap();
+        let mut player = Player::new();
+        player.state.position = Vec3::new(2.5, 1.0, 3.5);
+        player.input.pitch = 0.0;
+        player.input.yaw = 0.0;
+        player.input.attack = true;
+        // The war hammer is registered by packages/melee but not owned: the
+        // swing is refused outright rather than downgraded to hands.
+        player.input.selected = 8;
+        sim.players.insert(1, player);
+
+        sim.tick = 100;
+        sim.resolve_attacks(&world);
+        assert_eq!(sim.actor_health(dummy).unwrap().current(), 100);
+
+        sim.players.get_mut(&1).unwrap().inventory.add(8, 1);
+        sim.resolve_attacks(&world);
+        // Head-zone hit with the authored 30-damage spec.
+        assert_eq!(
+            sim.actor_health(dummy).unwrap().current(),
+            100 - 30 * gameplay::combat::HEADSHOT_MULTIPLIER
+        );
+        // The authored 60-tick cooldown, not the hands default, gates the next swing.
+        sim.tick += u64::from(gameplay::combat::MELEE_HANDS.cooldown_ticks);
+        sim.resolve_attacks(&world);
+        assert_eq!(
+            sim.actor_health(dummy).unwrap().current(),
+            100 - 30 * gameplay::combat::HEADSHOT_MULTIPLIER
+        );
+        sim.tick += 30;
+        sim.resolve_attacks(&world);
+        assert!(sim.actor_health(dummy).unwrap().is_depleted());
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
     fn controller_actors_use_authoritative_world_and_one_tick_per_update() {
         let mut app = headless_app(1);
         let spawn = app.world().resource::<Simulation>().spawn;
@@ -1858,6 +1913,36 @@ mod tests {
             1_000_003
         );
         assert!(sim.players[&1].inventory_dirty);
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
+    fn equipment_pickups_take_separate_slots_even_when_owned() {
+        let mut app = headless_app(1);
+        let (mut world, mut sim) = take_resources(&mut app);
+        let (_floor, ground) = drop_arena(&mut world, &sim);
+
+        let mut player = Player::new();
+        player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+        player.inventory.add_equipment(7);
+        sim.players.insert(1, player);
+        // A second knife drop is collected, not refused or merged.
+        sim.spawn_drop(ground.as_vec3() + Vec3::splat(0.5), 7, 1);
+        for _ in 0..40 {
+            sim.advance_drops(&world);
+        }
+        sim.collect_drops();
+        assert!(sim.drops.is_empty());
+        assert_eq!(sim.players[&1].inventory.count(7), 2);
+        assert_eq!(
+            sim.players[&1]
+                .inventory
+                .entries()
+                .iter()
+                .filter(|&&(item, _)| item == 7)
+                .count(),
+            2
+        );
         put_resources(&mut app, world, sim);
     }
 }

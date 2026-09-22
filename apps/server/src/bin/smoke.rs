@@ -42,7 +42,7 @@ struct Bot {
     explosions: Vec<(u32, Vec3, f32)>,
     inventory: Inventory,
     chunks: usize,
-    packages: Vec<(u64, Vec<PackageStatus>, u32)>,
+    packages: Vec<(u64, Vec<PackageStatus>, u32, Vec<protocol::MeleeWeaponInfo>)>,
     deltas: usize,
     forgotten: usize,
     corrections: usize,
@@ -50,6 +50,7 @@ struct Bot {
     yaw: f32,
     attack: bool,
     actors: HashMap<u32, ActorSnapshot>,
+    selected: u8,
     jitter: bool,
 }
 impl Bot {
@@ -84,6 +85,7 @@ impl Bot {
             yaw: 0.0,
             attack: false,
             actors: HashMap::new(),
+            selected: 0,
             max_error: 0.0,
             jitter,
         })
@@ -108,7 +110,7 @@ impl Bot {
                     self.life = 0;
                     require(health == Health::default(), "welcome health was not full")?;
                     self.health = Some(health);
-                    require(inventory.is_empty(), "welcome inventory was not empty")?;
+                    self.inventory = inventory;
                 }
                 ServerMessage::Chunk {
                     coord,
@@ -186,9 +188,10 @@ impl Bot {
                     revision,
                     packages,
                     bow_shots_per_second,
+                    melee_weapons,
                 } => self
                     .packages
-                    .push((revision, packages, bow_shots_per_second)),
+                    .push((revision, packages, bow_shots_per_second, melee_weapons)),
                 ServerMessage::Inventory { inventory } => self.inventory = inventory,
                 ServerMessage::Drops { .. } => {}
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
@@ -250,6 +253,7 @@ impl Bot {
             pitch,
             jump: movement != [0.0; 2],
             attack: self.attack,
+            selected: self.selected,
             ..Default::default()
         };
         if !self.health.is_some_and(Health::is_depleted) {
@@ -472,7 +476,7 @@ fn package_fixture() -> Result<(PathBuf, PathBuf, String)> {
 }
 
 fn latest_package(bot: &Bot) -> Option<(&PackageStatus, u32)> {
-    let (_, packages, rate) = bot.packages.last()?;
+    let (_, packages, rate, _) = bot.packages.last()?;
     Some((
         packages
             .iter()
@@ -932,8 +936,30 @@ fn main() -> Result<()> {
         repairs.iter().all(|c| first.world.chunks.contains_key(c)),
         "burst resync stranded a missing baseline",
     )?;
+    // Melee package: the loadout reached the welcome inventory and the weapon
+    // table replicated with the package set.
+    for item in [7u8, 8, 9] {
+        // check_health killed first: its gear scattered and may have been
+        // re-collected, so counts can exceed the granted one.
+        require(
+            first.inventory.count(item) >= 1 && second.inventory.count(item) >= 1,
+            "melee spawn loadout did not reach both bots",
+        )?;
+    }
+    {
+        let (_, _, _, weapons) = first
+            .packages
+            .last()
+            .ok_or("no package message received")?;
+        require(
+            weapons.len() == 3 && weapons.iter().any(|w| w.item == 8 && w.damage == 30),
+            "melee weapon table did not replicate",
+        )?;
+    }
     // Melee: walk to the training dummy, swing until it dies, watch it respawn.
     // Aim with the authoritative position: the server resolves swings there.
+    // Swing the granted war hammer: ownership is required for the authored spec.
+    first.selected = 8;
     let dummy = *first
         .actors
         .keys()
@@ -959,6 +985,7 @@ fn main() -> Result<()> {
         drive_first(&mut app, &mut first, &mut second, 34, movement, 0.0)?;
     }
     first.attack = false;
+    first.selected = 0;
     first.yaw = 0.0;
     require(
         first

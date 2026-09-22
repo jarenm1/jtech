@@ -22,18 +22,35 @@ impl Simulation {
         if recipients.is_empty() {
             return;
         }
+        let mut packages = self.packages.statuses();
+        packages.push(protocol::PackageStatus {
+            id: "terrain".into(),
+            generation: 1,
+            state: protocol::PackageState::Loaded,
+            error: None,
+        });
         let message = ServerMessage::Packages {
             revision,
-            packages: vec![
-                self.packages.status().clone(),
-                protocol::PackageStatus {
-                    id: "terrain".into(),
-                    generation: 1,
-                    state: protocol::PackageState::Loaded,
-                    error: None,
-                },
-            ],
+            packages,
             bow_shots_per_second: self.packages.shots_per_second(),
+            melee_weapons: {
+                let mut weapons: Vec<_> = self
+                    .packages
+                    .melee_table()
+                    .weapons()
+                    .map(|weapon| protocol::MeleeWeaponInfo {
+                        item: weapon.id,
+                        name: weapon.name.clone(),
+                        kind: protocol::ItemKind::Equipment,
+                        range: weapon.spec.range,
+                        damage: weapon.spec.damage,
+                        cooldown_ticks: weapon.spec.cooldown_ticks,
+                        knockback: weapon.spec.knockback,
+                    })
+                    .collect();
+                weapons.sort_by_key(|weapon| weapon.item);
+                weapons
+            },
         };
         for id in recipients {
             if self.send(id, &message) {

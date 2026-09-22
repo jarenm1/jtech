@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use bevy::{prelude::*, text::LineBreak};
-use protocol::{PackageState, PackageStatus};
+use protocol::{MeleeWeaponInfo, PackageState, PackageStatus};
 
 use crate::{ClientSession, game_hud::palette};
 
@@ -10,6 +10,9 @@ pub(crate) struct ServerPackages {
     pub revision: Option<u64>,
     pub statuses: Vec<PackageStatus>,
     pub bow_shots_per_second: u32,
+    /// Melee weapons replicated with the package set; drives swing routing
+    /// and item display names without client-side duplication.
+    pub melee_weapons: Vec<MeleeWeaponInfo>,
 }
 
 impl Default for ServerPackages {
@@ -18,6 +21,7 @@ impl Default for ServerPackages {
             revision: None,
             statuses: Vec::new(),
             bow_shots_per_second: protocol::EXPLOSIVE_BOW_SHOTS_PER_SECOND,
+            melee_weapons: Vec::new(),
         }
     }
 }
@@ -28,6 +32,7 @@ impl ServerPackages {
         revision: u64,
         statuses: Vec<PackageStatus>,
         bow_shots_per_second: u32,
+        melee_weapons: Vec<MeleeWeaponInfo>,
     ) {
         if self.revision.is_some_and(|current| revision <= current) {
             return;
@@ -36,6 +41,33 @@ impl ServerPackages {
         self.statuses = statuses;
         // Zero disables firing when no bow package is active.
         self.bow_shots_per_second = bow_shots_per_second;
+        self.melee_weapons = melee_weapons;
+    }
+
+    /// Swing reach for the held item; unarmed reach when the item is not a
+    /// replicated weapon.
+    pub fn melee_range(&self, item: u8) -> f32 {
+        self.melee_weapons
+            .iter()
+            .find(|weapon| weapon.item == item)
+            .map_or(gameplay::combat::MELEE_HANDS.range, |weapon| {
+                weapon.range
+            })
+    }
+
+    /// Authored display name for a replicated weapon item.
+    pub fn melee_name(&self, item: u8) -> Option<&str> {
+        self.melee_weapons
+            .iter()
+            .find(|weapon| weapon.item == item)
+            .map(|weapon| weapon.name.as_str())
+    }
+
+    /// Unique non-stacking items (weapons); everything else is a stack.
+    pub fn is_equipment(&self, item: u8) -> bool {
+        self.melee_weapons
+            .iter()
+            .any(|weapon| weapon.item == item && weapon.kind == protocol::ItemKind::Equipment)
     }
 }
 
@@ -152,11 +184,11 @@ mod tests {
     #[test]
     fn stale_package_messages_cannot_restore_old_state_or_firing_rate() {
         let mut packages = ServerPackages::default();
-        packages.receive(0, vec![status(0, PackageState::Loading)], 0);
+        packages.receive(0, vec![status(0, PackageState::Loading)], 0, vec![]);
         assert_eq!(packages.revision, Some(0));
-        packages.receive(2, vec![status(1, PackageState::Loaded)], 10);
+        packages.receive(2, vec![status(1, PackageState::Loaded)], 10, vec![]);
         for revision in [0, 1, 2] {
-            packages.receive(revision, vec![status(0, PackageState::Error)], 25);
+            packages.receive(revision, vec![status(0, PackageState::Error)], 25, vec![]);
         }
         assert_eq!(packages.revision, Some(2));
         assert_eq!(packages.bow_shots_per_second, 10);
@@ -193,7 +225,7 @@ mod tests {
             app.world_mut()
                 .resource_mut::<ClientSession>()
                 .packages
-                .receive(revision, vec![package], 10);
+                .receive(revision, vec![package], 10, vec![]);
             app.update();
             assert_eq!(
                 app.world().get::<Node>(panel).unwrap().display,

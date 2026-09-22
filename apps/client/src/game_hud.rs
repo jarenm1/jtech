@@ -328,11 +328,16 @@ pub(crate) fn update(
             palette::BORDER
         });
     }
-    **selected_label = Text::new(item_name(session.held_item()));
+    **selected_label = Text::new(item_name(&session, session.held_item()));
     for (slot, mut text) in &mut counts {
-        // The bow is not a carried stack; its tile shows no count.
+        // Equipment and the bow are not stacks; their tiles show no count.
         let item = session.hotbar[slot.index()];
-        let count = item.map(|item| session.inventory.count(item)).unwrap_or(0);
+        let stack = item.is_some_and(|item| !session.packages.is_equipment(item));
+        let count = if stack {
+            item.map(|item| session.inventory.count(item)).unwrap_or(0)
+        } else {
+            0
+        };
         text.0 = if count == 0 {
             String::new()
         } else {
@@ -341,6 +346,8 @@ pub(crate) fn update(
     }
     for (swatch, mut color) in &mut swatches {
         color.0 = match session.hotbar[swatch.index()] {
+            // Equipment is always usable; only stacks dim when spent.
+            Some(item) if session.packages.is_equipment(item) => item_swatch(item, false),
             Some(item) => item_swatch(item, session.inventory.count(item) == 0),
             None => palette::SLOT,
         };
@@ -363,8 +370,12 @@ pub(crate) fn update(
     }
 }
 
-/// Display name for an item id; unknown ids read as a numbered unknown.
-pub(crate) fn item_name(item: u8) -> String {
+/// Display name for an item id; replicated weapon names win, unknown ids read
+/// as a numbered unknown.
+pub(crate) fn item_name(session: &ClientSession, item: u8) -> String {
+    if let Some(name) = session.packages.melee_name(item) {
+        return name.to_string();
+    }
     match item {
         voxel_world::GRASS => "Grass".into(),
         voxel_world::DIRT => "Dirt".into(),
@@ -389,6 +400,10 @@ pub(crate) fn item_color(item: u8) -> Color {
         voxel_world::STONE => Color::srgb(0.55, 0.56, 0.58),
         voxel_world::SAND => Color::srgb(0.82, 0.73, 0.48),
         voxel_world::WOOD => Color::srgb(0.55, 0.38, 0.21),
+        // Melee weapons: cool steel hues distinct from terrain materials.
+        7 => Color::srgb(0.70, 0.72, 0.78),
+        8 => Color::srgb(0.48, 0.42, 0.55),
+        9 => Color::srgb(0.60, 0.55, 0.40),
         _ => palette::AMBER,
     }
 }

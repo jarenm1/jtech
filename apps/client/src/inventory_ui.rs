@@ -15,12 +15,12 @@ use protocol::EXPLOSIVE_BOW_ITEM;
 
 use crate::{ClientSession, game_hud, pause_menu::PauseMenu};
 
-/// Local inventory panel state. `shown` caches the last rendered inventory so
-/// the grid only rebuilds when the replicated contents change.
+/// Local inventory panel state. `shown` caches the last rendered inventory and
+/// weapon set so the grid only rebuilds when the replicated contents change.
 #[derive(Resource, Default)]
 pub(crate) struct InventoryUi {
     pub open: bool,
-    shown: Option<gameplay::Inventory>,
+    shown: Option<(gameplay::Inventory, Vec<protocol::MeleeWeaponInfo>)>,
 }
 
 /// Where a dragged stack came from.
@@ -148,23 +148,26 @@ pub(crate) fn sync(
         ui.shown = None;
         return;
     }
-    if ui.shown.as_ref() == Some(&session.inventory) {
+    let shown = (session.inventory.clone(), session.packages.melee_weapons.clone());
+    if ui.shown.as_ref() == Some(&shown) {
         return;
     }
-    ui.shown = Some(session.inventory.clone());
+    ui.shown = Some(shown);
     for cell in &cells {
         commands.entity(cell).despawn();
     }
     commands.entity(*grid).with_children(|grid| {
         // The bow is usable by everyone; show it ahead of carried stacks.
-        spawn_cell(grid, EXPLOSIVE_BOW_ITEM, None);
+        spawn_cell(grid, EXPLOSIVE_BOW_ITEM, game_hud::item_name(&session, EXPLOSIVE_BOW_ITEM), None);
         for &(item, count) in session.inventory.entries() {
-            spawn_cell(grid, item, Some(count));
+            // Equipment is unique; its cell shows no stack count.
+            let count = (!session.packages.is_equipment(item)).then_some(count);
+            spawn_cell(grid, item, game_hud::item_name(&session, item), count);
         }
     });
 }
 
-fn spawn_cell(grid: &mut ChildSpawnerCommands, item: u8, count: Option<u32>) {
+fn spawn_cell(grid: &mut ChildSpawnerCommands, item: u8, name: String, count: Option<u32>) {
     grid.spawn((
         Button,
         Node {
@@ -192,7 +195,7 @@ fn spawn_cell(grid: &mut ChildSpawnerCommands, item: u8, count: Option<u32>) {
             BorderRadius::all(px(3)),
         ));
         cell.spawn((
-            Text::new(game_hud::item_name(item)),
+            Text::new(name),
             TextFont {
                 font_size: 10.0,
                 ..default()

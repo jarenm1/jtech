@@ -101,7 +101,8 @@ pub struct Inventory {
     entries: Vec<ItemStack>,
 }
 
-// Reject malformed wire data: item 0, zero counts, or duplicate ids.
+// Reject malformed wire data: item 0 or zero counts. Duplicate ids are legal:
+// equipment occupies one entry per instance so future per-item meta has a home.
 #[derive(Deserialize)]
 struct InventoryEntries {
     entries: Vec<ItemStack>,
@@ -111,10 +112,9 @@ impl TryFrom<InventoryEntries> for Inventory {
     type Error = &'static str;
 
     fn try_from(value: InventoryEntries) -> Result<Self, Self::Error> {
-        let mut seen = std::collections::HashSet::new();
         for &(item, count) in &value.entries {
-            if item == 0 || count == 0 || !seen.insert(item) {
-                return Err("inventory entries must be unique, nonzero stacks");
+            if item == 0 || count == 0 {
+                return Err("inventory entries must be nonzero stacks");
             }
         }
         Ok(Self {
@@ -132,8 +132,14 @@ impl Inventory {
         self.entries.iter().position(|&(id, _)| id == item)
     }
 
+    /// Total owned count across every entry for `item`; equipment instances
+    /// each contribute their own entry.
     pub fn count(&self, item: u8) -> u32 {
-        self.position(item).map_or(0, |index| self.entries[index].1)
+        self.entries
+            .iter()
+            .filter(|&&(id, _)| id == item)
+            .map(|&(_, count)| count)
+            .sum()
     }
 
     pub fn total(&self) -> u64 {
@@ -168,18 +174,36 @@ impl Inventory {
         }
     }
 
-    /// Remove up to `amount`, returning how many were taken. Empty stacks are
-    /// dropped from the list.
-    pub fn take(&mut self, item: u8, amount: u32) -> u32 {
-        let Some(index) = self.position(item) else {
+    /// Add one equipment instance as its own entry, even when the item is
+    /// already owned. Returns 1, or 0 for item 0.
+    pub fn add_equipment(&mut self, item: u8) -> u32 {
+        if item == 0 {
             return 0;
-        };
-        let taken = amount.min(self.entries[index].1);
-        self.entries[index].1 -= taken;
-        if self.entries[index].1 == 0 {
-            self.entries.remove(index);
         }
-        taken
+        self.entries.push((item, 1));
+        1
+    }
+
+    /// Remove up to `amount` across every entry for `item`, returning how many
+    /// were taken. Empty entries are dropped from the list.
+    pub fn take(&mut self, item: u8, amount: u32) -> u32 {
+        let mut remaining = amount;
+        let mut index = 0;
+        while remaining > 0 && index < self.entries.len() {
+            if self.entries[index].0 != item {
+                index += 1;
+                continue;
+            }
+            let taken = remaining.min(self.entries[index].1);
+            self.entries[index].1 -= taken;
+            remaining -= taken;
+            if self.entries[index].1 == 0 {
+                self.entries.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        amount - remaining
     }
 }
 
@@ -243,6 +267,20 @@ mod tests {
         assert_eq!(inventory.take(7, 4), 4);
         assert!(inventory.is_empty());
         assert_eq!(inventory.take(3, 1), 0);
+    }
+
+    #[test]
+    fn equipment_instances_take_separate_entries() {
+        let mut inventory = Inventory::new();
+        assert_eq!(inventory.add_equipment(7), 1);
+        assert_eq!(inventory.add_equipment(7), 1);
+        assert_eq!(inventory.add_equipment(0), 0);
+        assert_eq!(inventory.entries(), &[(7, 1), (7, 1)]);
+        assert_eq!(inventory.count(7), 2);
+        assert_eq!(inventory.take(7, 1), 1);
+        assert_eq!(inventory.entries(), &[(7, 1)]);
+        assert_eq!(inventory.take(7, 5), 1);
+        assert!(inventory.is_empty());
     }
 
     #[test]

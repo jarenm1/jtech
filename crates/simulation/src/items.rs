@@ -93,8 +93,17 @@ impl Simulation {
     /// Add up to `amount` of `item` to a player's inventory. Returns the amount
     /// accepted; unknown players return `None`.
     pub fn grant_item(&mut self, id: u64, item: u8, amount: u32) -> Option<u32> {
+        let equipment =
+            self.packages.melee_table().kind(item) == protocol::ItemKind::Equipment;
         let player = self.players.get_mut(&id)?;
-        let granted = player.inventory.add(item, amount);
+        // Equipment instances each take an inventory slot; stacks merge.
+        let granted = if equipment {
+            (0..amount)
+                .map(|_| player.inventory.add_equipment(item))
+                .sum()
+        } else {
+            player.inventory.add(item, amount)
+        };
         if granted > 0 {
             player.inventory_dirty = true;
         }
@@ -106,9 +115,17 @@ impl Simulation {
     /// Leave a dropped stack at `position`. The authoritative destruction path
     /// calls this for grid and loose-block destruction alike.
     pub(super) fn spawn_drop(&mut self, position: Vec3, item: u8, count: u32) {
-        if item == 0 || item > voxel_world::WOOD || count == 0 || !position.is_finite() {
+        let equipment =
+            self.packages.melee_table().kind(item) == protocol::ItemKind::Equipment;
+        if item == 0
+            || (item > voxel_world::WOOD && !equipment)
+            || count == 0
+            || !position.is_finite()
+        {
             return;
         }
+        // Equipment drops carry a single copy regardless of the source count.
+        let count = if equipment { 1 } else { count };
         if self.drops.len() >= MAX_DROPS {
             self.drops.pop_front();
         }
@@ -152,6 +169,7 @@ impl Simulation {
             })
             .collect();
         players.sort_unstable_by_key(|(id, _)| *id);
+        let melee = self.packages.melee_table();
         let mut changed = false;
         for (id, center) in players {
             let mut index = 0;
@@ -163,15 +181,22 @@ impl Simulation {
                     index += 1;
                     continue;
                 }
+                let equipment = melee.kind(drop.snapshot.item) == protocol::ItemKind::Equipment;
                 let inventory = &mut self.players.get_mut(&id).unwrap().inventory;
-                if drop.collect(inventory) == 0 {
+                // Equipment always collects: each instance takes its own slot.
+                let taken = if equipment {
+                    inventory.add_equipment(drop.snapshot.item)
+                } else {
+                    drop.collect(inventory)
+                };
+                if taken == 0 {
                     // The stack is full; leave the remainder for later or for others.
                     index += 1;
                     continue;
                 }
                 self.players.get_mut(&id).unwrap().inventory_dirty = true;
                 changed = true;
-                if drop.snapshot.count == 0 {
+                if equipment || drop.snapshot.count == 0 {
                     self.drops.remove(index);
                 } else {
                     index += 1;
