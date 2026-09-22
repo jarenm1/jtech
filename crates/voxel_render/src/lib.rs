@@ -8,7 +8,7 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
 };
 use voxel_world::{
-    AIR, CHUNK_SIZE, ChunkNeighborhood, DIRT, SAND, STONE, VoxelWorld, block_color,
+    AIR, CHUNK_SIZE, ChunkNeighborhood, DIRT, SAND, STONE, VoxelWorld, block_color, chunk_coord,
 };
 
 const MAX_JOBS: usize = 16;
@@ -281,6 +281,42 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                 }
                 let normal = (-gradient).try_normalize().unwrap_or(Vec3::Y);
                 let material = neighborhood.block(corner(c, surface_corner));
+                // Blend toward the second-nearest solid corner's material by
+                // inverse distance so biome boundaries grade instead of
+                // stepping. The surface corner dominates; a much closer second
+                // corner only tints the transition band.
+                let mut second: Option<(u8, f32)> = None;
+                for i in 0..8 {
+                    if d[i] <= 0 || i == surface_corner {
+                        continue;
+                    }
+                    let distance = (position - corner(c, i).as_vec3()).length_squared();
+                    if second.is_none_or(|(_, best)| distance < best) {
+                        second = Some((i as u8, distance));
+                    }
+                }
+                let color = match second {
+                    Some((corner_index, second_distance)) => {
+                        let other = neighborhood.block(corner(c, corner_index as usize));
+                        let first_distance = (position
+                            - corner(c, surface_corner).as_vec3())
+                        .length_squared();
+                        // Weight of the secondary material: 0.4 when the two
+                        // corners are equidistant, fading to 0 as the second
+                        // corner recedes past twice the surface distance.
+                        let blend = (0.4
+                            * (2.0 - second_distance / (first_distance + 1e-6)))
+                        .clamp(0.0, 0.4);
+                        let (a, b) = (block_color(material), block_color(other));
+                        [
+                            a[0] + (b[0] - a[0]) * blend,
+                            a[1] + (b[1] - a[1]) * blend,
+                            a[2] + (b[2] - a[2]) * blend,
+                            a[3] + (b[3] - a[3]) * blend,
+                        ]
+                    }
+                    None => block_color(material),
+                };
                 // Displace along the pre-displacement normal (kept as-is: the
                 // bump is sub-voxel, so recomputing the gradient buys nothing).
                 // The heightfield is a pure function of world position, so a
@@ -290,18 +326,24 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                 vert_index[cell(c)] = mesh.positions.len() as u32;
                 mesh.positions.push(position.to_array());
                 mesh.normals.push(normal.to_array());
-                mesh.colors.push(block_color(material));
+                mesh.colors.push(color);
             }
         }
     }
 
-    // Every sign-changing lattice edge starting in 0..32 spawns the quad dual
-    // to it, through the four cells sharing the edge. Edges on the +faces are
-    // owned by the neighboring chunk and skipped here.
-    for y in 0..CHUNK_SIZE {
-        for z in 0..CHUNK_SIZE {
-            for x in 0..CHUNK_SIZE {
+    // Every sign-changing lattice edge starting in -1..32 spawns the quad dual
+    // to it, through the four cells sharing the edge. An edge belongs to the
+    // chunk containing its start lattice point; edges owned by a MISSING
+    // neighbor are emitted here as a fallback so streaming gaps don't leave
+    // cracks. Edges on +faces are owned by the +neighbor and skipped.
+    for y in -1..CHUNK_SIZE {
+        for z in -1..CHUNK_SIZE {
+            for x in -1..CHUNK_SIZE {
                 let c = IVec3::new(x, y, z);
+                let owner = chunk_coord(c);
+                if owner != IVec3::ZERO && neighborhood.has(owner) {
+                    continue;
+                }
                 for axis in 0..3 {
                     let mut step = IVec3::ZERO;
                     step[axis] = 1;
@@ -316,7 +358,14 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                     let mut ee = IVec3::ZERO;
                     eb[b] = 1;
                     ee[e] = 1;
-                    let ring = [c, c - eb, c - eb - ee, c - ee].map(|q| vert_index[cell(q)]);
+                    let ring_cells = [c, c - eb, c - eb - ee, c - ee];
+                    if ring_cells
+                        .iter()
+                        .any(|q| q.min_element() < -1 || q.max_element() >= CHUNK_SIZE)
+                    {
+                        continue;
+                    }
+                    let ring = ring_cells.map(|q| vert_index[cell(q)]);
                     if ring.contains(&u32::MAX) {
                         continue;
                     }
@@ -769,11 +818,15 @@ mod tests {
             let normal = Vec3::from_array(mesh.normals[i]);
             assert!((normal.length() - 1.0).abs() < 1e-4);
             assert_eq!(mesh.colors[i], block_color(STONE));
-            // The only interior surface is the top, just below y = 16.
+            // The interior top surface sits just below y = 16; the missing -y
+            // neighbor also yields a fallback bottom surface near y = -0.5.
             if position[0] > 1.0 && position[0] < 31.0 && position[2] > 1.0 && position[2] < 31.0
             {
-                assert!(position[1] > 15.0 && position[1] < 16.0);
-                assert_eq!(normal, Vec3::Y);
+                assert!(
+                    (position[1] > 15.0 && position[1] < 16.0)
+                        || (position[1] > -1.0 && position[1] < 0.0),
+                    "vertex at {position:?}"
+                );
             }
         }
         // Every triangle's geometric winding agrees with its vertex normals.
