@@ -41,49 +41,11 @@ pub const MELEE_HANDS: MeleeSpec = MeleeSpec {
     knockback: 320.0,
 };
 
-/// Tool items (not placeable blocks): the early-game weapon ladder.
-pub const ITEM_ROCK: u8 = 7;
-pub const ITEM_HATCHET: u8 = 8;
-pub const ITEM_PICKAXE: u8 = 9;
-/// Highest valid inventory item id.
-pub const MAX_ITEM: u8 = ITEM_PICKAXE;
 
-/// Hotbar slot to inventory item: slots 1-5 mirror block materials, 6 is the
-/// bow, 7 the bedroll, 8-10 the tools. Shared by client and server so the
-/// replicated `selected` slot resolves identically on both sides.
-pub fn slot_item(slot: u8) -> u8 {
-    match slot {
-        7 => voxel_world::BEDROLL,
-        8 => ITEM_ROCK,
-        9 => ITEM_HATCHET,
-        10 => ITEM_PICKAXE,
-        other => other,
-    }
-}
-
-/// Melee profile for the held item; anything without a tool swings hands.
-pub fn melee_spec(item: u8) -> MeleeSpec {
-    match item {
-        ITEM_ROCK => MeleeSpec {
-            range: 3.0,
-            damage: 15,
-            cooldown_ticks: 30,
-            knockback: 400.0,
-        },
-        ITEM_PICKAXE => MeleeSpec {
-            range: 3.2,
-            damage: 20,
-            cooldown_ticks: 36,
-            knockback: 360.0,
-        },
-        ITEM_HATCHET => MeleeSpec {
-            range: 3.2,
-            damage: 25,
-            cooldown_ticks: 40,
-            knockback: 320.0,
-        },
-        _ => MELEE_HANDS,
-    }
+/// Melee profile for the held item; the extension point for authored weapons.
+/// Every current item swings hands.
+pub fn melee_spec(_item: u8) -> MeleeSpec {
+    MELEE_HANDS
 }
 
 /// Fraction of the target's height counting as the head zone (top quarter).
@@ -260,13 +222,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_specs_outdamage_hands_and_slots_map_to_items() {
-        assert!(melee_spec(ITEM_ROCK).damage > MELEE_HANDS.damage);
-        assert!(melee_spec(ITEM_HATCHET).damage > melee_spec(ITEM_ROCK).damage);
+    fn every_item_swings_hands() {
         assert_eq!(melee_spec(0), MELEE_HANDS);
-        assert_eq!(slot_item(3), 3);
-        assert_eq!(slot_item(7), voxel_world::BEDROLL);
-        assert_eq!(slot_item(8), ITEM_ROCK);
-        assert_eq!(slot_item(10), ITEM_PICKAXE);
+        assert_eq!(melee_spec(6), MELEE_HANDS);
     }
 }

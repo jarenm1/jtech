@@ -10,7 +10,7 @@ use bevy::{
     prelude::*,
     text::LineBreak,
 };
-use protocol::EXPLOSIVE_BOW_SLOT;
+use protocol::EXPLOSIVE_BOW_ITEM;
 
 use crate::ClientSession;
 
@@ -46,17 +46,40 @@ const SLOT_GAP: f32 = 8.0;
 #[derive(Component)]
 pub(crate) struct HotbarSlot(u8);
 
+impl HotbarSlot {
+    /// Zero-based index into `ClientSession::hotbar`.
+    pub(crate) fn index(&self) -> usize {
+        usize::from(self.0) - 1
+    }
+}
+
 #[derive(Component)]
 pub(crate) struct SelectedLabel;
 
 #[derive(Component)]
 pub(crate) struct ConnectionStatus;
 
-#[derive(Component)]
-pub(crate) struct SlotCount(u8);
 /// Material swatch inside a hotbar tile; dimmed while the stack is empty.
 #[derive(Component)]
 pub(crate) struct Swatch(u8);
+
+impl Swatch {
+    /// Zero-based index into `ClientSession::hotbar`.
+    fn index(&self) -> usize {
+        usize::from(self.0) - 1
+    }
+}
+
+/// Stack count label inside a hotbar tile.
+#[derive(Component)]
+pub(crate) struct SlotCount(u8);
+
+impl SlotCount {
+    /// Zero-based index into `ClientSession::hotbar`.
+    fn index(&self) -> usize {
+        usize::from(self.0) - 1
+    }
+}
 
 
 #[derive(Component)]
@@ -217,6 +240,7 @@ fn spawn_hotbar(commands: &mut Commands) {
             .with_children(|row| {
                 for slot in 1..=10 {
                     row.spawn((
+                        Button,
                         Node {
                             width: px(SLOT_SIZE),
                             height: px(SLOT_SIZE),
@@ -231,62 +255,32 @@ fn spawn_hotbar(commands: &mut Commands) {
                         HotbarSlot(slot),
                     ))
                     .with_children(|tile| {
-                        if slot == EXPLOSIVE_BOW_SLOT {
-                            tile.spawn(Node {
-                                flex_direction: FlexDirection::Column,
-                                align_items: AlignItems::Center,
+                        tile.spawn((
+                            Node {
+                                width: percent(70),
+                                height: percent(70),
                                 ..default()
-                            })
-                            .with_children(|icon| {
-                                for width in [6.0_f32, 12.0, 18.0] {
-                                    icon.spawn((
-                                        Node {
-                                            width: px(width),
-                                            height: px(3),
-                                            ..default()
-                                        },
-                                        BackgroundColor(palette::AMBER),
-                                    ));
-                                }
-                                icon.spawn((
-                                    Node {
-                                        width: px(4),
-                                        height: px(8),
-                                        ..default()
-                                    },
-                                    BackgroundColor(palette::AMBER),
-                                ));
-                            });
-                        } else {
-                            tile.spawn((
-                                Node {
-                                    width: percent(70),
-                                    height: percent(70),
-                                    ..default()
-                                },
-                                BackgroundColor(swatch(slot)),
-                                Swatch(slot),
-                                BorderRadius::all(px(3)),
-                            ));
-                        }
-                        if slot != EXPLOSIVE_BOW_SLOT {
-                            tile.spawn((
-                                Text::new(""),
-                                TextFont {
-                                    font_size: 13.0,
-                                    ..default()
-                                },
-                                TextColor(palette::IVORY),
-                                TextShadow::default(),
-                                Node {
-                                    position_type: PositionType::Absolute,
-                                    bottom: px(2),
-                                    right: px(5),
-                                    ..default()
-                                },
-                                SlotCount(slot),
-                            ));
-                        }
+                            },
+                            BackgroundColor(palette::SLOT),
+                            Swatch(slot),
+                            BorderRadius::all(px(3)),
+                        ));
+                        tile.spawn((
+                            Text::new(""),
+                            TextFont {
+                                font_size: 13.0,
+                                ..default()
+                            },
+                            TextColor(palette::IVORY),
+                            TextShadow::default(),
+                            Node {
+                                position_type: PositionType::Absolute,
+                                bottom: px(2),
+                                right: px(5),
+                                ..default()
+                            },
+                            SlotCount(slot),
+                        ));
                     });
                 }
             });
@@ -334,9 +328,11 @@ pub(crate) fn update(
             palette::BORDER
         });
     }
-    **selected_label = Text::new(slot_name(session.selected));
+    **selected_label = Text::new(item_name(session.held_item()));
     for (slot, mut text) in &mut counts {
-        let count = session.inventory.count(slot_item(slot.0));
+        // The bow is not a carried stack; its tile shows no count.
+        let item = session.hotbar[slot.index()];
+        let count = item.map(|item| session.inventory.count(item)).unwrap_or(0);
         text.0 = if count == 0 {
             String::new()
         } else {
@@ -344,7 +340,10 @@ pub(crate) fn update(
         };
     }
     for (swatch, mut color) in &mut swatches {
-        color.0 = swatch_color(swatch.0, session.inventory.count(slot_item(swatch.0)) == 0);
+        color.0 = match session.hotbar[swatch.index()] {
+            Some(item) => item_swatch(item, session.inventory.count(item) == 0),
+            None => palette::SLOT,
+        };
     }
 
     let (node, text, color) = &mut *status;
@@ -364,46 +363,34 @@ pub(crate) fn update(
     }
 }
 
-fn slot_name(slot: u8) -> &'static str {
-    match slot {
-        1 => "Foundation",
-        2 => "Floor",
-        3 => "Wall",
-        4 => "Pillar",
-        voxel_world::WOOD => "Wood",
-        EXPLOSIVE_BOW_SLOT => "Explosive Bow",
-        7 => "Bedroll",
-        8 => "Rock",
-        9 => "Hatchet",
-        10 => "Pickaxe",
-        _ => "Empty",
+/// Display name for an item id; unknown ids read as a numbered unknown.
+pub(crate) fn item_name(item: u8) -> String {
+    match item {
+        voxel_world::GRASS => "Grass".into(),
+        voxel_world::DIRT => "Dirt".into(),
+        voxel_world::STONE => "Stone".into(),
+        voxel_world::SAND => "Sand".into(),
+        voxel_world::WOOD => "Wood".into(),
+        EXPLOSIVE_BOW_ITEM => "Explosive Bow".into(),
+        other => format!("Item {other}"),
     }
 }
 /// Empty stacks keep their material hue at low alpha so the tile reads as spent.
-fn swatch_color(slot: u8, empty: bool) -> Color {
-    let color = swatch(slot);
+fn item_swatch(item: u8, empty: bool) -> Color {
+    let color = item_color(item);
     if empty { color.with_alpha(0.25) } else { color }
 }
 
-
-fn swatch(slot: u8) -> Color {
-    match slot {
+/// Base swatch color for an item id.
+pub(crate) fn item_color(item: u8) -> Color {
+    match item {
         voxel_world::GRASS => Color::srgb(0.36, 0.60, 0.26),
         voxel_world::DIRT => Color::srgb(0.45, 0.30, 0.19),
         voxel_world::STONE => Color::srgb(0.55, 0.56, 0.58),
         voxel_world::SAND => Color::srgb(0.82, 0.73, 0.48),
         voxel_world::WOOD => Color::srgb(0.55, 0.38, 0.21),
-        7 => Color::srgb(0.62, 0.48, 0.70),
-        8 => Color::srgb(0.50, 0.50, 0.52),
-        9 => Color::srgb(0.60, 0.42, 0.25),
-        10 => Color::srgb(0.45, 0.45, 0.50),
         _ => palette::AMBER,
     }
-}
-
-/// Hotbar slot to inventory item, shared with the server's melee-spec lookup.
-fn slot_item(slot: u8) -> u8 {
-    gameplay::combat::slot_item(slot)
 }
 
 #[cfg(test)]
@@ -422,7 +409,7 @@ mod tests {
     #[test]
     fn hotbar_accents_exactly_the_selected_slot() {
         let mut app = app_with_hud();
-        for selected in [3, EXPLOSIVE_BOW_SLOT, 1] {
+        for selected in [3, 6, 1] {
             app.world_mut().resource_mut::<ClientSession>().selected = selected;
             app.update();
             let world = app.world_mut();

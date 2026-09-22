@@ -1,5 +1,5 @@
 use bevy::{prelude::*, window::CursorOptions};
-use protocol::EXPLOSIVE_BOW_SLOT;
+use protocol::EXPLOSIVE_BOW_ITEM;
 
 use crate::{
     ClientSession,
@@ -66,7 +66,7 @@ pub(crate) fn cycle_on_click(
     if session.health.is_depleted() {
         return;
     }
-    if cursor.visible && session.selected == EXPLOSIVE_BOW_SLOT {
+    if cursor.visible && session.held_item() == EXPLOSIVE_BOW_ITEM {
         for interaction in &buttons {
             if *interaction == Interaction::Pressed {
                 session.bow_power = session.bow_power.next();
@@ -82,7 +82,7 @@ pub(crate) fn update(
     mut label: Single<&mut Text, With<PowerLabel>>,
 ) {
     let (node, interaction, color) = &mut *button;
-    node.display = if session.selected == EXPLOSIVE_BOW_SLOT {
+    node.display = if session.held_item() == EXPLOSIVE_BOW_ITEM {
         Display::Flex
     } else {
         Display::None
@@ -104,7 +104,7 @@ mod tests {
     fn clicks_cycle_once_only_with_bow_and_released_cursor() {
         let mut app = App::new();
         app.insert_resource(ClientSession {
-            selected: EXPLOSIVE_BOW_SLOT,
+            selected: 6,
             ..default()
         })
         .add_systems(Startup, |mut commands: Commands| spawn(&mut commands))

@@ -31,7 +31,7 @@ pub(super) struct Drop {
 }
 
 impl Drop {
-    fn new(id: u32, position: Vec3, item: u8, count: u16) -> Self {
+    fn new(id: u32, position: Vec3, item: u8, count: u32) -> Self {
         // The golden angle spreads successive drops without shared RNG state.
         let angle = id as f32 * 2.399_963_2;
         let velocity = Vec3::new(angle.cos(), 0.0, angle.sin()) * DROP_SPREAD + Vec3::Y * DROP_POP;
@@ -82,7 +82,7 @@ impl Drop {
     }
 
     /// Merge as much of this stack as `inventory` accepts; returns the amount taken.
-    pub(super) fn collect(&mut self, inventory: &mut Inventory) -> u16 {
+    pub(super) fn collect(&mut self, inventory: &mut Inventory) -> u32 {
         let taken = inventory.add(self.snapshot.item, self.snapshot.count);
         self.snapshot.count -= taken;
         taken
@@ -91,8 +91,8 @@ impl Drop {
 
 impl Simulation {
     /// Add up to `amount` of `item` to a player's inventory. Returns the amount
-    /// accepted before the stack ceiling; unknown players return `None`.
-    pub fn grant_item(&mut self, id: u64, item: u8, amount: u16) -> Option<u16> {
+    /// accepted; unknown players return `None`.
+    pub fn grant_item(&mut self, id: u64, item: u8, amount: u32) -> Option<u32> {
         let player = self.players.get_mut(&id)?;
         let granted = player.inventory.add(item, amount);
         if granted > 0 {
@@ -105,8 +105,8 @@ impl Simulation {
 impl Simulation {
     /// Leave a dropped stack at `position`. The authoritative destruction path
     /// calls this for grid and loose-block destruction alike.
-    pub(super) fn spawn_drop(&mut self, position: Vec3, item: u8, count: u16) {
-        if item == 0 || item > gameplay::combat::MAX_ITEM || count == 0 || !position.is_finite() {
+    pub(super) fn spawn_drop(&mut self, position: Vec3, item: u8, count: u32) {
+        if item == 0 || item > voxel_world::WOOD || count == 0 || !position.is_finite() {
             return;
         }
         if self.drops.len() >= MAX_DROPS {
@@ -211,7 +211,7 @@ impl Simulation {
             .map(|(&id, _)| id)
             .collect();
         for id in dirty {
-            let inventory = self.players[&id].inventory;
+            let inventory = self.players[&id].inventory.clone();
             if self.send(id, &ServerMessage::Inventory { inventory }) {
                 self.players.get_mut(&id).unwrap().inventory_dirty = false;
             }

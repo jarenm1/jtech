@@ -41,7 +41,7 @@ fn setup(
     commands.insert_resource(LooseBlockAssets {
         // Debris reads as a rounded blob, not a regriddable cube.
         mesh: meshes.add(Sphere::new(0.55).mesh().ico(2).unwrap()),
-        materials: (0..=voxel_world::BEDROLL)
+        materials: (0..=voxel_world::WOOD)
             .map(|id| {
                 let [r, g, b, _] = voxel_world::block_color(id);
                 materials.add(StandardMaterial {

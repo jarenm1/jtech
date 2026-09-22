@@ -143,9 +143,7 @@ impl Simulation {
             self.swing_actor(world, actor_id);
         }
         for id in attackers {
-            let spec = gameplay::combat::melee_spec(gameplay::combat::slot_item(
-                self.players[&id].input.selected,
-            ));
+            let spec = gameplay::combat::melee_spec(self.players[&id].input.selected);
             let player = &self.players[&id];
             let origin = player.state.position + Vec3::Y * EYE_HEIGHT;
             let direction = look_direction(player.input.yaw, player.input.pitch);

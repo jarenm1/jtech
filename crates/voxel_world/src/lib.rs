@@ -19,9 +19,6 @@ pub const DIRT: u8 = 2;
 pub const STONE: u8 = 3;
 pub const SAND: u8 = 4;
 pub const WOOD: u8 = 5;
-/// Placeable respawn anchor: placing binds the owner's respawn, destroying
-/// clears it. Soft like sand so raiding a bedroll is cheap.
-pub const BEDROLL: u8 = 6;
 /// Lowest world block coordinate covered by the chunk range.
 pub const WORLD_MIN_Y: i32 = MIN_CHUNK_Y * CHUNK_SIZE;
 /// Highest world block coordinate covered by the chunk range.
@@ -118,7 +115,6 @@ pub fn block_color(block: u8) -> [f32; 4] {
         STONE => [0.048, 0.060, 0.073, 1.0],  // #3C444B weathered flint
         SAND => [0.076, 0.049, 0.027, 1.0],   // #4A3C2C dark ochre
         WOOD => [0.024, 0.011, 0.006, 1.0],   // #2A1D14 dark timber
-        BEDROLL => [0.047, 0.018, 0.030, 1.0], // #3A2430 dark wine
         _ => [0.0; 4],
     }
 }
@@ -222,7 +218,7 @@ impl Chunk {
     }
     /// Write the full voxel state. Expands storage tiers as needed.
     pub fn set_voxel(&mut self, index: usize, voxel: Voxel) {
-        debug_assert!(voxel.material <= BEDROLL);
+        debug_assert!(voxel.material <= WOOD);
         let implied = voxel.density == Voxel::implied_density(voxel.material) && !voxel.placed;
         match &self.storage {
             Storage::Uniform(old) => {
@@ -280,7 +276,7 @@ impl Chunk {
     pub fn from_runs(revision: u64, runs: &[(u16, u8)]) -> Result<Self, String> {
         let mut total = 0usize;
         for &(count, block) in runs {
-            if count == 0 || block > BEDROLL {
+            if count == 0 || block > WOOD {
                 return Err("zero run or invalid block".into());
             }
             total += count as usize;
@@ -321,7 +317,7 @@ impl Chunk {
         let expand = |runs: &[(u16, u8)]| -> Result<Vec<u8>, String> {
             let mut out = Vec::with_capacity(CHUNK_VOLUME);
             for &(count, block) in runs {
-                if count == 0 || block & !PLACED_FLAG > BEDROLL {
+                if count == 0 || block & !PLACED_FLAG > WOOD {
                     return Err("zero run or invalid block".into());
                 }
                 if out.len() + count as usize > CHUNK_VOLUME {
@@ -485,7 +481,7 @@ impl VoxelWorld {
     /// `block != AIR` writes a player-placed cube the smooth mesher ignores.
     /// Terrain carving goes through [`Self::brush_dig`].
     pub fn set_block(&mut self, pos: IVec3, block: u8) -> Option<(u64, u64)> {
-        if block > BEDROLL {
+        if block > WOOD {
             return None;
         }
         let voxel = if block == AIR {
@@ -498,7 +494,7 @@ impl VoxelWorld {
     /// Write a full voxel state; used by journal restore and wire deltas.
     /// Returns `(old_revision, new_revision)` when the voxel changed.
     pub fn set_voxel(&mut self, pos: IVec3, voxel: Voxel) -> Option<(u64, u64)> {
-        if voxel.material > BEDROLL {
+        if voxel.material > WOOD {
             return None;
         }
         let chunk = self.chunks.get_mut(&chunk_coord(pos))?;
@@ -575,7 +571,7 @@ impl VoxelWorld {
     /// Deposit terrain: adds density with a linear falloff, adopting
     /// `material` where the voxel becomes solid. Placed cubes are untouched.
     pub fn brush_add(&mut self, center: Vec3, radius: f32, material: u8) -> Vec<BrushEdit> {
-        if material == AIR || material > BEDROLL {
+        if material == AIR || material > WOOD {
             return Vec::new();
         }
         self.brush(center, radius, Some(material))

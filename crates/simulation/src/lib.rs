@@ -6,7 +6,6 @@ mod actors;
 mod blast_jump_tests;
 #[cfg(test)]
 mod bombardment_tests;
-mod building;
 mod bow;
 mod bow_server;
 mod explosion;
@@ -187,9 +186,6 @@ impl Plugin for SimulationPlugin {
                 spawn_chunks,
                 actors: HashMap::new(),
                 next_actor: 1,
-                pieces: BTreeMap::new(),
-                next_piece: 1,
-                piece_revision: 0,
             })
             .add_systems(Update, advance);
         // The training dummy shares the player spawn volume so it is always
@@ -232,10 +228,6 @@ struct Player {
     attack_ready: u64,
     inventory: Inventory,
     inventory_dirty: bool,
-    /// Placed bedroll piece anchoring respawn, if bound.
-    respawn_point: Option<u32>,
-    /// Last building-piece revision this player was sent.
-    piece_revision: Option<u64>,
 }
 impl Player {
     fn new() -> Self {
@@ -263,8 +255,6 @@ impl Player {
             inventory: Inventory::default(),
             attack_ready: 0,
             inventory_dirty: false,
-            respawn_point: None,
-            piece_revision: None,
         }
     }
     fn snapshot(&self, id: u64) -> PlayerSnapshot {
@@ -344,11 +334,6 @@ pub struct Simulation {
     spawn_chunks: HashSet<IVec3>,
     actors: actors::ActorMap,
     next_actor: u32,
-    /// Free-placed building primitives by id; never join the voxel grid.
-    pieces: BTreeMap<u32, gameplay::building::Piece>,
-    next_piece: u32,
-    /// Bumped on every piece set change; drives `Building` replication.
-    piece_revision: u64,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -621,7 +606,6 @@ impl Simulation {
                 .apply_contact(world, &tool_contact(target, material))
                 .map(Some);
         }
-        // Voxel placement is gone: free-placed pieces arrive via `Place`.
         if block != 0 {
             return Err(EditRejection::InvalidTarget);
         }
@@ -949,7 +933,7 @@ fn validate_edit_target(
     revision: u64,
 ) -> Result<(), EditRejection> {
     let coord = chunk_coord(target);
-    if block > voxel_world::BEDROLL
+    if block > voxel_world::WOOD
         || target.y <= MIN_CHUNK_Y * CHUNK_SIZE
         || !valid_coord(coord)
         || !player.interest.contains(&coord)
@@ -1058,12 +1042,11 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     }
     for (id, session) in incoming.connected {
         let mut player = Player::new();
-        let mut bodies = sim
+        let bodies = sim
             .physics
             .as_ref()
             .map(|p| p.dynamic_colliders())
             .unwrap_or_default();
-        bodies.extend(sim.piece_colliders());
         let Some(position) = terrain_stream::available_spawn(&world, sim.spawn, &bodies) else {
             eprintln!("connect id={id} rejected: no clear supported spawn in the loaded area");
             sim.drop_player(id);
@@ -1072,7 +1055,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         player.state.position = position;
         let spawn = player.state;
         let health = player.health;
-        let inventory = player.inventory;
+        let inventory = player.inventory.clone();
         sim.players.insert(id, player);
         sim.send(
             id,
@@ -1091,12 +1074,11 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         sim.accept_inputs(id, packet);
     }
     // Only one command advances each actor per server tick, regardless of packet rate.
-    let mut bodies = sim
+    let bodies = sim
         .physics
         .as_ref()
         .map(|p| p.dynamic_colliders())
         .unwrap_or_default();
-    bodies.extend(sim.piece_colliders());
     for player in sim.players.values_mut() {
         if player.health.is_depleted() {
             // Dead players are frozen: no input movement, noclip, or GPU body push
@@ -1197,14 +1179,6 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 target,
                 expected_revision,
             } => sim.edit(&mut world, id, request, target, 0, expected_revision, true),
-            ClientMessage::Place {
-                request,
-                kind,
-                yaw_steps,
-            } => sim.place_piece(&world, id, request, kind, yaw_steps),
-            ClientMessage::HitPiece { request, piece } => {
-                sim.hit_piece(&world, id, request, piece)
-            }
             ClientMessage::FireBow {
                 request,
                 yaw,
@@ -1235,12 +1209,10 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     sim.advance_drops(&world);
     sim.collect_drops();
     sim.replicate_inventory();
-    sim.replicate_pieces();
     if sim.tick.is_multiple_of(3) {
         sim.replicate_drops();
     }
     let mut needed = std::mem::take(&mut sim.needed);
-    needed.clear();
     // One chunk of safety beyond visible interest ensures swept bodies never reach unloaded edges.
     for player in sim.players.values() {
         needed.extend(player.safety.iter().copied());
@@ -1403,7 +1375,6 @@ fn observe_character_bodies(sim: Res<Simulation>, mut bodies: ResMut<controller:
         .as_ref()
         .map(|p| p.dynamic_colliders())
         .unwrap_or_default();
-    bodies.0.extend(sim.piece_colliders());
 }
 
 #[cfg(test)]
@@ -1494,135 +1465,6 @@ mod tests {
         player.known.insert(IVec3::ZERO, 2);
         assert!(!valid_player_edit(&world, &player, 100, 1, target, 0, 2));
         assert_eq!(world.block(target), Some(5));
-    }
-
-    /// Player aiming level at the +Z face of a solid block at eye height,
-    /// standing back far enough that a placed box clears their body while
-    /// the piece's near face stays inside melee range.
-    fn aiming_player() -> Player {
-        let mut player = Player::new();
-        player.state.position = Vec3::new(2.5, 4.0, 6.0);
-        player
-    }
-
-    /// All-air world with one solid block at (2, 5, 2): its +Z face sits at
-    /// z = 3, four metres from the aiming player's eye.
-    fn piece_world() -> VoxelWorld {
-        let mut world = empty_world();
-        world
-            .set_block(IVec3::new(2, 5, 2), voxel_world::STONE)
-            .unwrap();
-        world
-    }
-
-    #[test]
-    fn place_piece_requires_stock_and_spends_wood() {
-        use gameplay::building::PieceKind;
-        let mut app = headless_app(1);
-        let (_generated, mut sim) = take_resources(&mut app);
-        let world = piece_world();
-        sim.players.insert(1, aiming_player());
-
-        // Empty stock rejects before any piece exists.
-        sim.tick = 100;
-        sim.place_piece(&world, 1, 1, PieceKind::Pillar, 0);
-        assert_eq!(
-            sim.players[&1].results.back().unwrap().1,
-            Err(EditRejection::OutOfStock)
-        );
-        assert!(sim.pieces.is_empty());
-
-        // Granted wood places the pillar and spends exactly one item.
-        sim.players
-            .get_mut(&1)
-            .unwrap()
-            .inventory
-            .add(voxel_world::WOOD, 1);
-        sim.tick = 200;
-        sim.place_piece(&world, 1, 2, PieceKind::Pillar, 0);
-        assert_eq!(sim.players[&1].results.back().unwrap().1, Ok(None));
-        assert_eq!(sim.players[&1].inventory.count(voxel_world::WOOD), 0);
-        assert!(sim.players[&1].inventory_dirty);
-        assert_eq!(sim.pieces.len(), 1);
-        assert_eq!(sim.piece_revision, 1);
-        let piece = sim.pieces.values().next().unwrap();
-        assert_eq!(piece.kind, PieceKind::Pillar);
-        assert_eq!(piece.health, PieceKind::Pillar.health());
-        put_resources(&mut app, world, sim);
-    }
-
-    #[test]
-    fn place_piece_rejects_overlap_with_another_piece() {
-        use gameplay::building::{Piece, PieceKind};
-        let mut app = headless_app(1);
-        let (_generated, mut sim) = take_resources(&mut app);
-        let world = piece_world();
-        let mut player = aiming_player();
-        player.inventory.add(voxel_world::WOOD, 1);
-        sim.players.insert(1, player);
-        // A foundation astride the volume the aimed pillar would occupy.
-        sim.pieces.insert(
-            7,
-            Piece {
-                id: 7,
-                kind: PieceKind::Foundation,
-                position: Vec3::new(2.5, 6.0, 4.0),
-                yaw_steps: 0,
-                health: PieceKind::Foundation.health(),
-            },
-        );
-        sim.tick = 100;
-        sim.place_piece(&world, 1, 1, PieceKind::Pillar, 0);
-        assert_eq!(
-            sim.players[&1].results.back().unwrap().1,
-            Err(EditRejection::Occupied)
-        );
-        assert_eq!(sim.pieces.len(), 1);
-        assert_eq!(sim.players[&1].inventory.count(voxel_world::WOOD), 1);
-        put_resources(&mut app, world, sim);
-    }
-
-    #[test]
-    fn hit_piece_damages_then_destroys_and_unbinds_respawn() {
-        use gameplay::building::PieceKind;
-        let mut app = headless_app(1);
-        let (_generated, mut sim) = take_resources(&mut app);
-        let world = piece_world();
-        let mut player = aiming_player();
-        player.inventory.add(voxel_world::BEDROLL, 1);
-        sim.players.insert(1, player);
-
-        // Placing the bedroll binds respawn to the new piece id.
-        sim.tick = 100;
-        sim.place_piece(&world, 1, 1, PieceKind::Bedroll, 0);
-        assert_eq!(sim.players[&1].results.back().unwrap().1, Ok(None));
-        let piece_id = *sim.pieces.keys().next().unwrap();
-        assert_eq!(sim.players[&1].respawn_point, Some(piece_id));
-
-        // Swings chip health without removing the piece.
-        sim.hit_piece(&world, 1, 2, piece_id);
-        assert_eq!(
-            sim.players[&1].results.back().unwrap().1,
-            Ok(Some(f32::from(gameplay::combat::MELEE_HANDS.damage)))
-        );
-        assert_eq!(
-            sim.pieces[&piece_id].health,
-            PieceKind::Bedroll.health() - gameplay::combat::MELEE_HANDS.damage
-        );
-
-        // The depleting blow removes the piece, drops its item, and unbinds.
-        for request in 3..6 {
-            sim.hit_piece(&world, 1, request, piece_id);
-        }
-        assert!(!sim.pieces.contains_key(&piece_id));
-        assert_eq!(sim.players[&1].respawn_point, None);
-        assert_eq!(
-            sim.drops
-                .back()
-                .map(|drop| (drop.snapshot.item, drop.snapshot.count)),
-            Some((voxel_world::BEDROLL, 1))
-        );
-        put_resources(&mut app, world, sim);
     }
 
     #[test]
@@ -1971,7 +1813,7 @@ mod tests {
         let mut app = headless_app(1);
         let (_world, mut sim) = take_resources(&mut app);
         for (item, count, position) in [
-            (0_u8, 1_u16, Vec3::ZERO),
+            (0_u8, 1_u32, Vec3::ZERO),
             (10, 1, Vec3::ZERO),
             (3, 0, Vec3::ZERO),
             (3, 1, Vec3::new(f32::NAN, 0.0, 0.0)),
@@ -1995,55 +1837,27 @@ mod tests {
     }
 
     #[test]
-    fn collection_keeps_the_remainder_when_the_stack_is_full() {
+    fn collection_merges_into_uncapped_stacks() {
         let mut app = headless_app(1);
         let (mut world, mut sim) = take_resources(&mut app);
         let (_floor, ground) = drop_arena(&mut world, &sim);
 
         let mut player = Player::new();
         player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
-        player
-            .inventory
-            .add(voxel_world::STONE, gameplay::MAX_STACK);
+        player.inventory.add(voxel_world::STONE, 1_000_000);
         sim.players.insert(1, player);
         sim.spawn_drop(ground.as_vec3() + Vec3::splat(0.5), voxel_world::STONE, 3);
         for _ in 0..40 {
             sim.advance_drops(&world);
         }
         sim.collect_drops();
-        assert_eq!(sim.drops.len(), 1);
-        assert_eq!(sim.drops[0].snapshot.count, 3);
-        assert!(!sim.players[&1].inventory_dirty);
-
-        let taken = sim
-            .players
-            .get_mut(&1)
-            .unwrap()
-            .inventory
-            .take(voxel_world::STONE, 2);
-        assert_eq!(taken, 2);
-        sim.collect_drops();
-        assert_eq!(sim.drops[0].snapshot.count, 1);
-        assert_eq!(
-            sim.players[&1].inventory.count(voxel_world::STONE),
-            gameplay::MAX_STACK
-        );
-
-        sim.players.get_mut(&1).unwrap().inventory_dirty = false;
-        assert_eq!(
-            sim.players
-                .get_mut(&1)
-                .unwrap()
-                .inventory
-                .take(voxel_world::STONE, 1),
-            1
-        );
-        sim.collect_drops();
+        // Uncapped stacks take the whole drop; nothing is left behind.
         assert!(sim.drops.is_empty());
         assert_eq!(
             sim.players[&1].inventory.count(voxel_world::STONE),
-            gameplay::MAX_STACK
+            1_000_003
         );
+        assert!(sim.players[&1].inventory_dirty);
         put_resources(&mut app, world, sim);
     }
 }

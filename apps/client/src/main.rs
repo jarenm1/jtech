@@ -1,10 +1,10 @@
 use controller::PlayerInput;
 mod bow_power_hud;
-mod building;
 mod death_overlay;
 mod drops;
 mod game_hud;
 mod health_hud;
+mod inventory_ui;
 mod lighting;
 mod loose_blocks;
 mod package_hud;
@@ -26,7 +26,7 @@ use bevy::{
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerState, look_direction};
 use protocol::{
-    BowPower, ClientMessage, EXPLOSIVE_BOW_SLOT, EditRejection, Health, InputPacket, Inventory,
+    BowPower, ClientMessage, EXPLOSIVE_BOW_ITEM, EditRejection, Health, InputPacket, Inventory,
     ServerMessage, Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
@@ -106,7 +106,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-4 building piece (R rotate) | 5 wood | 6 explosive bow | 7 bedroll | 8-10 tools | Esc pause menu | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-0 hotbar | Tab inventory | Esc pause menu | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -139,10 +139,11 @@ struct ClientSession {
     yaw: f32,
     pitch: f32,
     correction: Vec3,
+    /// Selected hotbar slot, 1-10.
     selected: u8,
+    /// Item id assigned to each hotbar slot; `None` is an empty slot.
+    hotbar: [Option<u8>; 10],
     bow_power: BowPower,
-    // Quarter-turn rotation for the held building piece.
-    yaw_steps: u8,
     packages: package_hud::ServerPackages,
     request: u64,
     accepted_edits: u64,
@@ -203,9 +204,13 @@ impl Default for ClientSession {
             yaw: 0.0,
             pitch: -0.25,
             correction: Vec3::ZERO,
-            selected: 3,
+            selected: 6,
+            hotbar: {
+                let mut hotbar = [None; 10];
+                hotbar[5] = Some(EXPLOSIVE_BOW_ITEM);
+                hotbar
+            },
             bow_power: BowPower::default(),
-            yaw_steps: 0,
             packages: package_hud::ServerPackages::default(),
             request: 0,
             accepted_edits: 0,
@@ -224,6 +229,15 @@ impl Default for ClientSession {
 }
 
 impl ClientSession {
+    /// Item id the selected hotbar slot holds; 0 means empty hands.
+    fn held_item(&self) -> u8 {
+        self.hotbar
+            .get(usize::from(self.selected) - 1)
+            .copied()
+            .flatten()
+            .unwrap_or(0)
+    }
+
     fn capture_jump(&mut self, enabled: bool, pressed: bool) {
         self.jump_pending = enabled && (self.jump_pending || pressed);
     }
@@ -359,7 +373,6 @@ struct ClientPlugin;
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(controller::ControllerPlugin::default());
-        app.insert_resource(Time::<Fixed>::from_hz(60.0));
         app.add_systems(
             FixedUpdate,
             observe_character_bodies.in_set(controller::ControllerSet::Intent),
@@ -369,7 +382,15 @@ impl Plugin for ClientPlugin {
             .init_resource::<RemoteActors>()
             .init_resource::<pause_menu::PauseMenu>()
             .init_resource::<death_overlay::DeathOverlay>()
+            .init_resource::<inventory_ui::InventoryUi>()
             .add_systems(Startup, setup)
+            .add_systems(
+                Update,
+                (inventory_ui::input, inventory_ui::sync, inventory_ui::drag)
+                    .chain()
+                    .before(pause_menu::sync),
+            )
+            .add_systems(Update, (capture_screenshot, record_metrics))
             .add_systems(
                 Update,
                 (
@@ -380,6 +401,7 @@ impl Plugin for ClientPlugin {
                     death_overlay::input,
                     death_overlay::actions,
                     death_overlay::sync,
+                    pause_menu::sync_cursor,
                     controls,
                     bow_power_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
                     predict,
@@ -391,8 +413,6 @@ impl Plugin for ClientPlugin {
                     health_hud::update,
                     bow_power_hud::update,
                     package_hud::update,
-                    capture_screenshot,
-                    record_metrics,
                 )
                     .chain(),
             );
@@ -422,7 +442,6 @@ fn main() {
             VoxelRenderPlugin,
             ClientPlugin,
             loose_blocks::LooseBlocksPlugin,
-            building::BuildingPlugin,
             projectiles::ProjectilesPlugin,
             drops::DropsPlugin,
         ))
@@ -495,6 +514,7 @@ fn setup(
         Visibility::Hidden,
         Selection,
     ));
+    inventory_ui::spawn(&mut commands);
     game_hud::spawn(&mut commands);
     pause_menu::spawn(&mut commands);
     death_overlay::spawn(&mut commands);
@@ -518,8 +538,6 @@ fn receive_network(
     projectile_assets: Res<projectiles::ProjectileAssets>,
     mut drops: ResMut<drops::Drops>,
     drop_assets: Res<drops::DropAssets>,
-    mut building: ResMut<building::Building>,
-    building_assets: Res<building::BuildingAssets>,
 ) {
     let Some(transport) = &mut session.transport else {
         return;
@@ -546,7 +564,6 @@ fn receive_network(
             } => {
                 projectiles.clear(&mut commands);
                 drops.clear(&mut commands);
-                building.clear(&mut commands);
                 session.packages = package_hud::ServerPackages::default();
                 session.id = Some(id);
                 session.session = token;
@@ -591,7 +608,7 @@ fn receive_network(
                     && to == from.saturating_add(voxels.len() as u64)
                     && voxels.iter().all(|(cell, voxel)| {
                         usize::from(*cell) < voxel_world::CHUNK_VOLUME
-                            && voxel.material <= voxel_world::BEDROLL
+                            && voxel.material <= voxel_world::WOOD
                     });
                 if !valid {
                     session.resync(coord);
@@ -639,9 +656,6 @@ fn receive_network(
             }
             ServerMessage::Physics { tick, bodies } => {
                 loose.receive(tick, &bodies, &mut commands, &loose_assets);
-            }
-            ServerMessage::Building { revision, pieces } => {
-                building.receive(revision, &pieces, &mut commands, &building_assets);
             }
             ServerMessage::Projectiles { tick, arrows } => {
                 projectiles.receive(
@@ -700,12 +714,7 @@ fn receive_network(
         if snapshot.tick <= session.last_tick || Some(snapshot.you.id) != session.id {
             continue;
         }
-        let colliders: Vec<_> = loose
-            .colliders()
-            .iter()
-            .chain(building.colliders())
-            .copied()
-            .collect();
+        let colliders: Vec<_> = loose.colliders().to_vec();
         reconcile(&mut session, &world, &snapshot, &colliders);
         let now = Instant::now();
         remotes.0.retain(|id, remote| {
@@ -876,10 +885,8 @@ fn controls(
     }
     session.selected = selected_slot(&keys).unwrap_or(session.selected);
     if !options.bot && !cursor.visible && keys.just_pressed(KeyCode::KeyR) {
-        if session.selected == EXPLOSIVE_BOW_SLOT {
+        if session.held_item() == EXPLOSIVE_BOW_ITEM {
             session.bow_power = session.bow_power.next();
-        } else if gameplay::building::slot_piece(session.selected).is_some() {
-            session.yaw_steps = (session.yaw_steps + 1) % 4;
         }
     }
 }
@@ -912,7 +919,6 @@ fn predict(
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
     loose: Res<loose_blocks::LooseBlocks>,
-    building: Res<building::Building>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
     if session.id.is_none() || session.transport.is_none() {
@@ -949,12 +955,7 @@ fn predict(
         keys.just_pressed(KeyCode::Space),
     );
     session.accumulator += time.delta_secs().min(0.1);
-    let colliders: Vec<_> = loose
-        .colliders()
-        .iter()
-        .chain(building.colliders())
-        .copied()
-        .collect();
+    let colliders: Vec<_> = loose.colliders().to_vec();
     while session.accumulator >= FIXED_DT {
         session.accumulator -= FIXED_DT;
         // Stop producing new commands when the acknowledgement window is full.
@@ -990,11 +991,11 @@ fn predict(
             movement,
             yaw: session.yaw,
             pitch: session.pitch,
+            selected: session.held_item(),
             jump,
             descend,
             noclip: session.noclip_requested,
             attack: session.consume_attack(),
-            selected: session.selected,
         };
         session.predict_input(&world, input, &colliders);
     }
@@ -1025,7 +1026,6 @@ fn edit_blocks(
     remotes: Res<RemotePlayers>,
     time: Res<Time>,
     mut bow_repeat: Local<BowRepeat>,
-    building: Res<building::Building>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
     if menu.blocks_gameplay()
@@ -1043,7 +1043,7 @@ fn edit_blocks(
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
     let direction = look_direction(session.yaw, session.pitch);
     let melee = buttons.pressed(MouseButton::Left)
-        && melee_target(&world, origin, direction, &actors, &remotes, session.selected);
+        && melee_target(&world, origin, direction, &actors, &remotes, session.held_item());
     if melee {
         session.attack_pending = true;
     }
@@ -1051,18 +1051,18 @@ fn edit_blocks(
     let bow_shot = repeat_bow(
         &mut bow_repeat,
         time.elapsed_secs_f64(),
-        session.selected == EXPLOSIVE_BOW_SLOT
+        session.held_item() == EXPLOSIVE_BOW_ITEM
             && buttons.pressed(MouseButton::Right)
             && !strike
             && !hit,
         session.packages.bow_shots_per_second,
     );
-    let secondary = if session.selected == EXPLOSIVE_BOW_SLOT {
+    let secondary = if session.held_item() == EXPLOSIVE_BOW_ITEM {
         bow_shot
     } else {
         buttons.just_pressed(MouseButton::Right)
     };
-    if let Some(message) = block_action(&mut session, &world, &building, strike, hit, secondary) {
+    if let Some(message) = block_action(&mut session, &world, strike, hit, secondary) {
         session.send(message);
     }
 }
@@ -1077,7 +1077,7 @@ fn melee_target(
     remotes: &RemotePlayers,
     selected: u8,
 ) -> bool {
-    let spec = gameplay::combat::melee_spec(gameplay::combat::slot_item(selected));
+    let spec = gameplay::combat::melee_spec(selected);
     let wall = world
         .raycast(origin, direction, spec.range)
         .map(|hit| hit.distance)
@@ -1133,13 +1133,12 @@ fn repeat_bow(repeat: &mut BowRepeat, now: f64, held: bool, rate: u32) -> bool {
 fn block_action(
     session: &mut ClientSession,
     world: &VoxelWorld,
-    building: &building::Building,
     strike: bool,
     hit: bool,
     secondary: bool,
 ) -> Option<ClientMessage> {
     // Bow shots do not need a nearby grid target. The server owns the arrow origin.
-    if !strike && !hit && secondary && session.selected == EXPLOSIVE_BOW_SLOT {
+    if !strike && !hit && secondary && session.held_item() == EXPLOSIVE_BOW_ITEM {
         session.request += 1;
         return Some(ClientMessage::FireBow {
             request: session.request,
@@ -1148,39 +1147,12 @@ fn block_action(
             power: session.bow_power,
         });
     }
-    // Building slots place free-standing pieces; the server re-raycasts the aim.
-    if !strike && !hit && secondary {
-        let kind = gameplay::building::slot_piece(session.selected)?;
-        if session.inventory.count(kind.item()) == 0 {
-            return None;
-        }
-        session.request += 1;
-        return Some(ClientMessage::Place {
-            request: session.request,
-            kind,
-            yaw_steps: session.yaw_steps,
-        });
-    }
     if !strike && !hit {
         return None;
     }
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
     let direction = look_direction(session.yaw, session.pitch);
-    // A piece under the crosshair takes the hit before terrain does.
-    let pieces = building.gameplay_pieces();
-    let piece_hit =
-        gameplay::building::raycast_pieces(origin, direction, 6.0, pieces.iter());
-    let terrain = world.raycast(origin, direction, 6.0);
-    if let Some((piece, distance)) = piece_hit
-        && terrain.is_none_or(|hit| distance <= hit.distance)
-    {
-        session.request += 1;
-        return Some(ClientMessage::HitPiece {
-            request: session.request,
-            piece,
-        });
-    }
-    let hit = terrain?;
+    let hit = world.raycast(origin, direction, 6.0)?;
     let expected_revision = world.chunks.get(&chunk_coord(hit.block))?.revision;
     session.request += 1;
     let request = session.request;
@@ -1252,9 +1224,10 @@ fn select_voxel(
     world: Res<VoxelWorld>,
     session: Res<ClientSession>,
     menu: Res<pause_menu::PauseMenu>,
+    inventory: Res<inventory_ui::InventoryUi>,
     mut selection: Single<(&mut Transform, &mut Visibility), With<Selection>>,
 ) {
-    if menu.blocks_gameplay() || session.health.is_depleted() {
+    if menu.blocks_gameplay() || inventory.open || session.health.is_depleted() {
         *selection.1 = Visibility::Hidden;
         return;
     }
@@ -1340,10 +1313,8 @@ mod tests;
 
 fn observe_character_bodies(
     loose: Res<loose_blocks::LooseBlocks>,
-    building: Res<building::Building>,
     mut bodies: ResMut<controller::ObservedBodies>,
 ) {
     bodies.0.clear();
     bodies.0.extend_from_slice(loose.colliders());
-    bodies.0.extend_from_slice(building.colliders());
 }

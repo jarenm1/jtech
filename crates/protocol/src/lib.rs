@@ -1,13 +1,13 @@
 mod bow_power;
 pub use bow_power::BowPower;
 use controller::PlayerInput;
-pub use gameplay::{Health, Inventory, building::PieceKind};
+pub use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
 use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -15,13 +15,13 @@ pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_ARROWS: usize = 32;
 /// Ceiling for one complete dropped-item replication, matching the server bound.
 pub const MAX_DROPS: usize = 64;
-pub const EXPLOSIVE_BOW_SLOT: u8 = 6;
+/// Item id of the package-loaded explosive bow. It is not a carried stack:
+/// every client may hotbar it regardless of inventory contents.
+pub const EXPLOSIVE_BOW_ITEM: u8 = 6;
 pub const EXPLOSIVE_BOW_SHOTS_PER_SECOND: u32 = 25;
 /// Horizontal chunk radius shared by server configuration and client camera bounds.
 pub const DEFAULT_VIEW_RADIUS: i32 = 16;
 pub const MAX_VIEW_RADIUS: i32 = 64;
-/// Ceiling for the placed building-piece set, matching the server bound.
-pub const MAX_PIECES: usize = gameplay::building::MAX_PIECES;
 
 /// Authoritative action rejection, also used for completed queued debug strikes.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,16 +43,6 @@ pub enum EditRejection {
     OutOfStock,
 }
 
-/// One placed building primitive. `position` is the box center; `yaw_steps`
-/// counts quarter turns about Y. Free-standing AABBs, never voxel cells.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PieceSnapshot {
-    pub id: u32,
-    pub kind: PieceKind,
-    pub position: Vec3,
-    pub yaw_steps: u8,
-    pub health: u16,
-}
 
 /// One voxel's replicated state. Material bytes in chunk runs carry the
 /// placed flag in the high bit; deltas send it as a plain field instead.
@@ -73,20 +63,6 @@ pub enum ClientMessage {
         target: IVec3,
         block: u8,
         expected_revision: u64,
-    },
-    /// Place a building piece at the surface the player is aiming at. The
-    /// server re-raycasts the aim and validates clearance; `yaw_steps` is the
-    /// client's chosen quarter-turn rotation.
-    Place {
-        request: u64,
-        kind: PieceKind,
-        yaw_steps: u8,
-    },
-    /// Melee strike against a placed piece. The server re-raycasts against the
-    /// piece set and applies the held tool's damage.
-    HitPiece {
-        request: u64,
-        piece: u32,
     },
     Resync {
         coord: IVec3,
@@ -175,12 +151,6 @@ pub enum ServerMessage {
         tick: u64,
         drops: Vec<DropSnapshot>,
     },
-    /// Complete replacement of the bounded building-piece set, sent reliably
-    /// on every change.
-    Building {
-        revision: u64,
-        pieces: Vec<PieceSnapshot>,
-    },
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PackageState {
@@ -216,7 +186,7 @@ pub struct ArrowSnapshot {
 pub struct DropSnapshot {
     pub id: u32,
     pub item: u8,
-    pub count: u16,
+    pub count: u32,
     pub position: Vec3,
 }
 
@@ -275,7 +245,6 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gameplay::MAX_STACK;
 
     #[test]
     fn player_health_round_trips_in_welcome_and_snapshot() {
@@ -427,7 +396,13 @@ mod tests {
     fn inventory_and_drops_round_trip_in_one_frame() {
         let mut inventory = Inventory::default();
         assert_eq!(inventory.add(3, 12), 12);
-        let bytes = encode(&ServerMessage::Inventory { inventory }, MAX_FRAME).unwrap();
+        let bytes = encode(
+            &ServerMessage::Inventory {
+                inventory: inventory.clone(),
+            },
+            MAX_FRAME,
+        )
+        .unwrap();
         let ServerMessage::Inventory {
             inventory: decoded, ..
         } = decode(&bytes, MAX_FRAME).unwrap()
@@ -455,11 +430,18 @@ mod tests {
     }
 
     #[test]
-    fn inventory_decode_rejects_counts_above_the_stack_ceiling() {
-        let bytes = encode(&[1_u16, 0, 0, 0, 0, 0, 0, 0, 0, MAX_STACK], MAX_FRAME).unwrap();
+    fn inventory_decode_rejects_malformed_stacks() {
+        // Item 0, zero counts and duplicate ids are not valid inventories.
+        for entries in [
+            vec![(0_u8, 5_u32)],
+            vec![(3, 0)],
+            vec![(3, 1), (3, 2)],
+        ] {
+            let bytes = encode(&entries, MAX_FRAME).unwrap();
+            assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_err());
+        }
+        let bytes = encode(&vec![(3_u8, 5_u32), (7, 2)], MAX_FRAME).unwrap();
         assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_ok());
-        let bytes = encode(&[1_u16, 0, 0, 0, 0, 0, 0, 0, 0, MAX_STACK + 1], MAX_FRAME).unwrap();
-        assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_err());
     }
 
     #[test]
