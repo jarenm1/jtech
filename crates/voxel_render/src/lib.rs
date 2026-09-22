@@ -13,7 +13,7 @@ const MAX_JOBS: usize = 16;
 const STARTS_PER_FRAME: usize = 8;
 const UPLOADS_PER_FRAME: usize = 8;
 const UPLOAD_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
-type Stamp = [Option<u64>; 7];
+type Stamp = [Option<u64>; 27];
 
 #[derive(Resource, Default)]
 pub struct RenderFocus(pub Vec3);
@@ -77,10 +77,11 @@ impl MeshData {
     }
 }
 
-/// Greedily merges coplanar exposed faces of the same opaque material.
-/// Coordinates are chunk-local; only the six axial neighbor chunks are sampled.
+/// Greedily merges coplanar exposed faces of player-placed cubes. Terrain
+/// density never culls a placed face: a cube buried in rock still draws.
+/// Coordinates are chunk-local; neighbor chunks supply the occlusion samples.
 /// Scratch space is one fixed 32x32 mask; output is bounded by six faces per voxel.
-pub fn greedy_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
+pub fn placed_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
     let mut mesh = MeshData::default();
     let size = CHUNK_SIZE as usize;
     let mut mask = [AIR; (CHUNK_SIZE * CHUNK_SIZE) as usize];
@@ -97,13 +98,13 @@ pub fn greedy_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
                         cell[axis] = layer;
                         cell[u_axis] = u as i32;
                         cell[v_axis] = v as i32;
-                        let block = neighborhood.block(cell);
-                        mask[u + v * size] =
-                            if block != AIR && neighborhood.block(cell + normal) == AIR {
-                                block
-                            } else {
-                                AIR
-                            };
+                        mask[u + v * size] = if neighborhood.placed(cell)
+                            && !neighborhood.placed(cell + normal)
+                        {
+                            neighborhood.block(cell)
+                        } else {
+                            AIR
+                        };
                     }
                 }
                 for v in 0..size {
@@ -142,6 +143,160 @@ pub fn greedy_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
             }
         }
     }
+    mesh
+}
+
+/// Naive surface nets over the signed density field: one vertex per cell whose
+/// eight corner densities straddle zero, quads spanning every sign-changing
+/// lattice edge. Cells -1..=31 are evaluated so quads owned by this chunk can
+/// reach one cell into negative neighbors; the 27-chunk neighborhood supplies
+/// those samples. An edge belongs to the chunk containing its start lattice
+/// point, so boundary quads are emitted exactly once and vertices coincide
+/// bitwise across the seam (same world densities, same arithmetic).
+pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
+    const LATTICE: i32 = CHUNK_SIZE + 2; // density samples at -1..=32
+    const CELLS: i32 = CHUNK_SIZE + 1; // dual cells at -1..=31
+    let lattice = |p: IVec3| -> usize {
+        ((p.x + 1) + LATTICE * ((p.z + 1) + LATTICE * (p.y + 1))) as usize
+    };
+    let cell = |c: IVec3| -> usize {
+        ((c.x + 1) + CELLS * ((c.z + 1) + CELLS * (c.y + 1))) as usize
+    };
+    let mut field = vec![0i8; (LATTICE * LATTICE * LATTICE) as usize];
+    for y in -1..=CHUNK_SIZE {
+        for z in -1..=CHUNK_SIZE {
+            for x in -1..=CHUNK_SIZE {
+                let p = IVec3::new(x, y, z);
+                field[lattice(p)] = neighborhood.density(p);
+            }
+        }
+    }
+
+    // Corner (dx,dy,dz) is bit dx | dy<<1 | dz<<2; the 12 edges pair corners
+    // differing in exactly one bit.
+    const EDGES: [[usize; 2]; 12] = [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [6, 7],
+        [0, 2],
+        [1, 3],
+        [4, 6],
+        [5, 7],
+        [0, 4],
+        [1, 5],
+        [2, 6],
+        [3, 7],
+    ];
+    let corner =
+        |c: IVec3, i: usize| c + IVec3::new(i as i32 & 1, (i as i32 >> 1) & 1, (i >> 2) as i32);
+
+    let mut mesh = MeshData::default();
+    let mut vert_index = vec![u32::MAX; (CELLS * CELLS * CELLS) as usize];
+    for y in -1..CHUNK_SIZE {
+        for z in -1..CHUNK_SIZE {
+            for x in -1..CHUNK_SIZE {
+                let c = IVec3::new(x, y, z);
+                let mut d = [0i8; 8];
+                for (i, d) in d.iter_mut().enumerate() {
+                    *d = field[lattice(corner(c, i))];
+                }
+                let solid = d[0] > 0;
+                if d.iter().all(|&s| (s > 0) == solid) {
+                    continue;
+                }
+                // Vertex at the mean of the edge zero crossings.
+                let mut position = Vec3::ZERO;
+                let mut crossings = 0.0;
+                for &[a, b] in &EDGES {
+                    let (da, db) = (d[a] as f32, d[b] as f32);
+                    if (da > 0.0) == (db > 0.0) {
+                        continue;
+                    }
+                    let t = da / (da - db);
+                    position += corner(c, a).as_vec3().lerp(corner(c, b).as_vec3(), t);
+                    crossings += 1.0;
+                }
+                position /= crossings;
+                // Trilinear gradient at the vertex; the normal points at air.
+                let t = position - c.as_vec3();
+                let (tx, ty, tz) = (t.x, t.y, t.z);
+                let wy = |i: usize| if i & 2 == 2 { ty } else { 1.0 - ty };
+                let wz = |i: usize| if i & 4 == 4 { tz } else { 1.0 - tz };
+                let wx = |i: usize| if i & 1 == 1 { tx } else { 1.0 - tx };
+                let mut gradient = Vec3::ZERO;
+                for i in 0..8 {
+                    let s = d[i] as f32;
+                    gradient.x += s * wy(i) * wz(i) * if i & 1 == 1 { 1.0 } else { -1.0 };
+                    gradient.y += s * wx(i) * wz(i) * if i & 2 == 2 { 1.0 } else { -1.0 };
+                    gradient.z += s * wx(i) * wy(i) * if i & 4 == 4 { 1.0 } else { -1.0 };
+                }
+                let normal = (-gradient).try_normalize().unwrap_or(Vec3::Y);
+                // Color from the densest corner: always solid, so never AIR.
+                let densest = (0..8).max_by_key(|&i| d[i]).unwrap();
+                let material = neighborhood.block(corner(c, densest));
+                vert_index[cell(c)] = mesh.positions.len() as u32;
+                mesh.positions.push(position.to_array());
+                mesh.normals.push(normal.to_array());
+                mesh.colors.push(block_color(material));
+            }
+        }
+    }
+
+    // Every sign-changing lattice edge starting in 0..32 spawns the quad dual
+    // to it, through the four cells sharing the edge. Edges on the +faces are
+    // owned by the neighboring chunk and skipped here.
+    for y in 0..CHUNK_SIZE {
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let c = IVec3::new(x, y, z);
+                for axis in 0..3 {
+                    let mut step = IVec3::ZERO;
+                    step[axis] = 1;
+                    let d0 = field[lattice(c)];
+                    let d1 = field[lattice(c + step)];
+                    if (d0 > 0) == (d1 > 0) {
+                        continue;
+                    }
+                    let b = (axis + 1) % 3;
+                    let e = (axis + 2) % 3;
+                    let mut eb = IVec3::ZERO;
+                    let mut ee = IVec3::ZERO;
+                    eb[b] = 1;
+                    ee[e] = 1;
+                    let ring = [c, c - eb, c - eb - ee, c - ee].map(|q| vert_index[cell(q)]);
+                    if ring.contains(&u32::MAX) {
+                        continue;
+                    }
+                    // Air sits on the side the edge leaves solid toward.
+                    let mut hint = Vec3::ZERO;
+                    hint[axis] = if d0 > 0 { 1.0 } else { -1.0 };
+                    let p = |i: usize| Vec3::from_array(mesh.positions[ring[i] as usize]);
+                    let geometric = (p(2) - p(0)).cross(p(3) - p(1));
+                    if geometric.dot(hint) > 0.0 {
+                        mesh.indices
+                            .extend([ring[0], ring[1], ring[2], ring[0], ring[2], ring[3]]);
+                    } else {
+                        mesh.indices
+                            .extend([ring[0], ring[2], ring[1], ring[0], ring[3], ring[2]]);
+                    }
+                }
+            }
+        }
+    }
+    mesh
+}
+
+/// Terrain surface plus placed cubes; placed vertices are appended after the
+/// smooth ones with indices rebased.
+pub fn mesh_chunk(neighborhood: &ChunkNeighborhood) -> MeshData {
+    let mut mesh = surface_nets(neighborhood);
+    let placed = placed_mesh(neighborhood);
+    let base = mesh.positions.len() as u32;
+    mesh.positions.extend(placed.positions);
+    mesh.normals.extend(placed.normals);
+    mesh.colors.extend(placed.colors);
+    mesh.indices.extend(placed.indices.iter().map(|i| i + base));
     mesh
 }
 
@@ -312,12 +467,23 @@ fn update_chunks(
     for &(_, coord) in &nearest[..nearest_len] {
         let neighborhood = world.neighborhood(coord);
         let stamp = neighborhood.stamp();
-        let empty = world.chunks[&coord].is_empty();
+        // An all-air center still owns boundary quads against solid neighbors,
+        // so meshing is skipped only when the whole neighborhood is empty.
+        let empty = (-1..=1).all(|dz| {
+            (-1..=1).all(|dy| {
+                (-1..=1).all(|dx| {
+                    world
+                        .chunks
+                        .get(&(coord + IVec3::new(dx, dy, dz)))
+                        .map_or(true, |chunk| chunk.is_empty())
+                })
+            })
+        });
         let task = AsyncComputeTaskPool::get().spawn(async move {
             if empty {
                 MeshData::default()
             } else {
-                greedy_mesh(&neighborhood)
+                mesh_chunk(&neighborhood)
             }
         });
         renderer.jobs.push(MeshJob {
@@ -340,7 +506,7 @@ fn update_chunks(
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use voxel_world::{CHUNK_VOLUME, Chunk, DIRT, STONE, index};
+    use voxel_world::{CHUNK_VOLUME, Chunk, DENSITY_AIR, DIRT, PLACED_FLAG, STONE, WOOD, index};
 
     fn chunk_with(mut block: impl FnMut(IVec3) -> u8) -> Chunk {
         let mut cells = vec![AIR; CHUNK_VOLUME];
@@ -356,25 +522,44 @@ mod tests {
         Chunk::from_runs(0, &runs).unwrap()
     }
 
+    fn placed_chunk_with(mut block: impl FnMut(IVec3) -> u8) -> Chunk {
+        let mut cells = vec![AIR; CHUNK_VOLUME];
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let local = IVec3::new(x, y, z);
+                    let material = block(local);
+                    cells[index(local)] = if material == AIR {
+                        AIR
+                    } else {
+                        material | PLACED_FLAG
+                    };
+                }
+            }
+        }
+        let material_runs: Vec<_> = cells.into_iter().map(|b| (1, b)).collect();
+        Chunk::from_voxel_runs(0, &material_runs, &[(CHUNK_VOLUME as u16, DENSITY_AIR)]).unwrap()
+    }
+
     // Expand each quad into its unit faces: detects gaps, duplicates, incorrect material
     // merges, bad boundary ownership and flipped geometry, not just a triangle count.
-    fn assert_surface(world: &VoxelWorld, coord: IVec3) -> MeshData {
+    fn assert_placed_surface(world: &VoxelWorld, coord: IVec3) -> MeshData {
         let neighborhood = world.neighborhood(coord);
-        let mesh = greedy_mesh(&neighborhood);
+        let mesh = placed_mesh(&neighborhood);
         let mut expected = HashSet::new();
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
                 for x in 0..CHUNK_SIZE {
                     let cell = IVec3::new(x, y, z);
-                    let material = neighborhood.block(cell);
-                    if material == AIR {
+                    if !neighborhood.placed(cell) {
                         continue;
                     }
+                    let material = neighborhood.block(cell);
                     for axis in 0..3 {
                         for sign in [-1, 1] {
                             let mut normal = IVec3::ZERO;
                             normal[axis] = sign;
-                            if neighborhood.block(cell + normal) == AIR {
+                            if !neighborhood.placed(cell + normal) {
                                 expected.insert((cell.to_array(), axis, sign, material));
                             }
                         }
@@ -398,7 +583,7 @@ mod tests {
             let v = (axis + 2) % 3;
             let min = Vec3::from_array(mesh.positions[start]).as_ivec3();
             let max = Vec3::from_array(mesh.positions[start + 2]).as_ivec3();
-            let material = (1..=5)
+            let material = (1..=6)
                 .find(|&b| block_color(b) == mesh.colors[start])
                 .unwrap();
             for vertex in start..start + 4 {
@@ -423,10 +608,10 @@ mod tests {
     }
 
     #[test]
-    fn solid_chunk_merges_to_six_outward_quads() {
+    fn placed_chunk_merges_to_six_outward_quads() {
         let mut world = VoxelWorld::default();
-        world.insert(IVec3::ZERO, chunk_with(|_| STONE));
-        assert_eq!(assert_surface(&world, IVec3::ZERO).indices.len(), 36);
+        world.insert(IVec3::ZERO, placed_chunk_with(|_| STONE));
+        assert_eq!(assert_placed_surface(&world, IVec3::ZERO).indices.len(), 36);
     }
 
     #[test]
@@ -434,16 +619,16 @@ mod tests {
         let mut world = VoxelWorld::default();
         world.insert(
             IVec3::ZERO,
-            chunk_with(|p| if p.x < 16 { STONE } else { DIRT }),
+            placed_chunk_with(|p| if p.x < 16 { STONE } else { DIRT }),
         );
-        assert_eq!(assert_surface(&world, IVec3::ZERO).indices.len(), 60);
+        assert_eq!(assert_placed_surface(&world, IVec3::ZERO).indices.len(), 60);
     }
 
     #[test]
     fn axial_neighbors_occlude_and_removal_restores_boundary_faces() {
         let mut world = VoxelWorld::default();
         let coord = IVec3::new(-2, 0, -1);
-        world.insert(coord, chunk_with(|_| STONE));
+        world.insert(coord, placed_chunk_with(|_| STONE));
         for offset in [
             IVec3::X,
             IVec3::NEG_X,
@@ -452,11 +637,11 @@ mod tests {
             IVec3::Z,
             IVec3::NEG_Z,
         ] {
-            world.insert(coord + offset, chunk_with(|_| DIRT));
+            world.insert(coord + offset, placed_chunk_with(|_| DIRT));
         }
-        assert!(assert_surface(&world, coord).indices.is_empty());
+        assert!(assert_placed_surface(&world, coord).indices.is_empty());
         world.remove(coord + IVec3::NEG_X);
-        assert_eq!(assert_surface(&world, coord).indices.len(), 6);
+        assert_eq!(assert_placed_surface(&world, coord).indices.len(), 6);
     }
 
     #[test]
@@ -464,7 +649,7 @@ mod tests {
         let mut world = VoxelWorld::default();
         world.insert(
             IVec3::ZERO,
-            chunk_with(|p| {
+            placed_chunk_with(|p| {
                 if p.x < 5 && p.z < 6 && p.y < 4 && p != IVec3::new(2, 2, 2) {
                     if (p.x + p.y + p.z) % 3 == 0 {
                         DIRT
@@ -476,7 +661,121 @@ mod tests {
                 }
             }),
         );
-        assert_surface(&world, IVec3::ZERO);
+        assert_placed_surface(&world, IVec3::ZERO);
+    }
+
+    #[test]
+    fn fully_solid_neighborhood_has_no_terrain_surface() {
+        let mut world = VoxelWorld::default();
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    world.insert(IVec3::new(dx, dy, dz), chunk_with(|_| STONE));
+                }
+            }
+        }
+        let mesh = mesh_chunk(&world.neighborhood(IVec3::ZERO));
+        assert!(mesh.indices.is_empty());
+    }
+
+    #[test]
+    fn half_solid_chunk_contours_an_upward_surface() {
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, chunk_with(|p| if p.y < 16 { STONE } else { AIR }));
+        let mesh = mesh_chunk(&world.neighborhood(IVec3::ZERO));
+        assert!(!mesh.indices.is_empty());
+        // Only vertices referenced by quads matter; unreferenced halo cells
+        // (e.g. the bottom surface owned by the missing -y chunk) are skipped.
+        let mut referenced = vec![false; mesh.positions.len()];
+        for &i in &mesh.indices {
+            referenced[i as usize] = true;
+        }
+        for (i, &position) in mesh.positions.iter().enumerate() {
+            if !referenced[i] {
+                continue;
+            }
+            let normal = Vec3::from_array(mesh.normals[i]);
+            assert!((normal.length() - 1.0).abs() < 1e-4);
+            assert_eq!(mesh.colors[i], block_color(STONE));
+            // The only interior surface is the top, just below y = 16.
+            if position[0] > 1.0 && position[0] < 31.0 && position[2] > 1.0 && position[2] < 31.0
+            {
+                assert!(position[1] > 15.0 && position[1] < 16.0);
+                assert_eq!(normal, Vec3::Y);
+            }
+        }
+        // Every triangle's geometric winding agrees with its vertex normals.
+        for triangle in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[triangle[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[triangle[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[triangle[2] as usize]);
+            let normal_sum: Vec3 = triangle
+                .iter()
+                .map(|&i| Vec3::from_array(mesh.normals[i as usize]))
+                .sum();
+            assert!((b - a).cross(c - a).dot(normal_sum) > 0.0);
+        }
+    }
+
+    #[test]
+    fn placed_cube_produces_six_faces_and_no_terrain() {
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, chunk_with(|_| AIR));
+        world.set_block(IVec3::new(4, 5, 6), WOOD);
+        let neighborhood = world.neighborhood(IVec3::ZERO);
+        assert!(surface_nets(&neighborhood).indices.is_empty());
+        let mesh = mesh_chunk(&neighborhood);
+        assert_eq!(mesh.indices.len(), 36);
+        assert_eq!(mesh.positions.len(), 24);
+    }
+
+    #[test]
+    fn chunk_boundary_shares_vertices_without_duplicate_quads() {
+        let mut world = VoxelWorld::default();
+        let half = || chunk_with(|p| if p.y < 16 { STONE } else { AIR });
+        world.insert(IVec3::ZERO, half());
+        world.insert(IVec3::X, half());
+        let a = mesh_chunk(&world.neighborhood(IVec3::ZERO));
+        let b = mesh_chunk(&world.neighborhood(IVec3::X));
+        // Vertices on the shared seam are bitwise identical: chunk B's halo
+        // cell -1 is chunk A's cell 31, computed from the same densities.
+        let seam = |mesh: &MeshData, offset: f32, near: fn(f32) -> bool| {
+            mesh.positions
+                .iter()
+                .filter(|p| near(p[0]))
+                .map(|p| {
+                    let mut q = *p;
+                    q[0] += offset;
+                    q.map(f32::to_bits)
+                })
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(
+            seam(&a, 0.0, |x| x > 31.0),
+            seam(&b, 32.0, |x| x <= 0.0)
+        );
+        // No triangle is emitted by both chunks.
+        let triangles = |mesh: &MeshData, offset: f32| {
+            mesh.indices
+                .chunks_exact(3)
+                .map(|t| {
+                    let mut corners: Vec<_> = t
+                        .iter()
+                        .map(|&i| {
+                            let mut p = mesh.positions[i as usize];
+                            p[0] += offset;
+                            p.map(f32::to_bits)
+                        })
+                        .collect();
+                    corners.sort();
+                    corners
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut seen = HashSet::new();
+        for triangle in triangles(&a, 0.0).into_iter().chain(triangles(&b, 32.0)) {
+            assert!(seen.insert(triangle), "duplicate quad across chunk seam");
+        }
     }
 
     fn renderer_app() -> App {
@@ -496,7 +795,7 @@ mod tests {
             coord,
             stamp: neighborhood.stamp(),
             task: AsyncComputeTaskPool::get().spawn(async { MeshData::default() }),
-            ready: Some(greedy_mesh(&neighborhood)),
+            ready: Some(mesh_chunk(&neighborhood)),
         }
     }
 
@@ -505,12 +804,12 @@ mod tests {
         let mut app = renderer_app();
         app.world_mut()
             .resource_mut::<VoxelWorld>()
-            .insert(IVec3::ZERO, chunk_with(|_| STONE));
+            .insert(IVec3::ZERO, placed_chunk_with(|_| STONE));
         let job = ready_job(app.world().resource::<VoxelWorld>(), IVec3::ZERO);
         app.world_mut().resource_mut::<Renderer>().jobs.push(job);
         app.world_mut()
             .resource_mut::<VoxelWorld>()
-            .insert(IVec3::X, chunk_with(|_| STONE));
+            .insert(IVec3::X, placed_chunk_with(|_| STONE));
         app.update();
         let stats = app.world().resource::<VoxelRenderStats>();
         assert_eq!(stats.stale_jobs, 1);
@@ -527,7 +826,7 @@ mod tests {
         let mut app = renderer_app();
         app.world_mut()
             .resource_mut::<VoxelWorld>()
-            .insert(IVec3::ZERO, chunk_with(|_| STONE));
+            .insert(IVec3::ZERO, placed_chunk_with(|_| STONE));
         let job = ready_job(app.world().resource::<VoxelWorld>(), IVec3::ZERO);
         app.world_mut().resource_mut::<Renderer>().jobs.push(job);
         app.update();
