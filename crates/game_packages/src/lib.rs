@@ -37,8 +37,8 @@ const API: &str = "
 (define (projectile speed gravity travel lifetime) (list speed gravity travel lifetime))
 (define (explosion radius energy player-speed absorbed pulse)
   (list radius energy player-speed absorbed pulse))
-(define (melee-weapon id name range damage cooldown-ticks knockback)
-  (list id name range damage cooldown-ticks knockback))
+(define (melee-weapon id name range damage cooldown-ticks knockback . model)
+  (list id name range damage cooldown-ticks knockback model))
 ";
 
 /// Prefer packages beside the executable, then the working directory. The final
@@ -131,6 +131,10 @@ enum Package {
 
 impl Package {
     fn compile(source: String, path: PathBuf, generation: u64) -> Result<Self, String> {
+        let package_dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let mut vm = Vm::new()?;
         vm.run(LOAD_BUDGET, |engine| {
             engine.run(API).map_err(|error| diagnostic(engine, error))?;
@@ -158,7 +162,9 @@ impl Package {
                 &mut vm, generation,
             )?))),
             "melee" => Ok(Self::Melee(Arc::new(MeleePackage::from_vm(
-                &mut vm, generation,
+                &mut vm,
+                generation,
+                &package_dir,
             )?))),
             other => Err(format!("unknown package-kind {other:?}")),
         }
@@ -276,9 +282,13 @@ pub struct MeleeWeapon {
     /// Item id; must exceed `protocol::EXPLOSIVE_BOW_ITEM` so it cannot shadow
     /// hands, block materials, or the bow.
     pub id: u8,
+    /// Owning package id, assigned when the weapon merges into the table.
+    pub package: String,
     /// Display name for logs and a future presentation API.
     pub name: String,
     pub spec: MeleeSpec,
+    /// Model file under the package's `assets/` directory, if authored.
+    pub model: Option<String>,
 }
 
 /// Immutable melee policy: authored weapons plus the items granted to every
@@ -290,7 +300,7 @@ pub struct MeleePackage {
 }
 
 impl MeleePackage {
-    fn from_vm(vm: &mut Vm, generation: u64) -> Result<Self, String> {
+    fn from_vm(vm: &mut Vm, generation: u64, package_dir: &Path) -> Result<Self, String> {
         let value = vm
             .engine
             .extract_value("weapons")
@@ -301,7 +311,7 @@ impl MeleePackage {
         let mut weapons = Vec::with_capacity(entries.len());
         let mut seen = HashSet::new();
         for entry in entries.iter() {
-            let weapon = melee_weapon(entry.clone())?;
+            let weapon = melee_weapon(entry.clone(), package_dir)?;
             if !seen.insert(weapon.id) {
                 return Err(format!("weapons declares item id {} twice", weapon.id));
             }
@@ -331,12 +341,12 @@ impl MeleePackage {
     }
 }
 
-fn melee_weapon(value: SteelVal) -> Result<MeleeWeapon, String> {
+fn melee_weapon(value: SteelVal, package_dir: &Path) -> Result<MeleeWeapon, String> {
     let SteelVal::ListV(fields) = value else {
         return Err("each weapon must be a melee-weapon value".into());
     };
-    if fields.len() != 6 {
-        return Err("melee-weapon takes id, name, range, damage, cooldown-ticks, knockback".into());
+    if fields.len() != 7 {
+        return Err("melee-weapon takes id, name, range, damage, cooldown-ticks, knockback, optional model".into());
     }
     let id = integer(&fields[0], "weapon id")?;
     if !(0..=u8::MAX as isize).contains(&id) || id as u8 <= protocol::EXPLOSIVE_BOW_ITEM {
@@ -373,11 +383,47 @@ fn melee_weapon(value: SteelVal) -> Result<MeleeWeapon, String> {
              cooldown 0..=600 ticks, knockback 0..=10000"
         )
     })?;
+    let model = weapon_model(&fields[6], package_dir)?;
     Ok(MeleeWeapon {
         id: id as u8,
+        package: String::new(),
         name,
         spec,
+        model,
     })
+}
+
+/// Optional trailing model argument: a `.glb` path that must exist under the
+/// package's `assets/` directory so a typo fails the package, not the client.
+fn weapon_model(value: &SteelVal, package_dir: &Path) -> Result<Option<String>, String> {
+    let SteelVal::ListV(items) = value else {
+        return Err("weapon model must be a \"path.glb\" string or omitted".into());
+    };
+    if items.is_empty() {
+        return Ok(None);
+    }
+    if items.len() != 1 {
+        return Err("weapon model takes a single path".into());
+    }
+    let SteelVal::StringV(path) = &items[0] else {
+        return Err("weapon model path must be a string".into());
+    };
+    let path = path.as_str();
+    let relative = Path::new(path);
+    if path.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        || !path.ends_with(".glb")
+    {
+        return Err(format!(
+            "weapon model {path:?} must be a relative .glb path inside assets/"
+        ));
+    }
+    let file = package_dir.join("assets").join(relative);
+    if !file.is_file() {
+        return Err(format!("weapon model {path:?} not found in assets/"));
+    }
+    Ok(Some(path.to_string()))
 }
 
 fn spawn_item(value: SteelVal) -> Result<(u8, u32), String> {
@@ -599,7 +645,8 @@ impl PackageSlot {
 
 /// Live-reloadable package set. Disk changes compile on background threads; the
 /// simulation publishes successful candidates at tick boundaries. Packages are
-/// discovered and dropped as directories appear and vanish.
+/// discovered and dropped as directories appear and vanish. Files under each
+/// package's `assets/` directory are hashed into a manifest clients download.
 pub struct PackageHost {
     directory: PathBuf,
     slots: BTreeMap<String, PackageSlot>,
@@ -607,6 +654,27 @@ pub struct PackageHost {
     revision: u64,
     active_bow: Option<Arc<BowPackage>>,
     melee: MeleeTable,
+    /// (package, path) -> content fingerprint for every file under `assets/`.
+    assets: BTreeMap<(String, String), AssetEntry>,
+}
+
+struct AssetEntry {
+    size: u32,
+    hash: u64,
+    /// Cheap change detector: rehash only when size or mtime moved.
+    stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
+
+/// FNV-1a: deterministic across builds, unlike `DefaultHasher`.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 impl PackageHost {
@@ -616,8 +684,9 @@ impl PackageHost {
             slots: BTreeMap::new(),
             next_poll: Instant::now() + POLL_INTERVAL,
             revision: 0,
-            active_bow: None,
             melee: MeleeTable::default(),
+            active_bow: None,
+            assets: BTreeMap::new(),
         };
         for id in discover(directory) {
             let path = directory.join(&id).join("server.scm");
@@ -629,6 +698,7 @@ impl PackageHost {
             slot.observed = observed;
             host.install_slot(slot, result);
         }
+        host.scan_assets();
         host
     }
 
@@ -648,6 +718,86 @@ impl PackageHost {
     /// Merged melee weapon table across loaded melee packages.
     pub fn melee_table(&self) -> MeleeTable {
         self.melee.clone()
+    }
+
+    /// Files shipped by loaded packages, sorted for a stable wire manifest.
+    pub fn asset_manifest(&self) -> Vec<protocol::PackageAssetInfo> {
+        self.assets
+            .iter()
+            .filter(|((package, _), _)| {
+                package == TERRAIN_PACKAGE
+                    || self
+                        .slots
+                        .get(package)
+                        .is_some_and(|slot| slot.active.is_some())
+            })
+            .map(|((package, path), entry)| protocol::PackageAssetInfo {
+                package: package.clone(),
+                path: path.clone(),
+                size: entry.size,
+                hash: entry.hash,
+            })
+            .collect()
+    }
+
+    /// Read one manifest asset for a client request. Only files under a loaded
+    /// package's `assets/` directory are served.
+    pub fn read_asset(&self, package: &str, path: &str) -> Result<Vec<u8>, String> {
+        // The startup-only terrain package has no slot but ships scatter models.
+        let dir = if package == TERRAIN_PACKAGE {
+            self.directory.join(TERRAIN_PACKAGE)
+        } else {
+            let slot = self
+                .slots
+                .get(package)
+                .ok_or_else(|| format!("unknown package {package}"))?;
+            if slot.active.is_none() {
+                return Err(format!("package {package} is not loaded"));
+            }
+            slot.path
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_path_buf()
+        };
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("asset path {path:?} escapes the package"));
+        }
+        let file = dir.join("assets").join(relative);
+        let meta = std::fs::metadata(&file)
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        if meta.len() > MAX_ASSET_BYTES {
+            return Err(format!("{} exceeds {MAX_ASSET_BYTES} bytes", file.display()));
+        }
+        std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))
+    }
+
+    /// Rehash `assets/` contents; bumps the manifest revision on any change so
+    /// clients re-sync and re-download what moved.
+    fn scan_assets(&mut self) {
+        let mut found = BTreeMap::new();
+        // The startup-only terrain package ships scatter models but has no slot.
+        let ids = self
+            .slots
+            .keys()
+            .map(String::as_str)
+            .chain(std::iter::once(TERRAIN_PACKAGE));
+        for id in ids {
+            let root = self.directory.join(id).join("assets");
+            scan_asset_dir(&root, &root, id, &self.assets, &mut found);
+        }
+        if found.len() != self.assets.len()
+            || found
+                .iter()
+                .any(|(key, entry)| self.assets.get(key).is_none_or(|old| old.hash != entry.hash))
+        {
+            self.assets = found;
+            self.revision += 1;
+        }
     }
 
     pub fn fire(&self, power: BowPower) -> Result<Shot, String> {
@@ -696,6 +846,7 @@ impl PackageHost {
         }
         if Instant::now() >= self.next_poll {
             self.next_poll = Instant::now() + POLL_INTERVAL;
+            self.scan_assets();
             for id in discover(&self.directory) {
                 if !self.slots.contains_key(&id) {
                     let path = self.directory.join(&id).join("server.scm");
@@ -820,7 +971,13 @@ impl PackageHost {
                 Some(Package::Bow(package)) => self.active_bow = Some(package.clone()),
                 Some(Package::Melee(package)) => {
                     for weapon in &package.weapons {
-                        weapons.insert(weapon.id, weapon.clone());
+                        weapons.insert(
+                            weapon.id,
+                            MeleeWeapon {
+                                package: slot.status.id.clone(),
+                                ..weapon.clone()
+                            },
+                        );
                     }
                     spawn_items.extend_from_slice(&package.spawn_items);
                 }
@@ -831,6 +988,55 @@ impl PackageHost {
             weapons: Arc::new(weapons),
             spawn_items: Arc::new(spawn_items),
         };
+    }
+}
+
+/// Recursively collect `assets/` files into `(package, relative-path)` entries.
+fn scan_asset_dir(
+    root: &Path,
+    dir: &Path,
+    package: &str,
+    old: &BTreeMap<(String, String), AssetEntry>,
+    out: &mut BTreeMap<(String, String), AssetEntry>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            scan_asset_dir(root, &path, package, old, out);
+            continue;
+        }
+        if !meta.is_file() || meta.len() > MAX_ASSET_BYTES {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let stamp = meta.modified().ok().map(|mtime| (meta.len(), mtime));
+        let key = (
+            package.to_string(),
+            relative.to_string_lossy().replace('\\', "/"),
+        );
+        let hash = match old.get(&key) {
+            Some(old) if old.stamp == stamp => old.hash,
+            _ => match std::fs::read(&path) {
+                Ok(bytes) => fnv1a(&bytes),
+                Err(_) => continue,
+            },
+        };
+        out.insert(
+            key,
+            AssetEntry {
+                size: meta.len() as u32,
+                hash,
+                stamp,
+            },
+        );
     }
 }
 

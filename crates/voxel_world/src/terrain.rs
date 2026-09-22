@@ -28,8 +28,16 @@ pub const MAX_GRAPH_DEPTH: usize = 64;
 pub const MAX_CURVE_POINTS: usize = 16;
 /// Hard cap on declared biomes.
 pub const MAX_BIOMES: usize = 32;
+/// Hard cap on declared scatter species.
+pub const MAX_SPECIES: usize = 64;
 /// Hard cap on blocks of soil below a surface block.
 pub const MAX_SOIL_DEPTH: u8 = 16;
+/// Largest accepted jittered-grid spacing, in blocks.
+pub const MAX_SCATTER_SPACING: f32 = 64.0;
+/// Largest accepted sink below the surface, in blocks.
+pub const MAX_SCATTER_SINK: f32 = 8.0;
+/// Salt separating the scatter field from terrain and material hashes.
+const SCATTER_SALT: u64 = 0x5CA7_7E12_5CA7_7E12;
 
 const NO_OPERAND: u16 = u16::MAX;
 const DIV_EPSILON: f32 = 1e-6;
@@ -70,6 +78,60 @@ pub struct BiomeSpec {
     pub temperature: (f32, f32),
     pub moisture: (f32, f32),
     pub height: (f32, f32),
+}
+
+/// One scatterable species: a model plus the rules that place it.
+///
+/// Candidates come from a world-aligned jittered grid of `spacing`-block
+/// cells, so placement is independent of chunk boundaries and call order. A
+/// candidate survives when its density roll, cluster mask, biome membership,
+/// altitude, moisture and slope all admit it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpeciesSpec {
+    pub name: String,
+    /// Model path relative to the owning package's `assets/` directory.
+    pub model: String,
+    /// Jittered-grid cell size in blocks: the minimum spacing between instances.
+    pub spacing: f32,
+    /// Probability in `0..=1` that a candidate cell yields an instance.
+    pub density: f32,
+    /// Largest neighbouring height delta, in blocks per block, that admits it.
+    pub slope_max: f32,
+    /// Absolute world-height band in blocks.
+    pub altitude: (f32, f32),
+    pub moisture: (f32, f32),
+    /// Uniform scale range applied to the model.
+    pub scale: (f32, f32),
+    /// Blocks to sink the model below the surface. A flat base cannot follow a
+    /// slope, so the downhill edge floats by `slope * footprint`; sinking hides
+    /// that gap. Zero places the origin exactly on the surface.
+    pub sink: f32,
+    /// Low-frequency cluster mask `(frequency, threshold)`. A frequency of
+    /// zero disables clustering and admits every candidate.
+    pub cluster: (f32, f32),
+}
+
+/// Scatter rules: the species table plus per-biome membership.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScatterSpec {
+    pub species: Vec<SpeciesSpec>,
+    /// Per biome index, the species indices allowed in that biome.
+    pub biomes: Vec<Vec<u16>>,
+}
+
+/// One placed scatter instance in world space. `y` is the rendered surface
+/// height less the species sink, so a model authored with its base at the
+/// origin sits on the ground with its base buried by `sink` blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScatterInstance {
+    /// Index into the compiled species table.
+    pub species: u16,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Rotation about the vertical axis, in radians.
+    pub yaw: f32,
+    pub scale: f32,
 }
 
 /// Composable expression graph evaluated per world column.
@@ -147,6 +209,8 @@ pub struct TerrainSpec {
     pub moisture: TerrainExpr,
     pub soil: TerrainExpr,
     pub biomes: Vec<BiomeSpec>,
+    /// Organic scatter rules. Empty disables scatter entirely.
+    pub scatter: ScatterSpec,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +268,27 @@ struct BiomeDef {
     height: (f32, f32),
 }
 
+#[derive(Clone, Debug)]
+struct SpeciesDef {
+    name: Box<str>,
+    model: Box<str>,
+    spacing: f32,
+    density: f32,
+    slope_max: f32,
+    altitude: (f32, f32),
+    moisture: (f32, f32),
+    scale: (f32, f32),
+    sink: f32,
+    cluster: (f32, f32),
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledScatter {
+    species: Box<[SpeciesDef]>,
+    /// Per biome index, the species indices allowed there.
+    biomes: Box<[Box<[u16]>]>,
+}
+
 #[derive(Debug)]
 struct CompiledGraph {
     nodes: Box<[Node]>,
@@ -216,6 +301,7 @@ struct CompiledGraph {
     identity: Box<str>,
     version: u32,
     stone_slope: f32,
+    scatter: CompiledScatter,
 }
 
 /// Immutable compiled terrain graph shared by reference across generation.
@@ -510,6 +596,106 @@ fn compile_biomes(specs: &[BiomeSpec]) -> Result<Box<[BiomeDef]>, String> {
     Ok(biomes.into_boxed_slice())
 }
 
+fn compile_scatter(spec: &ScatterSpec, biome_count: usize) -> Result<CompiledScatter, String> {
+    if spec.species.len() > MAX_SPECIES {
+        return Err(format!(
+            "terrain declares more than {MAX_SPECIES} scatter species"
+        ));
+    }
+    let mut species = Vec::with_capacity(spec.species.len());
+    for entry in &spec.species {
+        let name = entry.name.as_str();
+        if name.is_empty() || name.len() > 64 {
+            return Err("species names must be non-empty and at most 64 bytes".into());
+        }
+        if species
+            .iter()
+            .any(|existing: &SpeciesDef| &*existing.name == name)
+        {
+            return Err(format!("duplicate scatter species {name:?}"));
+        }
+        if entry.model.is_empty() || entry.model.len() > 256 || !entry.model.ends_with(".glb") {
+            return Err(format!(
+                "species {name} model must be a relative .glb path of at most 256 bytes"
+            ));
+        }
+        if !entry.spacing.is_finite() || entry.spacing <= 0.0 || entry.spacing > MAX_SCATTER_SPACING
+        {
+            return Err(format!(
+                "species {name} spacing must be finite and in (0, {MAX_SCATTER_SPACING}]"
+            ));
+        }
+        if !entry.density.is_finite() || !(0.0..=1.0).contains(&entry.density) {
+            return Err(format!("species {name} density must be finite and in 0..=1"));
+        }
+        if !entry.slope_max.is_finite() || entry.slope_max < 0.0 {
+            return Err(format!("species {name} slope-max must be finite and non-negative"));
+        }
+        for (label, (low, high)) in [
+            ("altitude", entry.altitude),
+            ("moisture", entry.moisture),
+            ("scale", entry.scale),
+        ] {
+            if !low.is_finite() || !high.is_finite() || low > high {
+                return Err(format!(
+                    "species {name} {label} range must be finite and ordered"
+                ));
+            }
+        }
+        if entry.scale.0 <= 0.0 {
+            return Err(format!("species {name} scale must be positive"));
+        }
+        if !entry.sink.is_finite() || !(0.0..=MAX_SCATTER_SINK).contains(&entry.sink) {
+            return Err(format!(
+                "species {name} sink must be finite and in 0..={MAX_SCATTER_SINK}"
+            ));
+        }
+        let (frequency, threshold) = entry.cluster;
+        if !frequency.is_finite() || frequency < 0.0 {
+            return Err(format!("species {name} cluster frequency must be finite and non-negative"));
+        }
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err(format!(
+                "species {name} cluster threshold must be finite and in 0..=1"
+            ));
+        }
+        species.push(SpeciesDef {
+            name: entry.name.clone().into_boxed_str(),
+            model: entry.model.clone().into_boxed_str(),
+            spacing: entry.spacing,
+            density: entry.density,
+            slope_max: entry.slope_max,
+            altitude: entry.altitude,
+            moisture: entry.moisture,
+            scale: entry.scale,
+            sink: entry.sink,
+            cluster: entry.cluster,
+        });
+    }
+    if !spec.biomes.is_empty() && spec.biomes.len() != biome_count {
+        return Err(format!(
+            "scatter rules must cover all {biome_count} biomes, received {}",
+            spec.biomes.len()
+        ));
+    }
+    let mut biomes = Vec::with_capacity(biome_count);
+    for index in 0..biome_count {
+        let list = spec.biomes.get(index).map_or(&[][..], |list| list.as_slice());
+        for &species_index in list {
+            if usize::from(species_index) >= species.len() {
+                return Err(format!(
+                    "biome {index} references unknown species index {species_index}"
+                ));
+            }
+        }
+        biomes.push(list.to_vec().into_boxed_slice());
+    }
+    Ok(CompiledScatter {
+        species: species.into_boxed_slice(),
+        biomes: biomes.into_boxed_slice(),
+    })
+}
+
 impl TerrainGenerator {
     /// Compile an authoring description into an immutable generator.
     pub fn compile(spec: TerrainSpec) -> Result<Self, String> {
@@ -523,6 +709,7 @@ impl TerrainGenerator {
             return Err("stone slope must be finite and in (0, 32]".into());
         }
         let biomes = compile_biomes(&spec.biomes)?;
+        let scatter = compile_scatter(&spec.scatter, biomes.len())?;
         let mut compiler = Compiler {
             nodes: Vec::new(),
             curves: Vec::new(),
@@ -542,6 +729,7 @@ impl TerrainGenerator {
             identity: spec.identity.into_boxed_str(),
             version: spec.version,
             stone_slope: spec.stone_slope,
+            scatter,
         };
         let generator = Self {
             inner: Arc::new(graph),
@@ -590,6 +778,146 @@ impl TerrainGenerator {
     /// columns of chunk `(cx, cz)`.
     pub fn column_bounds(&self, cx: i32, cz: i32, seed: u64) -> (i32, i32) {
         self.column_grid(cx, cz, seed).interior_bounds()
+    }
+
+    /// Number of compiled scatter species.
+    pub fn species_count(&self) -> usize {
+        self.inner.scatter.species.len()
+    }
+
+    /// Authoring name of a compiled species index.
+    pub fn species_name(&self, index: u16) -> &str {
+        self.inner
+            .scatter
+            .species
+            .get(index as usize)
+            .map_or("unknown", |entry| &entry.name)
+    }
+
+    /// Model path of a compiled species index, relative to its package assets.
+    pub fn species_model(&self, index: u16) -> &str {
+        self.inner
+            .scatter
+            .species
+            .get(index as usize)
+            .map_or("", |entry| &entry.model)
+    }
+
+    /// Deterministic scatter instances whose anchor falls inside chunk `coord`.
+    ///
+    /// Candidates come from a world-aligned jittered grid per species, so the
+    /// result is independent of chunk boundaries and call order: every instance
+    /// belongs to exactly one chunk, the one holding its surface block. `y` is
+    /// the rendered surface height less the species sink, so a model authored
+    /// with its base at the origin sits on the ground.
+    pub fn scatter_chunk(&self, coord: IVec3, seed: u64) -> Vec<ScatterInstance> {
+        let scatter = &self.inner.scatter;
+        if scatter.species.is_empty() {
+            return Vec::new();
+        }
+        let base_x = i64::from(coord.x) * i64::from(CHUNK_SIZE);
+        let base_z = i64::from(coord.z) * i64::from(CHUNK_SIZE);
+        let end_x = base_x + i64::from(CHUNK_SIZE);
+        let end_z = base_z + i64::from(CHUNK_SIZE);
+        let mut scratch = [0.0f64; MAX_GRAPH_NODES];
+        let mut out = Vec::new();
+        for (index, species) in scatter.species.iter().enumerate() {
+            let spacing = f64::from(species.spacing);
+            // One cell of slack: a cell whose origin sits just outside the
+            // chunk can still jitter its anchor inside it.
+            let cx0 = (base_x as f64 / spacing).floor() as i64 - 1;
+            let cx1 = (end_x as f64 / spacing).ceil() as i64;
+            let cz0 = (base_z as f64 / spacing).floor() as i64 - 1;
+            let cz1 = (end_z as f64 / spacing).ceil() as i64;
+            let salt = seed ^ SCATTER_SALT ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for cz in cz0..=cz1 {
+                for cx in cx0..=cx1 {
+                    let wx = (cx as f64 + hash01(cx, cz, salt ^ 0x11)) * spacing;
+                    let wz = (cz as f64 + hash01(cx, cz, salt ^ 0x22)) * spacing;
+                    if wx < base_x as f64 || wx >= end_x as f64 {
+                        continue;
+                    }
+                    if wz < base_z as f64 || wz >= end_z as f64 {
+                        continue;
+                    }
+                    if hash01(cx, cz, salt ^ 0x33) > f64::from(species.density) {
+                        continue;
+                    }
+                    if species.cluster.0 > 0.0 {
+                        let mask = value_noise(
+                            wx * f64::from(species.cluster.0),
+                            wz * f64::from(species.cluster.0),
+                            salt ^ 0x44,
+                        );
+                        if !(mask > f64::from(species.cluster.1)) {
+                            continue;
+                        }
+                    }
+                    let x = wx.floor() as i64;
+                    let z = wz.floor() as i64;
+                    let sample = self.sample_into(x, z, seed, &mut scratch).0;
+                    // Scatter is a column property, but the interest set loads
+                    // several chunks per column. Assign each instance to the
+                    // chunk holding its surface block so the vertical stack
+                    // emits it exactly once.
+                    if sample.height.div_euclid(CHUNK_SIZE) != coord.y {
+                        continue;
+                    }
+                    let allowed = scatter
+                        .biomes
+                        .get(sample.biome.0 as usize)
+                        .is_some_and(|list| list.contains(&(index as u16)));
+                    if !allowed {
+                        continue;
+                    }
+                    let height = sample.raw_height;
+                    if height < species.altitude.0 || height > species.altitude.1 {
+                        continue;
+                    }
+                    if sample.moisture < species.moisture.0 || sample.moisture > species.moisture.1
+                    {
+                        continue;
+                    }
+                    if self.slope_at(x, z, sample.height, seed, &mut scratch) > species.slope_max {
+                        continue;
+                    }
+                    let scale = species.scale.0
+                        + (species.scale.1 - species.scale.0) * hash01(cx, cz, salt ^ 0x55) as f32;
+                    let yaw = (hash01(cx, cz, salt ^ 0x66) * std::f64::consts::TAU) as f32;
+                    out.push(ScatterInstance {
+                        species: index as u16,
+                        x: wx as f32,
+                        // The mesher contours the density field, whose ramp
+                        // crosses zero at `raw_height`, so that — not the
+                        // rounded block top — is where the surface renders.
+                        // `sink` buries the base so a slope's downhill edge
+                        // does not float.
+                        y: sample.raw_height - species.sink,
+                        z: wz as f32,
+                        yaw,
+                        scale,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Largest absolute height delta to the four axis neighbours, in blocks.
+    fn slope_at(
+        &self,
+        x: i64,
+        z: i64,
+        height: i32,
+        seed: u64,
+        scratch: &mut [f64; MAX_GRAPH_NODES],
+    ) -> f32 {
+        let mut max = 0;
+        for (dx, dz) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+            let neighbour = self.sample_into(x + dx, z + dz, seed, scratch).0.height;
+            max = max.max((neighbour - height).abs());
+        }
+        max as f32
     }
 
     fn sample_into(
@@ -1460,6 +1788,54 @@ fn default_spec() -> TerrainSpec {
                 height: (-1000.0, 5000.0),
             },
         ],
+        // Biome order is shore, desert, mountains, tundra, plains.
+        scatter: ScatterSpec {
+            species: vec![
+                SpeciesSpec {
+                    name: "oak".into(),
+                    model: "oak.glb".into(),
+                    spacing: 6.0,
+                    density: 0.5,
+                    slope_max: 0.6,
+                    altitude: (0.0, 120.0),
+                    moisture: (0.25, 1.0),
+                    scale: (0.8, 1.4),
+                    sink: 0.15,
+                    cluster: (0.012, 0.52),
+                },
+                SpeciesSpec {
+                    name: "pine".into(),
+                    model: "pine.glb".into(),
+                    spacing: 5.0,
+                    density: 0.45,
+                    slope_max: 0.8,
+                    altitude: (0.0, 200.0),
+                    moisture: (0.15, 1.0),
+                    scale: (0.9, 1.6),
+                    sink: 0.15,
+                    cluster: (0.014, 0.5),
+                },
+                SpeciesSpec {
+                    name: "boulder".into(),
+                    model: "boulder.glb".into(),
+                    spacing: 9.0,
+                    density: 0.3,
+                    slope_max: 1.5,
+                    altitude: (0.0, 400.0),
+                    moisture: (0.0, 1.0),
+                    scale: (0.6, 1.4),
+                    sink: 0.35,
+                    cluster: (0.0, 0.0),
+                },
+            ],
+            biomes: vec![
+                vec![2],
+                vec![2],
+                vec![2],
+                vec![1, 2],
+                vec![0, 2],
+            ],
+        },
     }
 }
 
@@ -1488,6 +1864,7 @@ mod tests {
                 moisture: (-2.0, 3.0),
                 height: (-1000.0, 5000.0),
             }],
+            scatter: ScatterSpec::default(),
         }
     }
 
@@ -2047,5 +2424,151 @@ mod tests {
         assert!(high < 0.08, "mountains are not concentrated: {high}");
         assert!(lowland > 0.5, "plains are not dominant: {lowland}");
         assert!(floor < 0.02, "valley floors are over-clamped: {floor}");
+    }
+
+    fn species(name: &str) -> SpeciesSpec {
+        SpeciesSpec {
+            name: name.into(),
+            model: format!("{name}.glb"),
+            spacing: 6.0,
+            density: 1.0,
+            slope_max: 100.0,
+            altitude: (-1000.0, 5000.0),
+            moisture: (-2.0, 3.0),
+            scale: (1.0, 1.0),
+            sink: 0.0,
+            cluster: (0.0, 0.0),
+        }
+    }
+
+    fn scatter_generator(biomes: Vec<Vec<u16>>) -> TerrainGenerator {
+        let mut spec = default_spec();
+        spec.scatter = ScatterSpec {
+            species: vec![species("oak")],
+            biomes,
+        };
+        TerrainGenerator::compile(spec).expect("scatter spec is valid")
+    }
+
+    #[test]
+    fn scatter_is_deterministic_and_seam_free() {
+        let generator = scatter_generator(vec![vec![0]; 5]);
+        let seed = 11;
+        let mut all = Vec::new();
+        for cx in -3..=3 {
+            for cz in -3..=3 {
+                // Cover the full vertical stack: an instance belongs to exactly
+                // the chunk holding its surface block.
+                for cy in -3..=4 {
+                    let coord = IVec3::new(cx, cy, cz);
+                    let first = generator.scatter_chunk(coord, seed);
+                    assert_eq!(
+                        first,
+                        generator.scatter_chunk(coord, seed),
+                        "scatter is not deterministic"
+                    );
+                    // Every anchor lies inside the chunk that produced it, so
+                    // the union over chunks has no duplicates and no seam gaps.
+                    for instance in &first {
+                        let (lo_x, hi_x) = (cx as f32 * 32.0, (cx as f32 + 1.0) * 32.0);
+                        let (lo_z, hi_z) = (cz as f32 * 32.0, (cz as f32 + 1.0) * 32.0);
+                        assert!((lo_x..hi_x).contains(&instance.x), "anchor escaped chunk x");
+                        assert!((lo_z..hi_z).contains(&instance.z), "anchor escaped chunk z");
+                    }
+                    all.extend(first);
+                }
+            }
+        }
+        assert!(!all.is_empty(), "scatter produced nothing");
+        let mut keys: Vec<(i64, i64)> = all
+            .iter()
+            .map(|i| ((i.x * 4096.0) as i64, (i.z * 4096.0) as i64))
+            .collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(total, keys.len(), "duplicate instances across chunks");
+    }
+
+    #[test]
+    fn scatter_respects_biome_membership_and_ground() {
+        // Only the plains biome (index 4) admits the species.
+        let generator = scatter_generator(vec![vec![], vec![], vec![], vec![], vec![0]]);
+        let seed = 5;
+        let mut placed = 0;
+        for cx in -8..=8 {
+            for cz in -8..=8 {
+                for cy in -3..=4 {
+                    for instance in generator.scatter_chunk(IVec3::new(cx, cy, cz), seed) {
+                        let sample = generator.sample(
+                            instance.x.floor() as i64,
+                            instance.z.floor() as i64,
+                            seed,
+                        );
+                        assert_eq!(generator.biome_name(sample.biome), "plains");
+                        assert_eq!(instance.y, sample.raw_height);
+                        assert_eq!(sample.height.div_euclid(32), cy);
+                        placed += 1;
+                    }
+                }
+            }
+        }
+        assert!(placed > 0, "no plains instances were placed");
+    }
+
+    #[test]
+    fn compile_rejects_invalid_scatter() {
+        let mut spec = default_spec();
+        spec.scatter.species.push(SpeciesSpec {
+            spacing: 0.0,
+            ..species("bad")
+        });
+        assert!(TerrainGenerator::compile(spec).is_err(), "zero spacing accepted");
+
+        let mut spec = default_spec();
+        spec.scatter.biomes[0] = vec![99];
+        assert!(
+            TerrainGenerator::compile(spec).is_err(),
+            "unknown species index accepted"
+        );
+
+        let mut spec = default_spec();
+        spec.scatter.species.push(species("oak"));
+        assert!(
+            TerrainGenerator::compile(spec).is_err(),
+            "duplicate species name accepted"
+        );
+
+        let mut spec = default_spec();
+        spec.scatter.species[0].sink = -1.0;
+        assert!(
+            TerrainGenerator::compile(spec).is_err(),
+            "negative sink accepted"
+        );
+    }
+
+    #[test]
+    fn sink_buries_the_base_below_the_surface() {
+        let mut spec = default_spec();
+        spec.scatter.species[0].sink = 0.5;
+        spec.scatter.biomes = vec![vec![0]; 5];
+        let generator = TerrainGenerator::compile(spec).expect("sink spec is valid");
+        let mut placed = 0;
+        for cx in -4..=4 {
+            for cz in -4..=4 {
+                for cy in -2..=3 {
+                    for instance in generator.scatter_chunk(IVec3::new(cx, cy, cz), 3) {
+                        let sample = generator.sample(
+                            instance.x.floor() as i64,
+                            instance.z.floor() as i64,
+                            3,
+                        );
+                        assert_eq!(instance.y, sample.raw_height - 0.5);
+                        placed += 1;
+                    }
+                }
+            }
+        }
+        assert!(placed > 0, "no instances to check");
     }
 }

@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 default-run = "server"
 
+[features]
+tracy = [
+  "bevy_app/trace",
+  "bevy_ecs/trace",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+  "dep:tracing-tracy",
+]
+
 [dependencies]
 bevy_app.workspace = true
 simulation.workspace = true
@@ -14,6 +23,10 @@ protocol.workspace = true
 physics.workspace = true
 controller.workspace = true
 glam.workspace = true
+bevy_ecs = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing-tracy = { workspace = true, optional = true }
 
 [dev-dependencies]
 game_packages.workspace = true

@@ -42,7 +42,14 @@ struct Bot {
     explosions: Vec<(u32, Vec3, f32)>,
     inventory: Inventory,
     chunks: usize,
+    /// Scatter instances received across all chunks, and the announced species.
+    scatter: usize,
+    scatter_species: usize,
     packages: Vec<(u64, Vec<PackageStatus>, u32, Vec<protocol::MeleeWeaponInfo>)>,
+    /// Latest announced asset manifest plus reassembled downloads.
+    asset_manifest: Vec<protocol::PackageAssetInfo>,
+    assets: HashMap<(String, String), Vec<u8>>,
+    asset_chunks: HashMap<(String, String), (u32, Vec<u8>)>,
     deltas: usize,
     forgotten: usize,
     corrections: usize,
@@ -78,8 +85,13 @@ impl Bot {
             explosions: Vec::new(),
             packages: Vec::new(),
             chunks: 0,
+            scatter: 0,
+            scatter_species: 0,
             inventory: Inventory::default(),
             deltas: 0,
+            asset_manifest: Vec::new(),
+            assets: HashMap::new(),
+            asset_chunks: HashMap::new(),
             forgotten: 0,
             corrections: 0,
             yaw: 0.0,
@@ -101,6 +113,7 @@ impl Bot {
                     spawn,
                     health,
                     inventory,
+                    scatter_species,
                 } => {
                     self.id = id;
                     self.session = session;
@@ -111,18 +124,21 @@ impl Bot {
                     require(health == Health::default(), "welcome health was not full")?;
                     self.health = Some(health);
                     self.inventory = inventory;
+                    self.scatter_species = scatter_species.len();
                 }
                 ServerMessage::Chunk {
                     coord,
                     revision,
                     material_runs,
                     density_runs,
+                    scatter,
                 } => {
                     self.world.insert(
                         coord,
                         Chunk::from_voxel_runs(revision, &material_runs, &density_runs)?,
                     );
                     self.chunks += 1;
+                    self.scatter += scatter.len();
                 }
                 ServerMessage::Delta {
                     coord,
@@ -189,9 +205,44 @@ impl Bot {
                     packages,
                     bow_shots_per_second,
                     melee_weapons,
-                } => self
-                    .packages
-                    .push((revision, packages, bow_shots_per_second, melee_weapons)),
+                    assets,
+                } => {
+                    self.packages
+                        .push((revision, packages, bow_shots_per_second, melee_weapons));
+                    self.asset_manifest = assets.clone();
+                    for info in assets {
+                        let key = (info.package.clone(), info.path.clone());
+                        if !self.assets.contains_key(&key)
+                            && !self.asset_chunks.contains_key(&key)
+                        {
+                            self.asset_chunks.insert(key.clone(), (info.size, Vec::new()));
+                            self.net.send(ClientMessage::AssetRequest {
+                                package: info.package,
+                                path: info.path,
+                            })?;
+                        }
+                    }
+                }
+                ServerMessage::AssetData {
+                    package,
+                    path,
+                    offset,
+                    total,
+                    data,
+                } => {
+                    let key = (package, path);
+                    if let Some((expected, buffer)) = self.asset_chunks.get_mut(&key) {
+                        if *expected == total && offset as usize == buffer.len() {
+                            buffer.extend_from_slice(&data);
+                            if buffer.len() as u32 == total {
+                                let (_, buffer) = self.asset_chunks.remove(&key).unwrap();
+                                self.assets.insert(key, buffer);
+                            }
+                        } else {
+                            self.asset_chunks.remove(&key);
+                        }
+                    }
+                }
                 ServerMessage::Inventory { inventory } => self.inventory = inventory,
                 ServerMessage::Drops { .. } => {}
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
@@ -468,10 +519,19 @@ fn package_fixture() -> Result<(PathBuf, PathBuf, String)> {
     // The plugin also compiles the terrain package from the same root.
     let terrain_dir = root.join("terrain");
     fs::create_dir_all(&terrain_dir)?;
+    let terrain_source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/terrain");
     fs::copy(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/terrain/server.scm"),
+        terrain_source.join("server.scm"),
         terrain_dir.join("server.scm"),
     )?;
+    // Species models must exist for the terrain package to load.
+    let target = terrain_dir.join("assets");
+    fs::create_dir_all(&target)?;
+    for entry in fs::read_dir(terrain_source.join("assets"))? {
+        let entry = entry?;
+        fs::copy(entry.path(), target.join(entry.file_name()))?;
+    }
     Ok((root, package_path, source))
 }
 
@@ -867,6 +927,14 @@ fn main() -> Result<()> {
         first.world.chunks.len() == 27 && second.world.chunks.len() == 27,
         "bounded initial interest did not finish streaming",
     )?;
+    require(
+        first.scatter_species == 3,
+        "scatter species table was not announced in the welcome",
+    )?;
+    require(
+        first.scatter > 0 && second.scatter > 0,
+        "no scatter instances streamed with chunks",
+    )?;
     check_health(&mut app, &mut first, &mut second)?;
     let hit = first
         .world
@@ -955,6 +1023,30 @@ fn main() -> Result<()> {
             weapons.len() == 3 && weapons.iter().any(|w| w.item == 8 && w.damage == 30),
             "melee weapon table did not replicate",
         )?;
+    }
+    // Package assets: the manifest announced the knife model and the chunked
+    // download reassembled byte-for-byte against the package directory.
+    {
+        let key = ("melee".to_string(), "knife.glb".to_string());
+        let info = first
+            .asset_manifest
+            .iter()
+            .find(|info| info.package == "melee" && info.path == "knife.glb")
+            .ok_or("knife.glb missing from the asset manifest")?;
+        let bytes = first
+            .assets
+            .get(&key)
+            .ok_or("knife.glb was never downloaded")?;
+        require(
+            bytes.len() as u32 == info.size && bytes.starts_with(b"glTF"),
+            "downloaded knife.glb is corrupt",
+        )?;
+        let disk = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packages/melee/assets/knife.glb"),
+        )
+        .map_err(|e| format!("packages/melee/assets/knife.glb: {e}"))?;
+        require(*bytes == disk, "downloaded knife.glb differs from disk")?;
     }
     // Melee: walk to the training dummy, swing until it dies, watch it respawn.
     // Aim with the authoritative position: the server resolves swings there.

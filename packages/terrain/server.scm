@@ -72,3 +72,25 @@
     (biome "mountains" 'stone 'stone 1 -2.0 3.0 -2.0 3.0 150.0 5000.0)
     (biome "tundra" 'grass 'dirt 2 -2.0 0.3 -2.0 3.0 -1000.0 5000.0)
     (biome "plains" 'grass 'dirt 4 -2.0 3.0 -2.0 3.0 -1000.0 5000.0)))
+
+;; Organic scatter. Each species names a model under assets/ and the rules that
+;; place it: a world-aligned jittered grid of `spacing` blocks, thinned by
+;; `density`, then filtered by slope, altitude, moisture and a low-frequency
+;; cluster mask (frequency 0 disables clustering). Models are meters with their
+;; base at the origin; `sink` buries that base so a slope's downhill edge does
+;; not float. Boulders sink deeper than tree trunks because their footprint is
+;; wider.
+(define scatter-species
+  (list
+    (species "oak" "oak.glb" 6.0 0.5 0.6 0.0 120.0 0.25 1.0 0.8 1.4 0.15 0.012 0.52)
+    (species "pine" "pine.glb" 5.0 0.45 0.8 0.0 200.0 0.15 1.0 0.9 1.6 0.15 0.014 0.5)
+    (species "boulder" "boulder.glb" 9.0 0.3 1.5 0.0 400.0 0.0 1.0 0.6 1.4 0.35 0.0 0.0)))
+
+;; Which species grow in which biome, by name. Biomes without a rule stay bare.
+(define scatter-rules
+  (list
+    (scatter-rule "shore" (list "boulder"))
+    (scatter-rule "desert" (list "boulder"))
+    (scatter-rule "mountains" (list "boulder"))
+    (scatter-rule "tundra" (list "pine" "boulder"))
+    (scatter-rule "plains" (list "oak" "boulder"))))

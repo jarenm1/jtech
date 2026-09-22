@@ -8,11 +8,12 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-bevy = { version = "0.17.3", default-features = false, features = ["std", "async_executor", "multi_threaded", "bevy_asset", "bevy_color", "bevy_core_pipeline", "bevy_pbr", "bevy_render", "bevy_image", "bevy_mesh", "bevy_camera", "bevy_light", "bevy_shader", "bevy_log", "bevy_text", "bevy_ui", "bevy_ui_render", "bevy_window", "bevy_winit", "default_font", "png", "x11", "wayland", "tonemapping_luts", "ktx2", "zstd_rust"] }
+bevy = { version = "0.17.3", default-features = false, features = ["std", "async_executor", "multi_threaded", "bevy_asset", "bevy_color", "bevy_core_pipeline", "bevy_gltf", "bevy_pbr", "bevy_render", "bevy_image", "bevy_mesh", "bevy_camera", "bevy_light", "bevy_shader", "bevy_log", "bevy_text", "bevy_ui", "bevy_ui_render", "bevy_window", "bevy_winit", "default_font", "png", "x11", "wayland", "tonemapping_luts", "ktx2", "zstd_rust"] }
 bevy_app = { version = "0.17.3", default-features = false, features = ["std"] }
 bevy_ecs = { version = "0.17.3", default-features = false, features = ["std", "multi_threaded"] }
 glam = { version = "0.30", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 postcard = { version = "1", features = ["alloc", "use-std"] }
 voxel_world = { path = "crates/voxel_world" }
 physics = { path = "crates/physics" }
@@ -23,6 +24,9 @@ networking = { path = "crates/networking" }
 simulation = { path = "crates/simulation" }
 voxel_render = { path = "crates/voxel_render" }
 game_packages = { path = "crates/game_packages" }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-tracy = "0.11.4"
 
 [profile.dev]
 opt-level = 1
@@ -33,3 +37,7 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = true

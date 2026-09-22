@@ -26,7 +26,7 @@ survivable. Larger bow presets extend the dangerous area. Repeated close shots
 can kill. At zero HP, movement, firing and terrain edits are blocked by the
 server; queued input, momentum and pending strikes are cleared.
 
-Press **Enter** or select **Respawn** on the death overlay to return with full
+Press **Enter** or click the respawn button on the death overlay to return with full
 health and zero momentum in walking mode. The server searches loaded, supported,
 collision-free space near the original spawn, using the current edited terrain.
 The request waits for GPU readback and, if needed, asynchronous loading of a
@@ -89,8 +89,9 @@ through a future registry.
 
 ## Melee combat
 
-Left click swings when a living actor or remote player is under the crosshair
-within reach; otherwise it mines terrain as before. Swings ride the input
+Left click always plays the held-item swing animation; when a living actor or
+remote player is under the crosshair within reach it also attacks instead of
+mining terrain as before. Swings ride the input
 stream (`PlayerInput.attack`), so a held click repeats at the weapon cooldown
 and the same channel serves scripted policies. The server resolves one swing
 per tick per player through `gameplay::combat::resolve_swing`: a ray from the
