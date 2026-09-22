@@ -1,6 +1,7 @@
 use super::*;
+use bevy::ecs::world::CommandQueue;
 use controller::step_player;
-use protocol::PlayerSnapshot;
+use protocol::{PieceKind, PieceSnapshot, PlayerSnapshot};
 use voxel_world::{AIR, STONE};
 
 fn arena() -> VoxelWorld {
@@ -321,11 +322,7 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
         step_player(&world, &mut client.state, &input, FIXED_DT);
         client.pending.push_back(input);
     }
-    let body = physics::DynamicCollider {
-        id: 1,
-        position: Vec3::new(1.5, 0.5, 0.5),
-        velocity: Vec3::ZERO,
-    };
+    let body = physics::DynamicCollider::cube(1, Vec3::new(1.5, 0.5, 0.5), Vec3::ZERO);
     reconcile(
         &mut client,
         &world,
@@ -417,10 +414,11 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
         pitch: 1.0,
         ..default()
     };
+    let building = building::Building::default();
     // Empty/unloaded terrain and sky aiming must not suppress bow shots.
     let world = VoxelWorld::default();
     assert!(matches!(
-        block_action(&mut client, &world, false, false, true),
+        block_action(&mut client, &world, &building, false, false, true),
         Some(ClientMessage::FireBow {
             request: 1,
             yaw: 0.75,
@@ -428,13 +426,13 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
             power: BowPower::Standard,
         })
     ));
-    assert!(block_action(&mut client, &world, false, false, false).is_none());
-    assert!(block_action(&mut client, &world, false, true, false).is_none());
+    assert!(block_action(&mut client, &world, &building, false, false, false).is_none());
+    assert!(block_action(&mut client, &world, &building, false, true, false).is_none());
     assert_eq!(client.request, 1);
     keys.reset_all();
     keys.press(KeyCode::Digit3);
     client.selected = selected_slot(&keys).unwrap();
-    assert!(block_action(&mut client, &world, false, false, true).is_none());
+    assert!(block_action(&mut client, &world, &building, false, false, true).is_none());
 }
 
 #[test]
@@ -444,6 +442,7 @@ fn bow_requests_copy_each_selected_power() {
         ..default()
     };
     let world = VoxelWorld::default();
+    let building = building::Building::default();
     for (index, power) in [
         BowPower::Low,
         BowPower::Standard,
@@ -455,7 +454,7 @@ fn bow_requests_copy_each_selected_power() {
     {
         client.bow_power = power;
         assert!(matches!(
-            block_action(&mut client, &world, false, false, true),
+            block_action(&mut client, &world, &building, false, false, true),
             Some(ClientMessage::FireBow { power: sent, request, .. })
                 if sent == power && request == index as u64 + 1
         ));
@@ -563,25 +562,118 @@ fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
         ..default()
     };
     let world = arena();
+    let building = building::Building::default();
     assert!(matches!(
-        block_action(&mut client, &world, false, true, true),
+        block_action(&mut client, &world, &building, false, true, true),
         Some(ClientMessage::Edit { block: 0, .. })
     ));
     assert!(matches!(
-        block_action(&mut client, &world, true, false, true),
+        block_action(&mut client, &world, &building, true, false, true),
         Some(ClientMessage::Strike { .. })
     ));
-    for selected in 1..=5 {
+    // Structural slots place pieces costing wood; yaw rides along. Empty
+    // stock sends nothing.
+    client.selected = 1;
+    client.yaw_steps = 2;
+    assert!(block_action(&mut client, &world, &building, false, false, true).is_none());
+    for (selected, kind) in [
+        (1, PieceKind::Foundation),
+        (2, PieceKind::Floor),
+        (3, PieceKind::Wall),
+        (4, PieceKind::Pillar),
+    ] {
         client.selected = selected;
-        assert!(block_action(&mut client, &world, false, false, true).is_none());
-        client.inventory.add(selected, 1);
+        client.inventory.add(voxel_world::WOOD, 1);
         assert!(
-            matches!(block_action(&mut client, &world, false, false, true),
-            Some(ClientMessage::Edit { block, .. }) if block == selected)
+            matches!(block_action(&mut client, &world, &building, false, false, true),
+            Some(ClientMessage::Place { kind: placed, yaw_steps: 2, .. }) if placed == kind)
         );
     }
+    // Wood, tools and empty hands never place.
+    for selected in [5, 8, 9, 10] {
+        client.selected = selected;
+        assert!(block_action(&mut client, &world, &building, false, false, true).is_none());
+    }
     client.selected = 7;
-    assert!(block_action(&mut client, &world, false, false, true).is_none());
+    assert!(block_action(&mut client, &world, &building, false, false, true).is_none());
+    client.inventory.add(voxel_world::BEDROLL, 1);
+    assert!(matches!(
+        block_action(&mut client, &world, &building, false, false, true),
+        Some(ClientMessage::Place {
+            kind: PieceKind::Bedroll,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn aimed_piece_takes_the_hit_before_terrain() {
+    let mut client = ClientSession {
+        pitch: -1.0,
+        state: PlayerState {
+            position: Vec3::new(0.5, 0.0, 0.5),
+            ..default()
+        },
+        ..default()
+    };
+    let world = arena();
+    let bevy_world = World::new();
+    let mut queue = CommandQueue::default();
+    let mut building = building::Building::default();
+    // A wall centered one meter along the aim ray, well inside the terrain hit.
+    let direction = look_direction(client.yaw, client.pitch);
+    let center = client.state.position + Vec3::Y * EYE_HEIGHT + direction;
+    building.receive(
+        1,
+        &[PieceSnapshot {
+            id: 9,
+            kind: PieceKind::Wall,
+            position: center,
+            yaw_steps: 0,
+            health: 250,
+        }],
+        &mut Commands::new(&mut queue, &bevy_world),
+        &building::test_assets(),
+    );
+    assert!(matches!(
+        block_action(&mut client, &world, &building, false, true, false),
+        Some(ClientMessage::HitPiece { piece: 9, .. })
+    ));
+}
+
+#[test]
+fn building_receive_builds_colliders_and_ignores_stale_revisions() {
+    let mut bevy_world = World::new();
+    let mut queue = CommandQueue::default();
+    let mut building = building::Building::default();
+    let assets = building::test_assets();
+    let snapshot = PieceSnapshot {
+        id: 3,
+        kind: PieceKind::Wall,
+        position: Vec3::new(2.0, 1.5, 4.0),
+        yaw_steps: 1,
+        health: 250,
+    };
+    building.receive(1, &[snapshot], &mut Commands::new(&mut queue, &bevy_world), &assets);
+    queue.apply(&mut bevy_world);
+    // Yaw 1 swaps the wall's thin axis from X to Z; position stays the center.
+    assert_eq!(
+        building.colliders(),
+        &[physics::DynamicCollider {
+            id: 3,
+            position: Vec3::new(2.0, 1.5, 4.0),
+            velocity: Vec3::ZERO,
+            half_extents: Vec3::new(1.5, 1.5, 0.125),
+        }]
+    );
+    assert_eq!(building.pieces().len(), 1);
+    // Stale revisions leave the set untouched; newer ones replace it.
+    building.receive(1, &[], &mut Commands::new(&mut queue, &bevy_world), &assets);
+    assert_eq!(building.pieces().len(), 1);
+    building.receive(2, &[], &mut Commands::new(&mut queue, &bevy_world), &assets);
+    queue.apply(&mut bevy_world);
+    assert!(building.pieces().is_empty());
+    assert!(building.colliders().is_empty());
 }
 
 #[test]

@@ -86,11 +86,7 @@ fn rectangular_body_sweeps_use_each_extent_against_voxels_and_cubes() {
         movement: Vec2::Y,
         ..Default::default()
     };
-    let cubes = [DynamicCollider {
-        id: 1,
-        position: Vec3::new(0.5, 0.5, -1.5),
-        velocity: Vec3::ZERO,
-    }];
+    let cubes = [DynamicCollider::cube(1, Vec3::new(0.5, 0.5, -1.5), Vec3::ZERO)];
     step_character(
         &world,
         &mut state,
@@ -416,11 +412,7 @@ fn large_actor_can_separate_from_a_deeply_embedded_cube() {
     let world = tests::arena();
     let body = CharacterBody::new(CollisionShape::new(1.0, 1.0, 3.0).unwrap(), 200.0).unwrap();
     let mut state = actor(Vec3::new(0.0, 0.0, 0.0));
-    let cube = DynamicCollider {
-        id: 1,
-        position: Vec3::new(0.0, 1.5, 0.0),
-        velocity: Vec3::ZERO,
-    };
+    let cube = DynamicCollider::cube(1, Vec3::new(0.0, 1.5, 0.0), Vec3::ZERO);
     step_character(
         &world,
         &mut state,

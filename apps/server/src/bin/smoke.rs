@@ -6,7 +6,7 @@ use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerState};
 use protocol::{
     ActorSnapshot, ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, Inventory,
-    PackageState, PackageStatus, ServerMessage,
+    PackageState, PackageStatus, PieceKind, PieceSnapshot, ServerMessage,
 };
 use simulation::{ServerConfig, Simulation, SimulationPlugin};
 use std::{
@@ -43,6 +43,8 @@ struct Bot {
     inventory: Inventory,
     chunks: usize,
     packages: Vec<(u64, Vec<PackageStatus>, u32)>,
+    pieces: Vec<PieceSnapshot>,
+    building_revision: u64,
     deltas: usize,
     forgotten: usize,
     corrections: usize,
@@ -76,6 +78,8 @@ impl Bot {
             flights: Vec::new(),
             explosions: Vec::new(),
             packages: Vec::new(),
+            pieces: Vec::new(),
+            building_revision: 0,
             chunks: 0,
             inventory: Inventory::default(),
             deltas: 0,
@@ -190,6 +194,12 @@ impl Bot {
                     .packages
                     .push((revision, packages, bow_shots_per_second)),
                 ServerMessage::Inventory { inventory } => self.inventory = inventory,
+                ServerMessage::Building { revision, pieces } => {
+                    if revision > self.building_revision {
+                        self.building_revision = revision;
+                        self.pieces = pieces;
+                    }
+                }
                 ServerMessage::Drops { .. } => {}
                 ServerMessage::Disconnect { reason } => return Err(reason.into()),
             }
@@ -932,53 +942,47 @@ fn main() -> Result<()> {
         repairs.iter().all(|c| first.world.chunks.contains_key(c)),
         "burst resync stranded a missing baseline",
     )?;
-    // Place a block ahead of the players, not inside their collision bodies.
-    // Placement spends inventory: an unowned material rejects before any grant.
-    let missing = (1..=5)
-        .find(|&item| first.inventory.count(item) == 0)
-        .ok_or("every material was stocked before the placement scenario")?;
-    request += 1;
-    first.net.send(ClientMessage::Edit {
-        request,
-        target: hit.block,
-        block: missing,
-        expected_revision: first.world.chunks[&coord].revision,
-    })?;
-    drive(&mut app, &mut [&mut first, &mut second], 12, [0.0; 2], -1.5)?;
-    require(
-        first.rejections.get(&request) == Some(&EditRejection::OutOfStock),
-        "unstocked placement was not rejected",
-    )?;
-    // Place a block ahead of the players, not inside their collision bodies.
+    // Building pieces are free-placed boxes, not voxels: the server re-raycasts
+    // the player's aim, checks clearance, and spends one wood per piece. Walk
+    // the bots apart first so the 3x3 foundation clears both collision bodies.
     let placement_pitch = -0.65;
     drive(
         &mut app,
         &mut [&mut first, &mut second],
-        30,
+        120,
+        [0.0, 1.0],
+        placement_pitch,
+    )?;
+    let eye = first.authority.position + Vec3::Y * EYE_HEIGHT;
+    let aim_direction = physics::look_direction(0.0, placement_pitch);
+    let aim = first
+        .world
+        .raycast(eye, aim_direction, 6.0)
+        .ok_or("no placement surface in reach")?;
+    let aim_point = eye + aim_direction * aim.distance;
+    // Placement spends inventory: an unstocked piece rejects before any grant.
+    request += 1;
+    first.net.send(ClientMessage::Place {
+        request,
+        kind: PieceKind::Foundation,
+        yaw_steps: 0,
+    })?;
+    drive(
+        &mut app,
+        &mut [&mut first, &mut second],
+        12,
         [0.0; 2],
         placement_pitch,
     )?;
-    let placement = first
-        .world
-        .raycast(
-            first.authority.position + Vec3::Y * EYE_HEIGHT,
-            physics::look_direction(0.0, placement_pitch),
-            6.0,
-        )
-        .ok_or("no placement surface in reach")?
-        .adjacent;
     require(
-        !physics::overlaps_block(&first.authority, placement)
-            && !physics::overlaps_block(&second.authority, placement),
-        "placement scenario intersects a player",
+        first.rejections.get(&request) == Some(&EditRejection::OutOfStock),
+        "unstocked placement was not rejected",
     )?;
-    let placement_coord = chunk_coord(placement);
-    let placement_revision = first.world.chunks[&placement_coord].revision;
     require(
         app.world_mut()
             .resource_mut::<Simulation>()
-            .grant_item(first.id, WOOD, 1)
-            == Some(1),
+            .grant_item(first.id, WOOD, 2)
+            == Some(2),
         "wood grant was not accepted",
     )?;
     drive(
@@ -989,15 +993,14 @@ fn main() -> Result<()> {
         placement_pitch,
     )?;
     require(
-        first.inventory.count(WOOD) == 1,
+        first.inventory.count(WOOD) == 2,
         "granted wood did not replicate",
     )?;
     request += 1;
-    first.net.send(ClientMessage::Edit {
+    first.net.send(ClientMessage::Place {
         request,
-        target: placement,
-        block: WOOD,
-        expected_revision: placement_revision,
+        kind: PieceKind::Foundation,
+        yaw_steps: 0,
     })?;
     drive(
         &mut app,
@@ -1008,20 +1011,68 @@ fn main() -> Result<()> {
     )?;
     require(
         first.edits.get(&request) == Some(&true),
-        "valid placement was rejected",
+        &format!(
+            "valid foundation placement was rejected: {:?}",
+            first.rejections.get(&request)
+        ),
     )?;
     require(
-        first.world.block(placement) == Some(5) && second.world.block(placement) == Some(5),
-        "placement did not replicate to both clients",
+        first.inventory.count(WOOD) == 1,
+        "placement did not spend one wood",
     )?;
-    // Break the placed material through repeated authoritative contacts too.
-    break_block(
+    let foundation = *first
+        .pieces
+        .iter()
+        .find(|piece| piece.kind == PieceKind::Foundation)
+        .ok_or("placed foundation did not replicate")?;
+    require(
+        first.pieces.len() == 1
+            && second.pieces.iter().any(|piece| piece.id == foundation.id),
+        "foundation did not replicate to both clients",
+    )?;
+    require(
+        foundation.position.distance(aim_point) < 2.0,
+        "foundation center is far from the aimed surface",
+    )?;
+    // The same aim now overlaps the placed piece and must reject.
+    request += 1;
+    first.net.send(ClientMessage::Place {
+        request,
+        kind: PieceKind::Foundation,
+        yaw_steps: 0,
+    })?;
+    drive(
         &mut app,
         &mut [&mut first, &mut second],
-        placement,
+        30,
+        [0.0; 2],
         placement_pitch,
-        &mut request,
-        false,
+    )?;
+    require(
+        first.edits.get(&request) == Some(&false),
+        "overlapping foundation placement was accepted",
+    )?;
+    // Strike the piece until its health is gone; hands chip ~15 of 250 hp.
+    for _ in 0..40 {
+        if first.pieces.is_empty() {
+            break;
+        }
+        request += 1;
+        first.net.send(ClientMessage::HitPiece {
+            request,
+            piece: foundation.id,
+        })?;
+        drive(
+            &mut app,
+            &mut [&mut first, &mut second],
+            30,
+            [0.0; 2],
+            placement_pitch,
+        )?;
+    }
+    require(
+        first.pieces.is_empty() && second.pieces.is_empty(),
+        "foundation was not destroyed on both clients",
     )?;
     // Melee: walk to the training dummy, swing until it dies, watch it respawn.
     // Aim with the authoritative position: the server resolves swings there.
@@ -1163,7 +1214,7 @@ fn main() -> Result<()> {
         .print_metrics(app.world().resource::<VoxelWorld>().chunks.len());
     explosive_bow()?;
     println!(
-        "SMOKE PASS: two real TCP/UDP clients; accumulating fracture/replay protection/destruction; reliable edits/revisions/rejection/resync; inventory-spending placement; melee kill/respawn on the training dummy; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect; CPU explosive bow flight/impact/destruction/cooldown/replay on both clients"
+        "SMOKE PASS: two real TCP/UDP clients; accumulating fracture/replay protection/destruction; reliable edits/revisions/rejection/resync; wood-spending building piece placement/replication/destruction; melee kill/respawn on the training dummy; duplicate/loss/jitter input recovery; prediction reconciliation; cross-chunk streaming/forget; disconnect and fresh-session reconnect; CPU explosive bow flight/impact/destruction/cooldown/replay on both clients"
     );
     Ok(())
 }

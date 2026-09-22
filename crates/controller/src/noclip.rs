@@ -91,11 +91,7 @@ mod tests {
             position: Vec3::new(0.5, -2.0, 0.5),
             ..Default::default()
         };
-        let bodies = [DynamicCollider {
-            id: 1,
-            position: state.position,
-            velocity: Vec3::ZERO,
-        }];
+        let bodies = [DynamicCollider::cube(1, state.position, Vec3::ZERO)];
         let mut input = PlayerInput {
             noclip: true,
             jump: true,
@@ -155,11 +151,7 @@ mod tests {
         step_player_with_bodies(&world, &mut state, &input, FIXED_DT, &[]);
         assert!(state.noclip);
         state.position.y = 4.0;
-        let bodies = [DynamicCollider {
-            id: 1,
-            position: state.position,
-            velocity: Vec3::ZERO,
-        }];
+        let bodies = [DynamicCollider::cube(1, state.position, Vec3::ZERO)];
         step_player_with_bodies(&world, &mut state, &input, FIXED_DT, &bodies);
         assert!(state.noclip);
         step_player_with_bodies(&world, &mut state, &input, FIXED_DT, &[]);

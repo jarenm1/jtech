@@ -207,9 +207,7 @@ impl PhysicsSlice {
         }
     }
 
-    pub fn overlaps(&self, target: IVec3) -> bool {
-        self.overlaps_except(target, 0)
-    }
+
     pub fn overlaps_except(&self, target: IVec3, except: u32) -> bool {
         let center = target.as_vec3() + Vec3::splat(0.5);
         self.ids.iter().zip(&self.bodies).any(|(&id, body)| {
@@ -304,12 +302,7 @@ impl PhysicsSlice {
             .map_or(0.0, |slot| self.bodies[slot].damage_joules())
     }
 
-    /// A placement cannot use stale CPU observations while a GPU batch is in flight.
-    pub fn can_place(&self, target: IVec3) -> bool {
-        !(self.overlaps(target)
-            || self.is_busy()
-                && active_terrain::needed_chunks(&self.bodies).contains(&chunk_coord(target)))
-    }
+
     pub fn failed(&self) -> bool {
         self.failed
     }
@@ -383,14 +376,16 @@ impl PhysicsSlice {
         self.ids
             .iter()
             .zip(&self.bodies)
-            .map(|(&id, body)| physics::DynamicCollider {
-                id,
-                position: Vec3::from_array(body.position),
-                velocity: if self.failed {
-                    Vec3::ZERO
-                } else {
-                    Vec3::from_array(body.velocity)
-                },
+            .map(|(&id, body)| {
+                physics::DynamicCollider::cube(
+                    id,
+                    Vec3::from_array(body.position),
+                    if self.failed {
+                        Vec3::ZERO
+                    } else {
+                        Vec3::from_array(body.velocity)
+                    },
+                )
             })
             .collect()
     }

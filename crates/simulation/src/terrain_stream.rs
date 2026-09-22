@@ -430,11 +430,7 @@ mod tests {
     fn available_spawn_avoids_body_occupied_landing() {
         let (preferred, world) = spawn_world(3);
         assert_eq!(available_spawn(&world, preferred, &[]), Some(preferred));
-        let body = physics::DynamicCollider {
-            id: 7,
-            position: preferred,
-            velocity: Vec3::ZERO,
-        };
+        let body = physics::DynamicCollider::cube(7, preferred, Vec3::ZERO);
         let position = available_spawn(&world, preferred, &[body]).expect("clear fallback");
         assert_ne!(position, preferred);
         let min = position - Vec3::new(physics::PLAYER_RADIUS, 0.0, physics::PLAYER_RADIUS);
