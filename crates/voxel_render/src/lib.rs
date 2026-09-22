@@ -242,17 +242,28 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                 if d.iter().all(|&s| (s > 0) == solid) {
                     continue;
                 }
-                // Vertex at the mean of the edge zero crossings.
+                // Vertex at the mean of the edge zero crossings; remember the
+                // crossing nearest the vertex — its solid endpoint is the
+                // surface voxel this vertex represents, which fixes material
+                // bleed on slopes where a subsurface corner sits closer.
                 let mut position = Vec3::ZERO;
                 let mut crossings = 0.0;
+                let mut nearest_crossing = f32::INFINITY;
+                let mut surface_corner = 0usize;
                 for &[a, b] in &EDGES {
                     let (da, db) = (d[a] as f32, d[b] as f32);
                     if (da > 0.0) == (db > 0.0) {
                         continue;
                     }
                     let t = da / (da - db);
-                    position += corner(c, a).as_vec3().lerp(corner(c, b).as_vec3(), t);
+                    let crossing = corner(c, a).as_vec3().lerp(corner(c, b).as_vec3(), t);
+                    position += crossing;
                     crossings += 1.0;
+                    let distance = (crossing - position / crossings).length_squared();
+                    if distance < nearest_crossing {
+                        nearest_crossing = distance;
+                        surface_corner = if da > 0.0 { a } else { b };
+                    }
                 }
                 position /= crossings;
                 // Trilinear gradient at the vertex; the normal points at air.
@@ -269,18 +280,7 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                     gradient.z += s * wx(i) * wy(i) * if i & 4 == 4 { 1.0 } else { -1.0 };
                 }
                 let normal = (-gradient).try_normalize().unwrap_or(Vec3::Y);
-                // Color and roughness come from the solid corner nearest the
-                // vertex: at a grass-over-dirt transition the vertex hugs the
-                // grass corner, so subsurface dirt cannot bleed through.
-                let nearest = (0..8)
-                    .filter(|&i| d[i] > 0)
-                    .min_by_key(|&i| {
-                        (position - corner(c, i).as_vec3())
-                            .length_squared()
-                            .to_bits()
-                    })
-                    .unwrap();
-                let material = neighborhood.block(corner(c, nearest));
+                let material = neighborhood.block(corner(c, surface_corner));
                 // Displace along the pre-displacement normal (kept as-is: the
                 // bump is sub-voxel, so recomputing the gradient buys nothing).
                 // The heightfield is a pure function of world position, so a
