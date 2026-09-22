@@ -1,13 +1,13 @@
 mod bow_power;
 pub use bow_power::BowPower;
 use controller::PlayerInput;
-pub use gameplay::{Health, Inventory};
+pub use gameplay::{Health, Inventory, building::PieceKind};
 use glam::{IVec3, Vec3};
 use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -20,6 +20,8 @@ pub const EXPLOSIVE_BOW_SHOTS_PER_SECOND: u32 = 25;
 /// Horizontal chunk radius shared by server configuration and client camera bounds.
 pub const DEFAULT_VIEW_RADIUS: i32 = 16;
 pub const MAX_VIEW_RADIUS: i32 = 64;
+/// Ceiling for the placed building-piece set, matching the server bound.
+pub const MAX_PIECES: usize = gameplay::building::MAX_PIECES;
 
 /// Authoritative action rejection, also used for completed queued debug strikes.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,6 +43,17 @@ pub enum EditRejection {
     OutOfStock,
 }
 
+/// One placed building primitive. `position` is the box center; `yaw_steps`
+/// counts quarter turns about Y. Free-standing AABBs, never voxel cells.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PieceSnapshot {
+    pub id: u32,
+    pub kind: PieceKind,
+    pub position: Vec3,
+    pub yaw_steps: u8,
+    pub health: u16,
+}
+
 /// One voxel's replicated state. Material bytes in chunk runs carry the
 /// placed flag in the high bit; deltas send it as a plain field instead.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +73,20 @@ pub enum ClientMessage {
         target: IVec3,
         block: u8,
         expected_revision: u64,
+    },
+    /// Place a building piece at the surface the player is aiming at. The
+    /// server re-raycasts the aim and validates clearance; `yaw_steps` is the
+    /// client's chosen quarter-turn rotation.
+    Place {
+        request: u64,
+        kind: PieceKind,
+        yaw_steps: u8,
+    },
+    /// Melee strike against a placed piece. The server re-raycasts against the
+    /// piece set and applies the held tool's damage.
+    HitPiece {
+        request: u64,
+        piece: u32,
     },
     Resync {
         coord: IVec3,
@@ -147,6 +174,12 @@ pub enum ServerMessage {
     Drops {
         tick: u64,
         drops: Vec<DropSnapshot>,
+    },
+    /// Complete replacement of the bounded building-piece set, sent reliably
+    /// on every change.
+    Building {
+        revision: u64,
+        pieces: Vec<PieceSnapshot>,
     },
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

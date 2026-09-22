@@ -123,11 +123,7 @@ fn ceiling_blocks_jump_and_invalid_input_cannot_poison_state() {
 }
 
 fn body(position: Vec3, velocity: Vec3) -> DynamicCollider {
-    DynamicCollider {
-        id: 1,
-        position,
-        velocity,
-    }
+    DynamicCollider::cube(1, position, velocity)
 }
 
 #[test]

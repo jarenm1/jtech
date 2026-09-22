@@ -14,12 +14,29 @@ pub const EYE_HEIGHT: f32 = 1.6;
 pub const FIXED_DT: f32 = 1.0 / 60.0;
 const EPSILON: f32 = 0.0001;
 
-/// Latest observed unit cube, centered at `position`; callers own snapshot timing.
+/// Latest observed dynamic box, centered at `position`; callers own snapshot
+/// timing. `half_extents` is the box half-size on each axis — unit cubes use
+/// `Vec3::splat(0.5)`, building pieces use their kind's extents.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DynamicCollider {
     pub id: u32,
     pub position: Vec3,
     pub velocity: Vec3,
+    pub half_extents: Vec3,
+}
+impl DynamicCollider {
+    /// Unit cube shorthand for loose voxel bodies.
+    pub fn cube(id: u32, position: Vec3, velocity: Vec3) -> Self {
+        Self {
+            id,
+            position,
+            velocity,
+            half_extents: Vec3::splat(0.5),
+        }
+    }
+    pub fn aabb(&self) -> (Vec3, Vec3) {
+        (self.position - self.half_extents, self.position + self.half_extents)
+    }
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct KinematicState {
@@ -378,8 +395,7 @@ pub fn sweep_with_bodies(
         if ignore == Some(index) || !body.position.is_finite() {
             continue;
         }
-        let lo = body.position - Vec3::splat(0.5);
-        let hi = body.position + Vec3::splat(0.5);
+        let (lo, hi) = body.aabb();
         if max[a] <= lo[a] + EPSILON
             || min[a] >= hi[a] - EPSILON
             || max[b] <= lo[b] + EPSILON
@@ -428,8 +444,7 @@ pub fn separate_bodies(
                 continue;
             }
             let (min, max) = bounds(state.position, shape);
-            let lo = body.position - Vec3::splat(0.5);
-            let hi = body.position + Vec3::splat(0.5);
+            let (lo, hi) = body.aabb();
             if !(min.cmplt(hi - Vec3::splat(EPSILON)).all()
                 && max.cmpgt(lo + Vec3::splat(EPSILON)).all())
             {

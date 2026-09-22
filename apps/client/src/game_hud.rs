@@ -366,10 +366,10 @@ pub(crate) fn update(
 
 fn slot_name(slot: u8) -> &'static str {
     match slot {
-        voxel_world::GRASS => "Grass",
-        voxel_world::DIRT => "Dirt",
-        voxel_world::STONE => "Stone",
-        voxel_world::SAND => "Sand",
+        1 => "Foundation",
+        2 => "Floor",
+        3 => "Wall",
+        4 => "Pillar",
         voxel_world::WOOD => "Wood",
         EXPLOSIVE_BOW_SLOT => "Explosive Bow",
         7 => "Bedroll",

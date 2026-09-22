@@ -82,11 +82,7 @@ impl LooseBlocks {
                     && body.material > 0
                     && body.material <= voxel_world::WOOD
             })
-            .map(|body| physics::DynamicCollider {
-                id: body.id,
-                position: body.position,
-                velocity: body.velocity,
-            })
+            .map(|body| physics::DynamicCollider::cube(body.id, body.position, body.velocity))
             .collect();
         self.colliders.sort_unstable_by_key(|body| body.id);
         let now = Instant::now();

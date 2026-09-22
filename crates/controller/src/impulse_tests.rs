@@ -91,11 +91,7 @@ fn terrain_collision_cancels_normal_momentum_but_preserves_sliding() {
 #[test]
 fn body_sweep_and_overlap_separation_cancel_external_momentum() {
     let world = tests::arena();
-    let body = DynamicCollider {
-        id: 1,
-        position: Vec3::new(0.5, 0.5, 1.5),
-        velocity: Vec3::ZERO,
-    };
+    let body = DynamicCollider::cube(1, Vec3::new(0.5, 0.5, 1.5), Vec3::ZERO);
     let mut state = player(Vec3::new(0.5, 0.0, 0.5));
     apply_player_impulse(&mut state, Vec3::Z * PLAYER_MASS * 20.0);
     step_player_with_bodies(&world, &mut state, &PlayerInput::default(), 0.1, &[body]);

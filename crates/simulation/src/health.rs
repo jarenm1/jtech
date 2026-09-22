@@ -137,14 +137,16 @@ impl Simulation {
         {
             return false;
         }
-        let bodies = self
+        let mut bodies = self
             .physics
             .as_ref()
             .map(|physics| physics.dynamic_colliders())
             .unwrap_or_default();
-        let anchor = player.respawn_point.map_or(self.spawn, |point| {
-            point.as_vec3() + Vec3::splat(0.5)
-        });
+        bodies.extend(self.piece_colliders());
+        let anchor = player
+            .respawn_point
+            .and_then(|piece| self.pieces.get(&piece))
+            .map_or(self.spawn, |piece| piece.position);
         let Some(position) = terrain_stream::available_spawn(world, anchor, &bodies) else {
             self.spawn_chunks
                 .extend(terrain_stream::spawn_search_chunks(anchor));
@@ -238,61 +240,6 @@ mod tests {
         // A second death on the empty corpse spills nothing.
         sim.damage_player(1, 10);
         assert_eq!(sim.drops.len(), 2);
-    }
-
-    #[test]
-    fn bedroll_binds_respawn_and_destruction_unbinds() {
-        let mut app = App::new();
-        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
-        let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut world = VoxelWorld::default();
-        let bedroll = glam::IVec3::new(9, 3, 9);
-        world.chunks.insert(
-            glam::IVec3::ZERO,
-            std::sync::Arc::new(voxel_world::Chunk::from_runs(0, &[(32768, 0)]).unwrap()),
-        );
-        // A floor block gives the placement ray a surface; the bedroll lands
-        // on the adjacent air cell above it.
-        world.set_block(bedroll - glam::IVec3::Y, voxel_world::STONE);
-
-        let mut player = Player::new();
-        player.inventory.add(voxel_world::BEDROLL, 1);
-        player.interest.insert(glam::IVec3::ZERO);
-        player.state.position = Vec3::new(9.5, 5.0, 9.5);
-        player.input.pitch = -std::f32::consts::FRAC_PI_2;
-
-        let revision = world.chunks[&glam::IVec3::ZERO].revision;
-        player.known.insert(glam::IVec3::ZERO, revision);
-        sim.players.insert(1, player);
-
-        // Placing the bedroll spends the item and binds respawn.
-        sim.tick = 100;
-        sim.edit(&mut world, 1, 1, bedroll, voxel_world::BEDROLL, revision, false);
-        assert_eq!(world.block(bedroll), Some(voxel_world::BEDROLL));
-        assert_eq!(sim.players[&1].respawn_point, Some(bedroll));
-        assert_eq!(sim.players[&1].inventory.count(voxel_world::BEDROLL), 0);
-
-        // Destroying the bedroll drops it and clears the binding.
-        sim.destroyed(bedroll, voxel_world::BEDROLL, None);
-        assert_eq!(sim.players[&1].respawn_point, None);
-        assert_eq!(
-            sim.drops.back().map(|d| (d.snapshot.item, d.snapshot.count)),
-            Some((voxel_world::BEDROLL, 1))
-        );
-
-        // Mining the bedroll to air through the damage path unbinds too.
-        sim.players.get_mut(&1).unwrap().respawn_point = Some(bedroll);
-        for request in 2..22 {
-            let revision = world.chunks[&glam::IVec3::ZERO].revision;
-            sim.players.get_mut(&1).unwrap().known.insert(glam::IVec3::ZERO, revision);
-            sim.tick += 100;
-            sim.edit(&mut world, 1, request, bedroll, 0, revision, false);
-            if world.block(bedroll) == Some(0) {
-                break;
-            }
-        }
-        assert_eq!(world.block(bedroll), Some(0));
-        assert_eq!(sim.players[&1].respawn_point, None);
     }
     #[test]
     fn absent_and_disconnected_players_cannot_receive_health_changes() {

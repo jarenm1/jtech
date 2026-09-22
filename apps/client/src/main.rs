@@ -1,5 +1,6 @@
 use controller::PlayerInput;
 mod bow_power_hud;
+mod building;
 mod death_overlay;
 mod drops;
 mod game_hud;
@@ -105,7 +106,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-5 material | 6 explosive bow | Esc pause menu | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit/place (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-4 building piece (R rotate) | 5 wood | 6 explosive bow | 7 bedroll | 8-10 tools | Esc pause menu | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -140,6 +141,8 @@ struct ClientSession {
     correction: Vec3,
     selected: u8,
     bow_power: BowPower,
+    // Quarter-turn rotation for the held building piece.
+    yaw_steps: u8,
     packages: package_hud::ServerPackages,
     request: u64,
     accepted_edits: u64,
@@ -202,6 +205,7 @@ impl Default for ClientSession {
             correction: Vec3::ZERO,
             selected: 3,
             bow_power: BowPower::default(),
+            yaw_steps: 0,
             packages: package_hud::ServerPackages::default(),
             request: 0,
             accepted_edits: 0,
@@ -417,8 +421,8 @@ fn main() {
             WorldPlugin,
             VoxelRenderPlugin,
             ClientPlugin,
-            lighting::LightingPlugin,
             loose_blocks::LooseBlocksPlugin,
+            building::BuildingPlugin,
             projectiles::ProjectilesPlugin,
             drops::DropsPlugin,
         ))
@@ -514,6 +518,8 @@ fn receive_network(
     projectile_assets: Res<projectiles::ProjectileAssets>,
     mut drops: ResMut<drops::Drops>,
     drop_assets: Res<drops::DropAssets>,
+    mut building: ResMut<building::Building>,
+    building_assets: Res<building::BuildingAssets>,
 ) {
     let Some(transport) = &mut session.transport else {
         return;
@@ -540,6 +546,7 @@ fn receive_network(
             } => {
                 projectiles.clear(&mut commands);
                 drops.clear(&mut commands);
+                building.clear(&mut commands);
                 session.packages = package_hud::ServerPackages::default();
                 session.id = Some(id);
                 session.session = token;
@@ -633,6 +640,9 @@ fn receive_network(
             ServerMessage::Physics { tick, bodies } => {
                 loose.receive(tick, &bodies, &mut commands, &loose_assets);
             }
+            ServerMessage::Building { revision, pieces } => {
+                building.receive(revision, &pieces, &mut commands, &building_assets);
+            }
             ServerMessage::Projectiles { tick, arrows } => {
                 projectiles.receive(
                     tick,
@@ -690,7 +700,13 @@ fn receive_network(
         if snapshot.tick <= session.last_tick || Some(snapshot.you.id) != session.id {
             continue;
         }
-        reconcile(&mut session, &world, &snapshot, loose.colliders());
+        let colliders: Vec<_> = loose
+            .colliders()
+            .iter()
+            .chain(building.colliders())
+            .copied()
+            .collect();
+        reconcile(&mut session, &world, &snapshot, &colliders);
         let now = Instant::now();
         remotes.0.retain(|id, remote| {
             if snapshot.players.iter().any(|player| player.id == *id) {
@@ -859,12 +875,12 @@ fn controls(
         session.pitch = (session.pitch - mouse.delta.y * 0.0025).clamp(-1.54, 1.54);
     }
     session.selected = selected_slot(&keys).unwrap_or(session.selected);
-    if !options.bot
-        && !cursor.visible
-        && session.selected == EXPLOSIVE_BOW_SLOT
-        && keys.just_pressed(KeyCode::KeyR)
-    {
-        session.bow_power = session.bow_power.next();
+    if !options.bot && !cursor.visible && keys.just_pressed(KeyCode::KeyR) {
+        if session.selected == EXPLOSIVE_BOW_SLOT {
+            session.bow_power = session.bow_power.next();
+        } else if gameplay::building::slot_piece(session.selected).is_some() {
+            session.yaw_steps = (session.yaw_steps + 1) % 4;
+        }
     }
 }
 
@@ -896,6 +912,7 @@ fn predict(
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
     loose: Res<loose_blocks::LooseBlocks>,
+    building: Res<building::Building>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
     if session.id.is_none() || session.transport.is_none() {
@@ -932,6 +949,12 @@ fn predict(
         keys.just_pressed(KeyCode::Space),
     );
     session.accumulator += time.delta_secs().min(0.1);
+    let colliders: Vec<_> = loose
+        .colliders()
+        .iter()
+        .chain(building.colliders())
+        .copied()
+        .collect();
     while session.accumulator >= FIXED_DT {
         session.accumulator -= FIXED_DT;
         // Stop producing new commands when the acknowledgement window is full.
@@ -973,7 +996,7 @@ fn predict(
             attack: session.consume_attack(),
             selected: session.selected,
         };
-        session.predict_input(&world, input, loose.colliders());
+        session.predict_input(&world, input, &colliders);
     }
     if !session.pending.is_empty() {
         let inputs = session
@@ -1002,6 +1025,7 @@ fn edit_blocks(
     remotes: Res<RemotePlayers>,
     time: Res<Time>,
     mut bow_repeat: Local<BowRepeat>,
+    building: Res<building::Building>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
     if menu.blocks_gameplay()
@@ -1038,7 +1062,7 @@ fn edit_blocks(
     } else {
         buttons.just_pressed(MouseButton::Right)
     };
-    if let Some(message) = block_action(&mut session, &world, strike, hit, secondary) {
+    if let Some(message) = block_action(&mut session, &world, &building, strike, hit, secondary) {
         session.send(message);
     }
 }
@@ -1109,6 +1133,7 @@ fn repeat_bow(repeat: &mut BowRepeat, now: f64, held: bool, rate: u32) -> bool {
 fn block_action(
     session: &mut ClientSession,
     world: &VoxelWorld,
+    building: &building::Building,
     strike: bool,
     hit: bool,
     secondary: bool,
@@ -1123,35 +1148,53 @@ fn block_action(
             power: session.bow_power,
         });
     }
-    let block = if strike || hit {
-        0
-    } else if secondary {
-        // Only placeable blocks (items 1-6) place; tools swing instead.
-        let item = gameplay::combat::slot_item(session.selected);
-        if !(1..=voxel_world::BEDROLL).contains(&item) || session.inventory.count(item) == 0 {
+    // Building slots place free-standing pieces; the server re-raycasts the aim.
+    if !strike && !hit && secondary {
+        let kind = gameplay::building::slot_piece(session.selected)?;
+        if session.inventory.count(kind.item()) == 0 {
             return None;
         }
-        item
-    } else {
+        session.request += 1;
+        return Some(ClientMessage::Place {
+            request: session.request,
+            kind,
+            yaw_steps: session.yaw_steps,
+        });
+    }
+    if !strike && !hit {
         return None;
-    };
+    }
     let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
-    let hit = world.raycast(origin, look_direction(session.yaw, session.pitch), 6.0)?;
-    let target = if block == 0 { hit.block } else { hit.adjacent };
-    let expected_revision = world.chunks.get(&chunk_coord(target))?.revision;
+    let direction = look_direction(session.yaw, session.pitch);
+    // A piece under the crosshair takes the hit before terrain does.
+    let pieces = building.gameplay_pieces();
+    let piece_hit =
+        gameplay::building::raycast_pieces(origin, direction, 6.0, pieces.iter());
+    let terrain = world.raycast(origin, direction, 6.0);
+    if let Some((piece, distance)) = piece_hit
+        && terrain.is_none_or(|hit| distance <= hit.distance)
+    {
+        session.request += 1;
+        return Some(ClientMessage::HitPiece {
+            request: session.request,
+            piece,
+        });
+    }
+    let hit = terrain?;
+    let expected_revision = world.chunks.get(&chunk_coord(hit.block))?.revision;
     session.request += 1;
     let request = session.request;
     Some(if strike {
         ClientMessage::Strike {
             request,
-            target,
+            target: hit.block,
             expected_revision,
         }
     } else {
         ClientMessage::Edit {
             request,
-            target,
-            block,
+            target: hit.block,
+            block: 0,
             expected_revision,
         }
     })
@@ -1297,8 +1340,10 @@ mod tests;
 
 fn observe_character_bodies(
     loose: Res<loose_blocks::LooseBlocks>,
+    building: Res<building::Building>,
     mut bodies: ResMut<controller::ObservedBodies>,
 ) {
     bodies.0.clear();
     bodies.0.extend_from_slice(loose.colliders());
+    bodies.0.extend_from_slice(building.colliders());
 }

@@ -2,6 +2,7 @@
 //! physics types; `combat` resolves melee swings against voxel terrain and
 //! character shapes.
 
+pub mod building;
 pub mod combat;
 
 use bevy_ecs::prelude::Component;
