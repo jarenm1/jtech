@@ -80,9 +80,9 @@ impl MeshData {
             (origin + v).to_array(),
         ]);
         self.normals.extend([normal.to_array(); 4]);
-        let mut color = block_color(material);
-        color[3] = 0.0; // alpha carries the secondary-material blend weight
-        self.colors.extend([color; 4]);
+        // Texture carries the material color; alpha carries the
+        // secondary-material blend weight.
+        self.colors.extend([[1.0, 1.0, 1.0, 0.0]; 4]);
         let m = material as f32;
         self.uvs.extend([[m, m]; 4]);
         if u.cross(v).dot(normal) > 0.0 {
@@ -323,22 +323,11 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                         let blend = (0.4
                             * (2.0 - second_distance / (first_distance + 1e-6)))
                         .clamp(0.0, 0.4);
-                        let (a, b) = (block_color(material), block_color(other));
-                        (
-                            [
-                                a[0] + (b[0] - a[0]) * blend,
-                                a[1] + (b[1] - a[1]) * blend,
-                                a[2] + (b[2] - a[2]) * blend,
-                                blend, // alpha carries the texture blend weight
-                            ],
-                            other,
-                        )
+                        // Texture carries the color; alpha carries the
+                        // texture-space blend weight.
+                        ([1.0, 1.0, 1.0, blend], other)
                     }
-                    None => {
-                        let mut color = block_color(material);
-                        color[3] = 0.0;
-                        (color, material)
-                    }
+                    None => ([1.0, 1.0, 1.0, 0.0], material),
                 };
                 // Displace along the pre-displacement normal (kept as-is: the
                 // bump is sub-voxel, so recomputing the gradient buys nothing).
@@ -446,7 +435,7 @@ type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 struct TerrainExtension {
-    #[texture(100)]
+    #[texture(100, dimension = "2d_array")]
     #[sampler(101)]
     atlas: Handle<Image>,
 }
@@ -754,17 +743,12 @@ mod tests {
             let v = (axis + 2) % 3;
             let min = Vec3::from_array(mesh.positions[start]).as_ivec3();
             let max = Vec3::from_array(mesh.positions[start + 2]).as_ivec3();
-            let material = (1..=6)
-                .find(|&b| {
-                    let tint = block_color(b);
-                    mesh.colors[start][..3] == tint[..3]
-                })
-                .unwrap();
+            let material = mesh.uvs[start][0] as u8;
             for vertex in start..start + 4 {
                 assert_eq!(mesh.normals[vertex], normal.to_array());
-                let mut expected = block_color(material);
-                expected[3] = 0.0; // alpha carries the blend weight
-                assert_eq!(mesh.colors[vertex], expected);
+                // White tint; alpha carries the blend weight.
+                assert_eq!(mesh.colors[vertex], [1.0, 1.0, 1.0, 0.0]);
+                assert_eq!(mesh.uvs[vertex], [material as f32, material as f32]);
             }
             for j in min[v]..max[v] {
                 for i in min[u]..max[u] {
@@ -872,7 +856,7 @@ mod tests {
             }
             let normal = Vec3::from_array(mesh.normals[i]);
             assert!((normal.length() - 1.0).abs() < 1e-4);
-            assert_eq!(mesh.colors[i][..3], block_color(STONE)[..3]);
+            assert_eq!(mesh.uvs[i][0], STONE as f32);
             // The interior top surface sits just below y = 16; the missing -y
             // neighbor also yields a fallback bottom surface near y = -0.5.
             if position[0] > 1.0 && position[0] < 31.0 && position[2] > 1.0 && position[2] < 31.0
@@ -994,15 +978,7 @@ mod tests {
                 && position.iter().all(|&c| c > 1.0 && c < 31.0)
             {
                 // Surface material dominates; a small dirt blend is allowed.
-                let grass = block_color(GRASS);
-                let dirt = block_color(DIRT);
-                let to_grass: f32 = (0..3)
-                    .map(|c| (mesh.colors[i][c] - grass[c]).abs())
-                    .sum();
-                let to_dirt: f32 = (0..3)
-                    .map(|c| (mesh.colors[i][c] - dirt[c]).abs())
-                    .sum();
-                assert!(to_grass < to_dirt, "vertex at {position:?}");
+                assert_eq!(mesh.uvs[i][0], GRASS as f32, "vertex at {position:?}");
                 matched += 1;
             }
         }

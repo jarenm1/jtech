@@ -1,12 +1,12 @@
 // Triplanar terrain texturing over the standard PBR input.
 //
 // Vertex data contract (set by `mesh_chunk`):
-//   color.rgb  blended material tint
+//   color.rgb  white (texture carries the full material color)
 //   color.a    blend weight toward the second material (0..0.4)
 //   uv.x       primary material id
 //   uv.y       secondary material id
-// The atlas is grayscale luminance; tint comes from vertex color so material
-// blending stays a pure color lerp.
+// The atlas is a horizontal row of RGB tiles; the sampler wraps so tile UVs
+// stay continuous across the tile edge (keeps derivatives clean for mips).
 
 #import bevy_pbr::{
     forward_io::{VertexOutput, FragmentOutput},
@@ -15,23 +15,23 @@
     pbr_types::STANDARD_MATERIAL_FLAGS_UNLIT_BIT,
 }
 
-@group(3) @binding(100) var atlas: texture_2d<f32>;
+@group(3) @binding(100) var atlas: texture_2d_array<f32>;
 @group(3) @binding(101) var atlas_sampler: sampler;
 
-const ATLAS_TILES: f32 = 8.0;
+const ATLAS_TILES: i32 = 8;
 // One texture tile spans four meters of world surface.
 const TEX_SCALE: f32 = 0.25;
 
-fn tile_uv(material: f32, uv: vec2<f32>) -> vec2<f32> {
-    let tile = clamp(u32(material + 0.5), 0u, u32(ATLAS_TILES) - 1u);
-    return vec2<f32>((f32(tile) + fract(uv.x)) / ATLAS_TILES, fract(uv.y));
+fn layer(material: f32) -> i32 {
+    return clamp(i32(material + 0.5), 0, ATLAS_TILES - 1);
 }
 
-fn triplanar(material: f32, world_pos: vec3<f32>, weights: vec3<f32>) -> f32 {
+fn triplanar(material: f32, world_pos: vec3<f32>, weights: vec3<f32>) -> vec3<f32> {
     let p = world_pos * TEX_SCALE;
-    let sx = textureSample(atlas, atlas_sampler, tile_uv(material, p.zy)).r;
-    let sy = textureSample(atlas, atlas_sampler, tile_uv(material, p.xz)).r;
-    let sz = textureSample(atlas, atlas_sampler, tile_uv(material, p.xy)).r;
+    let tile = layer(material);
+    let sx = textureSample(atlas, atlas_sampler, p.zy, tile).rgb;
+    let sy = textureSample(atlas, atlas_sampler, p.xz, tile).rgb;
+    let sz = textureSample(atlas, atlas_sampler, p.xy, tile).rgb;
     return sx * weights.x + sy * weights.y + sz * weights.z;
 }
 
@@ -43,22 +43,23 @@ fn fragment(
     var in = vertex_output;
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
-    // Triplanar weights: sharp falloff keeps each axis dominant on its faces.
+    // Triplanar weights: steep falloff keeps side projections off slopes —
+    // their edge-on smear reads as streaks on gentle terrain.
     var weights = abs(in.world_normal);
     weights = weights * weights * weights * weights;
+    weights = weights * weights;
     weights = weights / (weights.x + weights.y + weights.z);
 
-    let primary = triplanar(in.uv.x, in.world_position.xyz, weights);
-    var luminance = primary;
+    var texel = triplanar(in.uv.x, in.world_position.xyz, weights);
 #ifdef VERTEX_COLORS
     if in.color.a > 0.001 {
         let secondary = triplanar(in.uv.y, in.world_position.xyz, weights);
-        luminance = mix(primary, secondary, in.color.a);
+        texel = mix(texel, secondary, in.color.a);
     }
 #endif
 
     pbr_input.material.base_color = vec4<f32>(
-        pbr_input.material.base_color.rgb * luminance,
+        pbr_input.material.base_color.rgb * texel,
         pbr_input.material.base_color.a,
     );
     pbr_input.material.base_color = alpha_discard(
