@@ -213,8 +213,11 @@ pub(super) fn local_chunks(position: Vec3, radius: i32) -> HashSet<IVec3> {
 
 pub(super) fn spawn_position(generator: &TerrainGenerator, seed: u64) -> Vec3 {
     // Center of a single voxel leaves the full player footprint above its surface.
-    let height = generator.sample(0, 0, seed).height;
-    Vec3::new(0.5, height as f32 + 1.05, 0.5)
+    // The smooth surface sits at raw_height; the topmost solid voxel is the
+    // generation cap min(ceil(raw_height) - 1, height).
+    let sample = generator.sample(0, 0, seed);
+    let cap = (sample.raw_height.ceil() as i32 - 1).min(sample.height);
+    Vec3::new(0.5, cap as f32 + 1.05, 0.5)
 }
 
 const SPAWN_SEARCH_HEIGHT: i32 = 64;

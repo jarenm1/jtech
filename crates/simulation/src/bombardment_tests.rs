@@ -81,15 +81,24 @@ fn simultaneous_remote_blasts_release_and_move_supported_terrain() {
         sim.advance_bow(world);
         assert_eq!(sim.metrics.explosions, 2);
         let initial = sim.physics.as_ref().unwrap().snapshots();
+        // Each detonation carves one crater and launches one debris body.
+        assert_eq!(initial.len(), 2);
         for base in regions {
             assert!(
                 initial
                     .iter()
-                    .filter(|b| (b.position.x - base.x as f32).abs() < 20.0)
-                    .count()
-                    >= 8
+                    .any(|b| (b.position.x - base.x as f32).abs() < 20.0)
             );
-            assert_eq!(world.block(base + IVec3::new(6, 9, 6)), Some(0));
+            // The crater is smooth: some carved cell keeps partial density.
+            assert!(
+                (1..=11).any(|x| {
+                    (1..=11).any(|z| {
+                        let cell = base + IVec3::new(x, 9, z);
+                        world.density(cell).is_some_and(|d| d < 127 && d > -128)
+                    })
+                }),
+                "blast left no partially carved voxel"
+            );
         }
         for _ in 0..5 {
             submit(sim, world);
@@ -108,10 +117,7 @@ fn simultaneous_remote_blasts_release_and_move_supported_terrain() {
                         })
                 })
                 .count();
-            assert!(
-                moved >= 4,
-                "remote region {base:?}: only {moved} surviving bodies moved"
-            );
+            assert_eq!(moved, 1, "remote region {base:?}: debris body did not move");
         }
     });
 }
@@ -124,25 +130,22 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
     with_sim(&mut app, |sim, world| {
         let cells = [IVec3::new(516, 24, 516), IVec3::new(532, 24, 516)];
         for (id, cell) in cells.iter().enumerate() {
-            air(world, chunk_coord(*cell));
-            world.set_block(*cell, 3).unwrap();
             sim.detonations.push_back((
                 id as u32,
-                cell.as_vec3() + Vec3::splat(0.5) - Vec3::X * 2.75,
+                cell.as_vec3() + Vec3::splat(0.5) - Vec3::X * 1.0,
                 crate::packages::test_blast(protocol::BowPower::Standard),
             ));
         }
         sim.advance_bow(world);
         let initial = sim.physics.as_ref().unwrap().snapshots();
+        // One debris body per detonation, spawned undamaged.
         assert_eq!(initial.len(), 2);
         let doomed = initial[0].id;
         let survivor = initial[1].id;
         let initial_damage = sim.physics.as_ref().unwrap().body_damage(survivor);
-        assert!(initial_damage > 0.0);
+        assert_eq!(initial_damage, 0.0);
         assert!(cells.iter().all(|cell| world.block(*cell) == Some(0)));
         assert!(cells.iter().all(|cell| !sim.damage.contains_key(cell)));
-
-        submit(sim, world);
         // The impact arrives during GPU ownership. It must not mutate the old observation.
         sim.detonations.push_back((
             2,
@@ -326,7 +329,7 @@ fn playerless_streaming_loads_moving_halos_and_retires_remote_regions() {
         assert!(
             sim.journal
                 .values()
-                .any(|chunk| chunk.blocks.values().any(|&material| material == 3)),
+                .any(|chunk| chunk.voxels.values().any(|voxel| voxel.material == 3)),
             "settled body was not restored to terrain"
         );
     });

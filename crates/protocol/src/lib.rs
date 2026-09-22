@@ -7,7 +7,7 @@ use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -39,6 +39,15 @@ pub enum EditRejection {
     PackageUnavailable,
     Dead,
     OutOfStock,
+}
+
+/// One voxel's replicated state. Material bytes in chunk runs carry the
+/// placed flag in the high bit; deltas send it as a plain field instead.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Voxel {
+    pub material: u8,
+    pub density: i8,
+    pub placed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,14 +93,16 @@ pub enum ServerMessage {
     Chunk {
         coord: IVec3,
         revision: u64,
-        runs: Vec<(u16, u8)>,
+        /// Material runs with the placed flag packed into the high bit.
+        material_runs: Vec<(u16, u8)>,
+        density_runs: Vec<(u16, i8)>,
     },
     Delta {
         coord: IVec3,
         from: u64,
         to: u64,
-        local_index: u16,
-        block: u8,
+        /// `(local index, post-edit voxel)` pairs; `to - from` equals the count.
+        voxels: Vec<(u16, Voxel)>,
     },
     Forget {
         coord: IVec3,
@@ -416,5 +427,58 @@ mod tests {
         assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_ok());
         let bytes = encode(&[1_u16, 0, 0, 0, 0, 0, 0, 0, 0, MAX_STACK + 1], MAX_FRAME).unwrap();
         assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_err());
+    }
+
+    #[test]
+    fn chunk_and_delta_round_trip_voxel_state() {
+        let chunk = ServerMessage::Chunk {
+            coord: IVec3::new(-1, 2, 3),
+            revision: 41,
+            material_runs: vec![(32760, 3), (1, 0x80 | 5), (7, 0)],
+            density_runs: vec![(32760, 127), (8, -128)],
+        };
+        let bytes = encode(&chunk, MAX_FRAME).unwrap();
+        let ServerMessage::Chunk {
+            material_runs,
+            density_runs,
+            ..
+        } = decode(&bytes, MAX_FRAME).unwrap()
+        else {
+            panic!("wrong message")
+        };
+        assert_eq!(material_runs[1], (1, 0x85));
+        assert_eq!(density_runs, vec![(32760, 127), (8, -128)]);
+
+        let delta = ServerMessage::Delta {
+            coord: IVec3::ZERO,
+            from: 41,
+            to: 43,
+            voxels: vec![
+                (
+                    7,
+                    Voxel {
+                        material: 0,
+                        density: -40,
+                        placed: false,
+                    },
+                ),
+                (
+                    9,
+                    Voxel {
+                        material: 5,
+                        density: -128,
+                        placed: true,
+                    },
+                ),
+            ],
+        };
+        let bytes = encode(&delta, MAX_FRAME).unwrap();
+        let ServerMessage::Delta { from, to, voxels, .. } =
+            decode(&bytes, MAX_FRAME).unwrap()
+        else {
+            panic!("wrong message")
+        };
+        assert_eq!((from, to), (41, 43));
+        assert!(voxels[1].1.placed && voxels[1].1.density == -128);
     }
 }

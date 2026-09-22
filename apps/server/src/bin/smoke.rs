@@ -113,17 +113,20 @@ impl Bot {
                 ServerMessage::Chunk {
                     coord,
                     revision,
-                    runs,
+                    material_runs,
+                    density_runs,
                 } => {
-                    self.world.insert(coord, Chunk::from_runs(revision, &runs)?);
+                    self.world.insert(
+                        coord,
+                        Chunk::from_voxel_runs(revision, &material_runs, &density_runs)?,
+                    );
                     self.chunks += 1;
                 }
                 ServerMessage::Delta {
                     coord,
                     from,
                     to,
-                    local_index,
-                    block,
+                    voxels,
                 } => {
                     if self
                         .world
@@ -131,14 +134,20 @@ impl Bot {
                         .get(&coord)
                         .is_some_and(|chunk| chunk.revision == from)
                     {
-                        let cell = local_index as i32;
-                        let target = coord * CHUNK_SIZE
-                            + IVec3::new(cell % 32, cell / 1024, (cell / 32) % 32);
-                        let revision = self
-                            .world
-                            .set_block(target, block)
-                            .ok_or("delta did not change terrain")?;
-                        if revision != (from, to) {
+                        for (cell, voxel) in voxels {
+                            let cell = cell as i32;
+                            let target = coord * CHUNK_SIZE
+                                + IVec3::new(cell % 32, cell / 1024, (cell / 32) % 32);
+                            let _ = self.world.set_voxel(
+                                target,
+                                voxel_world::Voxel {
+                                    material: voxel.material,
+                                    density: voxel.density,
+                                    placed: voxel.placed,
+                                },
+                            );
+                        }
+                        if self.world.chunks[&coord].revision != to {
                             return Err("delta revision mismatch".into());
                         }
                         self.deltas += 1;
@@ -1030,18 +1039,15 @@ fn main() -> Result<()> {
         if actor.health.is_depleted() {
             break;
         }
-        // Predicted position leads the authoritative echo under jitter; stop
-        // early, then stand still so the server position converges in range.
-        let to = actor.state.position - first.state.position;
+        // Predicted position leads the authoritative echo under jitter; chase on
+        // the server position and keep walking while swinging so knockback
+        // cannot push the dummy out of reach between swings.
+        let to = actor.state.position - first.authority.position;
         let flat = Vec3::new(to.x, 0.0, to.z);
         first.yaw = (-to.x).atan2(-to.z);
-        if flat.length() > 2.5 {
-            first.attack = false;
-            drive_first(&mut app, &mut first, &mut second, 4, [0.0, 1.0], 0.0)?;
-        } else {
-            first.attack = true;
-            drive_first(&mut app, &mut first, &mut second, 34, [0.0; 2], 0.0)?;
-        }
+        first.attack = true;
+        let movement = if flat.length() > 1.6 { [0.0, 1.0] } else { [0.0; 2] };
+        drive_first(&mut app, &mut first, &mut second, 34, movement, 0.0)?;
     }
     first.attack = false;
     first.yaw = 0.0;
@@ -1083,10 +1089,31 @@ fn main() -> Result<()> {
         first.forgotten > 0 && first.chunks > 27,
         "interest did not forget and stream chunks",
     )?;
-    require(
-        first.world.chunks.len() <= 27 && second.world.chunks.len() <= 27,
-        "divergent streaming exceeded client chunk bound",
-    )?;
+    // Client residency must stay inside the server's interest set: the local
+    // 3x3x3 plus meshing halos around journaled (edited) chunks. Brush edits
+    // journal more chunks than single-cell edits did, so the old flat bound
+    // of 27 no longer describes a correct client.
+    let sim = app.world().resource::<Simulation>();
+    for (name, bot) in [("first", &first), ("second", &second)] {
+        let Some(interest) = sim.player_interest(bot.id) else {
+            continue;
+        };
+        let mut extra: Vec<_> = bot
+            .world
+            .chunks
+            .keys()
+            .filter(|c| !interest.contains(*c))
+            .cloned()
+            .collect();
+        extra.sort_by_key(|c| (c.x, c.y, c.z));
+        require(
+            extra.is_empty(),
+            &format!(
+                "{name} holds chunks outside interest: n={} extra={extra:?}",
+                bot.world.chunks.len()
+            ),
+        )?;
+    }
     // Server residency = both players' safety halos + warm spawn set + physics
     // collision pages; 588 observed, bound leaves headroom for terrain drift.
     let server_chunks = app.world().resource::<VoxelWorld>().chunks.len();
