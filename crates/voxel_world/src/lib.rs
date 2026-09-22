@@ -26,17 +26,87 @@ pub const BEDROLL: u8 = 6;
 pub const WORLD_MIN_Y: i32 = MIN_CHUNK_Y * CHUNK_SIZE;
 /// Highest world block coordinate covered by the chunk range.
 pub const WORLD_MAX_Y: i32 = (MAX_CHUNK_Y + 1) * CHUNK_SIZE - 1;
+/// Density written for a fully solid terrain voxel.
+pub const DENSITY_SOLID: i8 = 127;
+/// Density written for a fully empty voxel.
+pub const DENSITY_AIR: i8 = -128;
+/// High bit packed into material bytes on the wire marking player-placed cubes.
+pub const PLACED_FLAG: u8 = 0x80;
+/// Largest brush radius accepted by [`VoxelWorld::brush_dig`] and
+/// [`VoxelWorld::brush_add`]; bounds the touched-chunk work per edit.
+pub const MAX_BRUSH_RADIUS: f32 = 8.0;
+
+/// One voxel's full state: the material gameplay observes, the signed density
+/// the smooth mesher contours, and whether the cell is a player-placed cube.
+/// Invariant: `material != AIR` exactly when `density > 0 || placed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Voxel {
+    pub material: u8,
+    pub density: i8,
+    pub placed: bool,
+}
+impl Voxel {
+    pub const AIR: Self = Self {
+        material: AIR,
+        density: DENSITY_AIR,
+        placed: false,
+    };
+    /// Terrain write: density implied by material, never placed.
+    pub const fn terrain(material: u8) -> Self {
+        Self {
+            material,
+            density: if material == AIR {
+                DENSITY_AIR
+            } else {
+                DENSITY_SOLID
+            },
+            placed: false,
+        }
+    }
+    /// Placed write: a discrete cube; density stays air so the smooth mesher
+    /// ignores it and the greedy pass draws crisp faces.
+    pub const fn placed(material: u8) -> Self {
+        Self {
+            material,
+            density: DENSITY_AIR,
+            placed: material != AIR,
+        }
+    }
+    fn implied_density(material: u8) -> i8 {
+        if material == AIR {
+            DENSITY_AIR
+        } else {
+            DENSITY_SOLID
+        }
+    }
+}
 
 static DEFAULT_TERRAIN: LazyLock<TerrainGenerator> = LazyLock::new(TerrainGenerator::default);
-const OFFSETS: [IVec3; 7] = [
-    IVec3::ZERO,
-    IVec3::X,
-    IVec3::NEG_X,
-    IVec3::Y,
-    IVec3::NEG_Y,
-    IVec3::Z,
-    IVec3::NEG_Z,
-];
+/// All 27 chunks in the 3x3x3 neighborhood. Index 0 is the center chunk; the
+/// remaining 26 are ordered by offset `(dx, dy, dz)` in `-1..=1` lexicographic
+/// order skipping zero. Smooth meshing samples diagonal neighbors at chunk
+/// corners, so the full neighborhood is required for seamless boundaries.
+const OFFSETS: [IVec3; 27] = {
+    let mut offsets = [IVec3::ZERO; 27];
+    let mut i = 1;
+    let mut dz = -1;
+    while dz <= 1 {
+        let mut dy = -1;
+        while dy <= 1 {
+            let mut dx = -1;
+            while dx <= 1 {
+                if dx != 0 || dy != 0 || dz != 0 {
+                    offsets[i] = IVec3::new(dx, dy, dz);
+                    i += 1;
+                }
+                dx += 1;
+            }
+            dy += 1;
+        }
+        dz += 1;
+    }
+    offsets
+};
 
 pub fn block_color(block: u8) -> [f32; 4] {
     match block {
@@ -74,8 +144,16 @@ pub fn index(local: IVec3) -> usize {
 
 #[derive(Clone, Debug)]
 enum Storage {
+    /// Every voxel identical; material implies density, nothing placed.
     Uniform(u8),
+    /// Packed material nibbles only; density implied, nothing placed.
     Dense(Box<[u8]>),
+    /// Full voxel state: material nibbles, per-voxel density, placed bitmap.
+    Smooth {
+        materials: Box<[u8]>,
+        density: Box<[i8]>,
+        placed: Box<[u8]>,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct Chunk {
@@ -83,25 +161,119 @@ pub struct Chunk {
     storage: Storage,
 }
 impl Chunk {
-    fn at(&self, index: usize) -> u8 {
+    fn material_at(&self, index: usize) -> u8 {
         match &self.storage {
             Storage::Uniform(block) => *block,
-            Storage::Dense(bytes) => (bytes[index / 2] >> ((index & 1) * 4)) & 15,
+            Storage::Dense(bytes) | Storage::Smooth {
+                materials: bytes, ..
+            } => (bytes[index / 2] >> ((index & 1) * 4)) & 15,
         }
     }
+    fn density_at(&self, index: usize) -> i8 {
+        match &self.storage {
+            Storage::Uniform(block) => Voxel::implied_density(*block),
+            Storage::Dense(materials) => {
+                let m = (materials[index / 2] >> ((index & 1) * 4)) & 15;
+                Voxel::implied_density(m)
+            }
+            Storage::Smooth { density, .. } => density[index],
+        }
+    }
+    fn placed_at(&self, index: usize) -> bool {
+        match &self.storage {
+            Storage::Uniform(_) | Storage::Dense(_) => false,
+            Storage::Smooth { placed, .. } => placed[index / 8] & (1 << (index & 7)) != 0,
+        }
+    }
+    /// Material gameplay observes; `AIR` when the voxel is non-solid.
     pub fn get(&self, local: IVec3) -> u8 {
-        self.at(index(local))
+        self.material_at(index(local))
     }
-    fn set(&mut self, index: usize, block: u8) {
-        if let Storage::Uniform(old) = self.storage {
-            self.storage =
-                Storage::Dense(vec![old | (old << 4); CHUNK_VOLUME / 2].into_boxed_slice());
-        }
-        if let Storage::Dense(bytes) = &mut self.storage {
-            let shift = (index & 1) * 4;
-            bytes[index / 2] = (bytes[index / 2] & !(15 << shift)) | (block << shift);
+    /// Signed density at this voxel; `> 0` means the smooth surface is inside.
+    pub fn density(&self, local: IVec3) -> i8 {
+        self.density_at(index(local))
+    }
+    /// Whether this voxel is a player-placed discrete cube.
+    pub fn placed(&self, local: IVec3) -> bool {
+        self.placed_at(index(local))
+    }
+    /// Full voxel state for journaling and wire deltas.
+    pub fn voxel(&self, local: IVec3) -> Voxel {
+        let i = index(local);
+        Voxel {
+            material: self.material_at(i),
+            density: self.density_at(i),
+            placed: self.placed_at(i),
         }
     }
+    fn set_material(&mut self, index: usize, block: u8) {
+        match &mut self.storage {
+            Storage::Dense(bytes) | Storage::Smooth {
+                materials: bytes, ..
+            } => {
+                let shift = (index & 1) * 4;
+                bytes[index / 2] = (bytes[index / 2] & !(15 << shift)) | (block << shift);
+            }
+            Storage::Uniform(_) => unreachable!("materials allocated before write"),
+        }
+    }
+    /// Write the full voxel state. Expands storage tiers as needed.
+    pub fn set_voxel(&mut self, index: usize, voxel: Voxel) {
+        debug_assert!(voxel.material <= BEDROLL);
+        let implied = voxel.density == Voxel::implied_density(voxel.material) && !voxel.placed;
+        match &self.storage {
+            Storage::Uniform(old) => {
+                let old = *old;
+                if implied && voxel.material == old {
+                    return;
+                }
+                if implied {
+                    self.storage =
+                        Storage::Dense(vec![old | (old << 4); CHUNK_VOLUME / 2].into_boxed_slice());
+                } else {
+                    self.storage = Storage::Smooth {
+                        materials: vec![old | (old << 4); CHUNK_VOLUME / 2].into_boxed_slice(),
+                        density: vec![Voxel::implied_density(old); CHUNK_VOLUME].into_boxed_slice(),
+                        placed: vec![0; CHUNK_VOLUME / 8].into_boxed_slice(),
+                    };
+                }
+            }
+            Storage::Dense(_) => {
+                if !implied {
+                    let Storage::Dense(materials) =
+                        std::mem::replace(&mut self.storage, Storage::Uniform(AIR))
+                    else {
+                        unreachable!()
+                    };
+                    let mut density = Vec::with_capacity(CHUNK_VOLUME);
+                    for i in 0..CHUNK_VOLUME {
+                        let m = (materials[i / 2] >> ((i & 1) * 4)) & 15;
+                        density.push(Voxel::implied_density(m));
+                    }
+                    self.storage = Storage::Smooth {
+                        materials,
+                        density: density.into_boxed_slice(),
+                        placed: vec![0; CHUNK_VOLUME / 8].into_boxed_slice(),
+                    };
+                }
+            }
+            Storage::Smooth { .. } => {}
+        }
+        self.set_material(index, voxel.material);
+        if let Storage::Smooth {
+            density, placed, ..
+        } = &mut self.storage
+        {
+            density[index] = voxel.density;
+            if voxel.placed {
+                placed[index / 8] |= 1 << (index & 7);
+            } else {
+                placed[index / 8] &= !(1 << (index & 7));
+            }
+        }
+    }
+    /// Legacy material-run decode used by tests and fixtures. Density is
+    /// implied; nothing is placed.
     pub fn from_runs(revision: u64, runs: &[(u16, u8)]) -> Result<Self, String> {
         let mut total = 0usize;
         for &(count, block) in runs {
@@ -130,36 +302,109 @@ impl Chunk {
         let mut cursor = 0;
         for &(count, block) in runs {
             for i in cursor..cursor + count as usize {
-                chunk.set(i, block);
+                chunk.set_material(i, block);
             }
             cursor += count as usize;
         }
         Ok(chunk)
     }
-    pub fn runs(&self) -> Vec<(u16, u8)> {
-        if let Storage::Uniform(block) = self.storage {
-            return vec![(CHUNK_VOLUME as u16, block)];
+    /// Wire decode: material runs (high bit = placed) plus density runs.
+    /// Either stream may be a single full-volume run.
+    pub fn from_voxel_runs(
+        revision: u64,
+        material_runs: &[(u16, u8)],
+        density_runs: &[(u16, i8)],
+    ) -> Result<Self, String> {
+        let expand = |runs: &[(u16, u8)]| -> Result<Vec<u8>, String> {
+            let mut out = Vec::with_capacity(CHUNK_VOLUME);
+            for &(count, block) in runs {
+                if count == 0 || block & !PLACED_FLAG > BEDROLL {
+                    return Err("zero run or invalid block".into());
+                }
+                if out.len() + count as usize > CHUNK_VOLUME {
+                    return Err("chunk run volume overflow".into());
+                }
+                out.extend(std::iter::repeat(block).take(count as usize));
+            }
+            if out.len() != CHUNK_VOLUME {
+                return Err("chunk run volume incomplete".into());
+            }
+            Ok(out)
+        };
+        let materials = expand(material_runs)?;
+        let mut density = Vec::with_capacity(CHUNK_VOLUME);
+        for &(count, d) in density_runs {
+            if count == 0 {
+                return Err("zero density run".into());
+            }
+            if density.len() + count as usize > CHUNK_VOLUME {
+                return Err("density run volume overflow".into());
+            }
+            density.extend(std::iter::repeat(d).take(count as usize));
         }
-        let mut runs = Vec::new();
-        let mut block = self.at(0);
-        let mut count = 1u16;
+        if density.len() != CHUNK_VOLUME {
+            return Err("density run volume incomplete".into());
+        }
+        let mut chunk = Self {
+            revision,
+            storage: Storage::Uniform(AIR),
+        };
+        for i in 0..CHUNK_VOLUME {
+            let raw = materials[i];
+            chunk.set_voxel(
+                i,
+                Voxel {
+                    material: raw & !PLACED_FLAG,
+                    density: density[i],
+                    placed: raw & PLACED_FLAG != 0,
+                },
+            );
+        }
+        chunk.compact();
+        Ok(chunk)
+    }
+    /// Legacy material runs; placed voxels report their material with the
+    /// placed flag set so wire consumers can reconstruct full state.
+    pub fn runs(&self) -> Vec<(u16, u8)> {
+        self.voxel_runs().0
+    }
+    /// Wire encode: material runs (high bit = placed) plus density runs.
+    pub fn voxel_runs(&self) -> (Vec<(u16, u8)>, Vec<(u16, i8)>) {
+        let mut material_runs: Vec<(u16, u8)> = Vec::new();
+        let mut density_runs: Vec<(u16, i8)> = Vec::new();
+        let mut material = self.material_at(0) | (self.placed_at(0) as u8) << 7;
+        let mut density = self.density_at(0);
+        let mut material_count = 1u16;
+        let mut density_count = 1u16;
         for i in 1..CHUNK_VOLUME {
-            let next = self.at(i);
-            if next == block {
-                count += 1;
+            let m = self.material_at(i) | (self.placed_at(i) as u8) << 7;
+            let d = self.density_at(i);
+            if m == material {
+                material_count += 1;
             } else {
-                runs.push((count, block));
-                block = next;
-                count = 1;
+                material_runs.push((material_count, material));
+                material = m;
+                material_count = 1;
+            }
+            if d == density {
+                density_count += 1;
+            } else {
+                density_runs.push((density_count, density));
+                density = d;
+                density_count = 1;
             }
         }
-        runs.push((count, block));
-        runs
+        material_runs.push((material_count, material));
+        density_runs.push((density_count, density));
+        (material_runs, density_runs)
     }
     pub fn is_empty(&self) -> bool {
         match &self.storage {
             Storage::Uniform(block) => *block == AIR,
             Storage::Dense(bytes) => bytes.iter().all(|&b| b == 0),
+            Storage::Smooth {
+                materials, placed, ..
+            } => materials.iter().all(|&b| b == 0) && placed.iter().all(|&b| b == 0),
         }
     }
     pub fn generate(coord: IVec3, seed: u64) -> Self {
@@ -171,10 +416,33 @@ impl Chunk {
         crate::terrain::generate_chunk(coord, seed, generator)
     }
 
+    /// Collapse to the cheapest storage tier that preserves the voxel state.
     fn compact(&mut self) {
-        let first = self.at(0);
-        if (1..CHUNK_VOLUME).all(|i| self.at(i) == first) {
-            self.storage = Storage::Uniform(first);
+        if let Storage::Smooth {
+            materials,
+            density,
+            placed,
+        } = &self.storage
+        {
+            if placed.iter().all(|&b| b == 0)
+                && (0..CHUNK_VOLUME).all(|i| {
+                    let m = (materials[i / 2] >> ((i & 1) * 4)) & 15;
+                    density[i] == Voxel::implied_density(m)
+                })
+            {
+                let Storage::Smooth { materials, .. } =
+                    std::mem::replace(&mut self.storage, Storage::Uniform(AIR))
+                else {
+                    unreachable!()
+                };
+                self.storage = Storage::Dense(materials);
+            }
+        }
+        if matches!(self.storage, Storage::Dense(_)) {
+            let first = self.material_at(0);
+            if (1..CHUNK_VOLUME).all(|i| self.material_at(i) == first) {
+                self.storage = Storage::Uniform(first);
+            }
         }
     }
 }
@@ -209,23 +477,144 @@ impl VoxelWorld {
             .entry(coord)
             .or_insert_with(|| Arc::new(Chunk::generate_with(coord, self.seed, &self.generator)));
     }
+    /// Discrete-cube edit used by player placement and legacy callers.
+    /// `block == AIR` clears the voxel entirely (material, density, placed);
+    /// `block != AIR` writes a player-placed cube the smooth mesher ignores.
+    /// Terrain carving goes through [`Self::brush_dig`].
     pub fn set_block(&mut self, pos: IVec3, block: u8) -> Option<(u64, u64)> {
         if block > BEDROLL {
             return None;
         }
+        let voxel = if block == AIR {
+            Voxel::AIR
+        } else {
+            Voxel::placed(block)
+        };
+        self.set_voxel(pos, voxel)
+    }
+    /// Write a full voxel state; used by journal restore and wire deltas.
+    /// Returns `(old_revision, new_revision)` when the voxel changed.
+    pub fn set_voxel(&mut self, pos: IVec3, voxel: Voxel) -> Option<(u64, u64)> {
+        if voxel.material > BEDROLL {
+            return None;
+        }
         let chunk = self.chunks.get_mut(&chunk_coord(pos))?;
         let i = index(local_coord(pos));
-        if chunk.at(i) == block {
+        if chunk.voxel(local_coord(pos)) == voxel {
             return None;
         }
         let old = chunk.revision;
         let new = old.checked_add(1)?;
         let chunk = Arc::make_mut(chunk);
-        chunk.set(i, block);
+        chunk.set_voxel(i, voxel);
         chunk.revision = new;
         Some((old, new))
     }
-    pub fn mesh_stamp(&self, coord: IVec3) -> [Option<u64>; 7] {
+    /// Signed density at a world voxel; `None` for unloaded chunks.
+    pub fn density(&self, pos: IVec3) -> Option<i8> {
+        self.chunks
+            .get(&chunk_coord(pos))
+            .map(|c| c.density(local_coord(pos)))
+    }
+    /// Full voxel state at a world position; `None` for unloaded chunks.
+    pub fn voxel(&self, pos: IVec3) -> Option<Voxel> {
+        self.chunks
+            .get(&chunk_coord(pos))
+            .map(|c| c.voxel(local_coord(pos)))
+    }
+    /// Carve a smooth sphere out of the terrain: subtracts density with a
+    /// linear falloff and destroys placed cubes inside the radius. Returns the
+    /// per-chunk `(old_revision, new_revision)` pairs and the voxels changed.
+    pub fn brush_dig(&mut self, center: Vec3, radius: f32) -> Vec<BrushEdit> {
+        self.brush(center, radius, None)
+    }
+    /// Deposit terrain: adds density with a linear falloff, adopting
+    /// `material` where the voxel becomes solid. Placed cubes are untouched.
+    pub fn brush_add(&mut self, center: Vec3, radius: f32, material: u8) -> Vec<BrushEdit> {
+        if material == AIR || material > BEDROLL {
+            return Vec::new();
+        }
+        self.brush(center, radius, Some(material))
+    }
+    fn brush(&mut self, center: Vec3, radius: f32, add: Option<u8>) -> Vec<BrushEdit> {
+        if !center.is_finite()
+            || !radius.is_finite()
+            || radius <= 0.0
+            || radius > MAX_BRUSH_RADIUS
+        {
+            return Vec::new();
+        }
+        let lo = (center - Vec3::splat(radius)).floor().as_ivec3();
+        let hi = (center + Vec3::splat(radius)).floor().as_ivec3();
+        let mut edits: Vec<BrushEdit> = Vec::new();
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let pos = IVec3::new(x, y, z);
+                    let distance = (pos.as_vec3() + Vec3::splat(0.5) - center).length();
+                    if distance >= radius {
+                        continue;
+                    }
+                    let coord = chunk_coord(pos);
+                    let Some(chunk) = self.chunks.get_mut(&coord) else {
+                        continue;
+                    };
+                    let local = local_coord(pos);
+                    let before = chunk.voxel(local);
+                    let delta = ((radius - distance) / radius * 255.0).min(255.0) as i32;
+                    let after = match add {
+                        Some(material) => {
+                            if before.placed {
+                                continue;
+                            }
+                            let density = (before.density as i32 + delta).min(127) as i8;
+                            Voxel {
+                                material: if density > 0 && before.material == AIR {
+                                    material
+                                } else {
+                                    before.material
+                                },
+                                density,
+                                placed: false,
+                            }
+                        }
+                        None => {
+                            let density = (before.density as i32 - delta).max(-128) as i8;
+                            Voxel {
+                                material: if density > 0 { before.material } else { AIR },
+                                density,
+                                placed: false,
+                            }
+                        }
+                    };
+                    if after == before {
+                        continue;
+                    }
+                    let old = chunk.revision;
+                    let Some(new) = old.checked_add(1) else {
+                        continue;
+                    };
+                    let chunk = Arc::make_mut(chunk);
+                    chunk.set_voxel(index(local), after);
+                    chunk.revision = new;
+                    match edits.iter_mut().find(|e: &&mut BrushEdit| e.coord == coord) {
+                        Some(edit) => {
+                            edit.to = new;
+                            edit.voxels.push((index(local) as u16, before, after));
+                        }
+                        None => edits.push(BrushEdit {
+                            coord,
+                            from: old,
+                            to: new,
+                            voxels: vec![(index(local) as u16, before, after)],
+                        }),
+                    }
+                }
+            }
+        }
+        edits
+    }
+    pub fn mesh_stamp(&self, coord: IVec3) -> [Option<u64>; 27] {
         OFFSETS.map(|offset| self.chunks.get(&(coord + offset)).map(|c| c.revision))
     }
     pub fn neighborhood(&self, coord: IVec3) -> ChunkNeighborhood {
@@ -286,27 +675,73 @@ impl VoxelWorld {
 }
 pub struct ChunkNeighborhood {
     pub coord: IVec3,
-    chunks: [Option<Arc<Chunk>>; 7],
+    chunks: [Option<Arc<Chunk>>; 27],
 }
 impl ChunkNeighborhood {
+    /// Map a local coordinate (possibly outside `0..32`) to its chunk slot and
+    /// in-chunk coordinate. `local` must be within one chunk of the center.
+    fn locate(&self, local: IVec3) -> (usize, IVec3) {
+        let offset = chunk_coord(local);
+        debug_assert!(
+            offset.cmplt(IVec3::splat(2)).all() && offset.cmpgt(IVec3::splat(-2)).all(),
+            "neighborhood sample beyond one chunk"
+        );
+        // OFFSETS[0] is the center; slots 1..=26 hold the other offsets in
+        // (dz, dy, dx) lexicographic order. The zero triple's grid index is 13.
+        let grid = ((offset.z + 1) * 9 + (offset.y + 1) * 3 + (offset.x + 1)) as usize;
+        let slot = if grid == 13 {
+            0
+        } else if grid < 13 {
+            grid + 1
+        } else {
+            grid
+        };
+        (slot, local_coord(local))
+    }
+    /// Material at a local coordinate; `AIR` for missing chunks.
     pub fn block(&self, local: IVec3) -> u8 {
-        // Almost every meshing sample is in the center chunk. Do not perform
-        // Euclidean division and an axial-neighbor search for those samples.
         if local.cmpge(IVec3::ZERO).all() && local.cmplt(IVec3::splat(CHUNK_SIZE)).all() {
             return self.chunks[0]
                 .as_ref()
                 .map_or(AIR, |chunk| chunk.get(local));
         }
-        let offset = chunk_coord(local);
-        OFFSETS
-            .iter()
-            .position(|&o| o == offset)
-            .and_then(|i| self.chunks[i].as_ref())
-            .map_or(AIR, |c| c.get(local_coord(local)))
+        let (slot, inner) = self.locate(local);
+        self.chunks[slot].as_ref().map_or(AIR, |c| c.get(inner))
     }
-    pub fn stamp(&self) -> [Option<u64>; 7] {
+    /// Signed density at a local coordinate; `DENSITY_AIR` for missing chunks.
+    pub fn density(&self, local: IVec3) -> i8 {
+        if local.cmpge(IVec3::ZERO).all() && local.cmplt(IVec3::splat(CHUNK_SIZE)).all() {
+            return self.chunks[0]
+                .as_ref()
+                .map_or(DENSITY_AIR, |chunk| chunk.density(local));
+        }
+        let (slot, inner) = self.locate(local);
+        self.chunks[slot]
+            .as_ref()
+            .map_or(DENSITY_AIR, |c| c.density(inner))
+    }
+    /// Whether a local coordinate is a player-placed cube.
+    pub fn placed(&self, local: IVec3) -> bool {
+        if local.cmpge(IVec3::ZERO).all() && local.cmplt(IVec3::splat(CHUNK_SIZE)).all() {
+            return self.chunks[0]
+                .as_ref()
+                .is_some_and(|chunk| chunk.placed(local));
+        }
+        let (slot, inner) = self.locate(local);
+        self.chunks[slot].as_ref().is_some_and(|c| c.placed(inner))
+    }
+    pub fn stamp(&self) -> [Option<u64>; 27] {
         std::array::from_fn(|i| self.chunks[i].as_ref().map(|c| c.revision))
     }
+}
+/// Per-chunk record of one brush application: revisions for staleness checks
+/// and `(index, before, after)` triplets for journaling and wire deltas.
+#[derive(Clone, Debug)]
+pub struct BrushEdit {
+    pub coord: IVec3,
+    pub from: u64,
+    pub to: u64,
+    pub voxels: Vec<(u16, Voxel, Voxel)>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct RayHit {
@@ -334,11 +769,11 @@ mod tests {
         assert_eq!(snapshot.block(p), AIR);
         assert_ne!(snapshot.stamp(), world.mesh_stamp(IVec3::ZERO));
         assert_eq!(world.set_block(p, STONE), None);
-        assert_eq!(world.set_block(p, 6), None);
-        assert_eq!(world.mesh_stamp(IVec3::ZERO)[2], Some(1));
+        assert_eq!(world.set_block(p, 7), None);
+        assert_eq!(world.mesh_stamp(IVec3::ZERO)[13], Some(1));
         world.remove(IVec3::NEG_X);
         assert_eq!(world.block(p), None);
-        assert_eq!(world.mesh_stamp(IVec3::ZERO)[2], None);
+        assert_eq!(world.mesh_stamp(IVec3::ZERO)[13], None);
     }
     #[test]
     fn strict_codec_and_nibble_boundaries() {
@@ -346,7 +781,7 @@ mod tests {
             vec![],
             vec![(0, AIR), (32768, AIR)],
             vec![(32767, AIR)],
-            vec![(32768, 6)],
+            vec![(32768, 7)],
             vec![(32768, AIR), (1, AIR)],
         ] {
             assert!(Chunk::from_runs(0, &runs).is_err());
