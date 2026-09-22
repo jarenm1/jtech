@@ -7,7 +7,9 @@ use bevy::{
     render::render_resource::PrimitiveTopology,
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
 };
-use voxel_world::{AIR, CHUNK_SIZE, ChunkNeighborhood, VoxelWorld, block_color};
+use voxel_world::{
+    AIR, CHUNK_SIZE, ChunkNeighborhood, DIRT, SAND, STONE, VoxelWorld, block_color,
+};
 
 const MAX_JOBS: usize = 16;
 const STARTS_PER_FRAME: usize = 8;
@@ -146,6 +148,41 @@ pub fn placed_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
     mesh
 }
 
+/// Per-material surface roughness: the amplitude of the deterministic
+/// heightfield displacing surface-net vertices along their normal. Grass,
+/// wood, and bedroll stay flat; placed cubes never reach this path.
+fn roughness(material: u8) -> f32 {
+    match material {
+        DIRT => 0.05,
+        STONE => 0.15,
+        SAND => 0.03,
+        _ => 0.0,
+    }
+}
+
+/// Seeded value noise in [-1, 1), a pure function of world position so both
+/// sides of a chunk boundary displace a shared seam vertex identically.
+fn noise2d(x: f32, z: f32) -> f32 {
+    // Lattice hash: fixed seed, wrapping arithmetic, no table lookups.
+    let hash = |ix: i32, iz: i32| -> f32 {
+        let mut h = (ix as u32)
+            .wrapping_mul(0x8da6b343)
+            ^ (iz as u32).wrapping_mul(0xd8163841)
+            ^ 0xcb1ab31f;
+        h = h.wrapping_mul(h).wrapping_add(0x9e3779b9);
+        h ^= h >> 16;
+        (h & 0x00ff_ffff) as f32 / 0x0100_0000 as f32
+    };
+    let (ix, iz) = (x.floor() as i32, z.floor() as i32);
+    let (fx, fz) = (x - ix as f32, z - iz as f32);
+    // Smoothstep weights keep the field continuous across lattice lines.
+    let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
+    let (h00, h10) = (hash(ix, iz), hash(ix + 1, iz));
+    let (h01, h11) = (hash(ix, iz + 1), hash(ix + 1, iz + 1));
+    (h00 + (h10 - h00) * sx + ((h01 + (h11 - h01) * sx) - (h00 + (h10 - h00) * sx)) * sz) * 2.0
+        - 1.0
+}
+
 /// Naive surface nets over the signed density field: one vertex per cell whose
 /// eight corner densities straddle zero, quads spanning every sign-changing
 /// lattice edge. Cells -1..=31 are evaluated so quads owned by this chunk can
@@ -232,9 +269,24 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                     gradient.z += s * wx(i) * wy(i) * if i & 4 == 4 { 1.0 } else { -1.0 };
                 }
                 let normal = (-gradient).try_normalize().unwrap_or(Vec3::Y);
-                // Color from the densest corner: always solid, so never AIR.
-                let densest = (0..8).max_by_key(|&i| d[i]).unwrap();
-                let material = neighborhood.block(corner(c, densest));
+                // Color and roughness come from the solid corner nearest the
+                // vertex: at a grass-over-dirt transition the vertex hugs the
+                // grass corner, so subsurface dirt cannot bleed through.
+                let nearest = (0..8)
+                    .filter(|&i| d[i] > 0)
+                    .min_by_key(|&i| {
+                        (position - corner(c, i).as_vec3())
+                            .length_squared()
+                            .to_bits()
+                    })
+                    .unwrap();
+                let material = neighborhood.block(corner(c, nearest));
+                // Displace along the pre-displacement normal (kept as-is: the
+                // bump is sub-voxel, so recomputing the gradient buys nothing).
+                // The heightfield is a pure function of world position, so a
+                // seam vertex shifts identically on both sides of a boundary.
+                let world = (neighborhood.coord * CHUNK_SIZE).as_vec3() + position;
+                position += normal * (noise2d(world.x, world.z) * roughness(material));
                 vert_index[cell(c)] = mesh.positions.len() as u32;
                 mesh.positions.push(position.to_array());
                 mesh.normals.push(normal.to_array());
@@ -506,7 +558,9 @@ fn update_chunks(
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use voxel_world::{CHUNK_VOLUME, Chunk, DENSITY_AIR, DIRT, PLACED_FLAG, STONE, WOOD, index};
+    use voxel_world::{
+        CHUNK_VOLUME, Chunk, DENSITY_AIR, DIRT, GRASS, PLACED_FLAG, STONE, WOOD, index,
+    };
 
     fn chunk_with(mut block: impl FnMut(IVec3) -> u8) -> Chunk {
         let mut cells = vec![AIR; CHUNK_VOLUME];
@@ -539,6 +593,24 @@ mod tests {
         }
         let material_runs: Vec<_> = cells.into_iter().map(|b| (1, b)).collect();
         Chunk::from_voxel_runs(0, &material_runs, &[(CHUNK_VOLUME as u16, DENSITY_AIR)]).unwrap()
+    }
+
+    fn voxel_chunk_with(
+        mut material: impl FnMut(IVec3) -> u8,
+        mut density: impl FnMut(IVec3) -> i8,
+    ) -> Chunk {
+        let mut materials = Vec::with_capacity(CHUNK_VOLUME);
+        let mut densities = Vec::with_capacity(CHUNK_VOLUME);
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let local = IVec3::new(x, y, z);
+                    materials.push((1, material(local)));
+                    densities.push((1, density(local)));
+                }
+            }
+        }
+        Chunk::from_voxel_runs(0, &materials, &densities).unwrap()
     }
 
     // Expand each quad into its unit faces: detects gaps, duplicates, incorrect material
@@ -762,6 +834,7 @@ mod tests {
                     let mut corners: Vec<_> = t
                         .iter()
                         .map(|&i| {
+
                             let mut p = mesh.positions[i as usize];
                             p[0] += offset;
                             p.map(f32::to_bits)
@@ -776,6 +849,104 @@ mod tests {
         for triangle in triangles(&a, 0.0).into_iter().chain(triangles(&b, 32.0)) {
             assert!(seen.insert(triangle), "duplicate quad across chunk seam");
         }
+    }
+
+    #[test]
+    fn grass_over_dirt_vertex_colors_follow_nearest_solid_corner() {
+        // Diagonal surface x+y=32 through a grass cap over denser dirt: the
+        // densest-corner pick would bleed dirt, the nearest corner is grass.
+        let mut world = VoxelWorld::default();
+        world.insert(
+            IVec3::ZERO,
+            voxel_chunk_with(
+                |p| {
+                    if p.x + p.y >= 32 {
+                        AIR
+                    } else if p.x + p.y >= 31 {
+                        GRASS
+                    } else {
+                        DIRT
+                    }
+                },
+                |p| {
+                    if p.x + p.y >= 32 {
+                        DENSITY_AIR
+                    } else if p.x + p.y >= 31 {
+                        40
+                    } else {
+                        127
+                    }
+                },
+            ),
+        );
+        let mesh = surface_nets(&world.neighborhood(IVec3::ZERO));
+        let mut matched = 0;
+        for (i, &position) in mesh.positions.iter().enumerate() {
+            if position[0] + position[1] > 30.0
+                && position.iter().all(|&c| c > 1.0 && c < 31.0)
+            {
+                assert_eq!(mesh.colors[i], block_color(GRASS), "vertex at {position:?}");
+                matched += 1;
+            }
+        }
+        assert!(matched > 30);
+    }
+
+    #[test]
+    fn roughness_displaces_stone_but_not_grass() {
+        // Flat surface at y=16: undisplaced vertices sit at 15 + 127/255.
+        let base = 15.0 + 127.0 / 255.0;
+        let deviation = |material: u8| {
+            let mut world = VoxelWorld::default();
+            world.insert(
+                IVec3::ZERO,
+                chunk_with(|p| if p.y < 16 { material } else { AIR }),
+            );
+            let mesh = surface_nets(&world.neighborhood(IVec3::ZERO));
+            mesh.positions
+                .iter()
+                .filter(|p| {
+                    p[0] > 1.0 && p[0] < 31.0 && p[2] > 1.0 && p[2] < 31.0 && p[1] > 14.0
+                })
+                .map(|p| (p[1] - base).abs())
+                .fold(0.0, f32::max)
+        };
+        let grass = deviation(GRASS);
+        let stone = deviation(STONE);
+        assert_eq!(grass, 0.0);
+        assert!(stone > grass && stone <= 0.15);
+    }
+
+    #[test]
+    fn seam_vertices_displace_identically_across_chunks() {
+        let mut world = VoxelWorld::default();
+        let half = || chunk_with(|p| if p.y < 16 { STONE } else { AIR });
+        world.insert(IVec3::ZERO, half());
+        world.insert(IVec3::X, half());
+        let a = surface_nets(&world.neighborhood(IVec3::ZERO));
+        let b = surface_nets(&world.neighborhood(IVec3::X));
+        // Same world densities and the same world-space heightfield: shared
+        // seam vertices must match bitwise after the +32 x-offset.
+        let seam = |mesh: &MeshData, offset: f32, near: fn(f32) -> bool| {
+            mesh.positions
+                .iter()
+                .filter(|p| near(p[0]))
+                .map(|p| {
+                    let mut q = *p;
+                    q[0] += offset;
+                    q.map(f32::to_bits)
+                })
+                .collect::<HashSet<_>>()
+        };
+        let a_seam = seam(&a, 0.0, |x| x > 31.0);
+        assert_eq!(a_seam, seam(&b, 32.0, |x| x <= 0.0));
+        // Stone roughness must actually move the seam off the flat plane.
+        let base = 15.0 + 127.0 / 255.0;
+        assert!(
+            a_seam
+                .iter()
+                .any(|p| (f32::from_bits(p[1]) - base).abs() > 1e-6)
+        );
     }
 
     fn renderer_app() -> App {
