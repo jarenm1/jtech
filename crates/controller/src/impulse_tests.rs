@@ -46,7 +46,7 @@ fn horizontal_impulse_persists_and_adds_to_motor_input() {
 #[test]
 fn exponential_drag_is_timestep_correct_and_stronger_on_ground() {
     let world = tests::arena();
-    for (height, drag) in [(10.0, 1.0_f32), (0.0, 8.0_f32)] {
+    for (height, drag) in [(10.0, 1.0_f32), (-0.5, 8.0_f32)] {
         let mut whole = player(Vec3::new(0.5, height, 0.5));
         apply_player_impulse(&mut whole, Vec3::X * PLAYER_MASS * 4.0);
         let mut split = whole;

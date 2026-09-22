@@ -522,6 +522,47 @@ impl VoxelWorld {
             .get(&chunk_coord(pos))
             .map(|c| c.voxel(local_coord(pos)))
     }
+    /// Trilinear density at a continuous world position. Samples the eight
+    /// surrounding lattice points (the density stored at cell `c` is the
+    /// lattice sample at `c`); `None` if any sample's chunk is unloaded.
+    /// `> 0` is inside terrain. Used by smooth collision.
+    pub fn density_at(&self, point: Vec3) -> Option<f32> {
+        if !point.is_finite() {
+            return None;
+        }
+        let base = point.floor().as_ivec3();
+        let frac = point - base.as_vec3();
+        let mut corners = [0.0f32; 8];
+        for (i, corner) in corners.iter_mut().enumerate() {
+            let offset = IVec3::new(
+                (i & 1) as i32,
+                ((i >> 1) & 1) as i32,
+                ((i >> 2) & 1) as i32,
+            );
+            *corner = self.density(base + offset)? as f32;
+        }
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let x00 = lerp(corners[0], corners[1], frac.x);
+        let x10 = lerp(corners[2], corners[3], frac.x);
+        let x01 = lerp(corners[4], corners[5], frac.x);
+        let x11 = lerp(corners[6], corners[7], frac.x);
+        Some(lerp(lerp(x00, x10, frac.y), lerp(x01, x11, frac.y), frac.z))
+    }
+    /// Density gradient at a continuous position via central differences on
+    /// the trilinear field. `None` near unloaded chunks. Points toward
+    /// increasing density (into terrain); negate for the surface normal.
+    pub fn density_gradient(&self, point: Vec3) -> Option<Vec3> {
+        const H: f32 = 0.25;
+        let mut gradient = Vec3::ZERO;
+        for axis in 0..3 {
+            let mut offset = Vec3::ZERO;
+            offset[axis] = H;
+            let plus = self.density_at(point + offset)?;
+            let minus = self.density_at(point - offset)?;
+            gradient[axis] = (plus - minus) / (2.0 * H);
+        }
+        Some(gradient)
+    }
     /// Carve a smooth sphere out of the terrain: subtracts density with a
     /// linear falloff and destroys placed cubes inside the radius. Returns the
     /// per-chunk `(old_revision, new_revision)` pairs and the voxels changed.

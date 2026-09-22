@@ -41,6 +41,26 @@ pub(super) fn step(
 
 fn clear(world: &VoxelWorld, position: Vec3, bodies: &[DynamicCollider]) -> bool {
     let (min, max) = bounds(position);
+    // Smooth terrain: the whole box must sit in air density. Unloaded samples
+    // (None) stay passable, matching the old cell scan.
+    for y in [min.y, max.y] {
+        for z in [min.z, max.z] {
+            for x in [min.x, max.x] {
+                if world
+                    .density_at(Vec3::new(x, y, z))
+                    .is_some_and(|d| d > 0.0)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    if world
+        .density_at((min + max) * 0.5)
+        .is_some_and(|d| d > 0.0)
+    {
+        return false;
+    }
     let first = (min + Vec3::splat(EPSILON)).floor().as_ivec3();
     let last = (max - Vec3::splat(EPSILON)).floor().as_ivec3();
     for y in first.y..=last.y {

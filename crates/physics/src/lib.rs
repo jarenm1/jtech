@@ -4,7 +4,7 @@ use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use glam::{IVec3, Vec2, Vec3};
 pub use impulse::{apply_impulse, apply_player_impulse, bounded_horizontal};
 use serde::{Deserialize, Serialize};
-use voxel_world::{AIR, VoxelWorld};
+use voxel_world::VoxelWorld;
 
 pub const PLAYER_RADIUS: f32 = 0.3;
 pub const PLAYER_HEIGHT: f32 = 1.8;
@@ -124,12 +124,161 @@ pub fn raycast_body(
     }
     Some(enter)
 }
+/// Discrete solids: player-placed cubes and unloaded chunks. Smooth terrain is
+/// handled by the density sweep, so terrain voxels are not solid here.
 fn solid(world: &VoxelWorld, cell: IVec3) -> bool {
-    world.block(cell) != Some(AIR)
+    world.voxel(cell).is_none_or(|v| v.placed)
 }
 
-/// Sweeps the leading AABB face across every crossed voxel plane, not just its endpoint.
-/// Sequential axes preserve tangential displacement when a wall blocks one component.
+/// Height the feet may ride up per sweep: slopes rising less than this per
+/// horizontal move are climbed by the depenetration pass instead of blocking.
+/// The motor also snaps grounded actors down by this much to keep support on
+/// descents.
+pub const STEP_HEIGHT: f32 = 0.55;
+/// Density margin counting as contact without blocking, so a face resting on
+/// the iso surface still reports a hit for `grounded`.
+const CONTACT_SKIN: f32 = 0.02;
+
+/// Sampled points of the leading face: corners plus center. Horizontal sweeps
+/// lift the bottom edge by `STEP_HEIGHT`, letting the feet embed shallowly into
+/// slopes the vertical pass then climbs out of. `None` (unloaded) samples are
+/// treated as air; the discrete scan already stops at unloaded cells.
+fn face_samples(position: Vec3, axis: usize, positive: bool, shape: CollisionShape) -> [Vec3; 5] {
+    let (min, max) = bounds(position, shape);
+    let face = if positive { max[axis] } else { min[axis] };
+    let a = (axis + 1) % 3;
+    let b = (axis + 2) % 3;
+    let mut lo_a = min[a];
+    let mut lo_b = min[b];
+    if axis != 1 {
+        // The face's lower edge is the feet; raise it so shallow slope
+        // penetration is allowed and resolved by the vertical pass.
+        if a == 1 {
+            lo_a += STEP_HEIGHT;
+        } else {
+            lo_b += STEP_HEIGHT;
+        }
+    }
+    let point = |pa: f32, pb: f32| {
+        let mut p = Vec3::ZERO;
+        p[axis] = face;
+        p[a] = pa;
+        p[b] = pb;
+        p
+    };
+    [
+        point(lo_a, lo_b),
+        point(lo_a, max[b]),
+        point(max[a], lo_b),
+        point(max[a], max[b]),
+        point((lo_a + max[a]) * 0.5, (lo_b + max[b]) * 0.5),
+    ]
+}
+
+/// Worst density over the face samples: `Some(max)` or `None` when every sample
+/// is unloaded. A face is blocked when this exceeds zero.
+fn face_density(world: &VoxelWorld, samples: &[Vec3; 5]) -> Option<f32> {
+    samples
+        .iter()
+        .filter_map(|p| world.density_at(*p))
+        .reduce(f32::max)
+}
+
+/// Density sweep of the leading face along `axis` by `distance`. Returns the
+/// allowed displacement and whether the face touched terrain within
+/// `CONTACT_SKIN`. Marches in quarter-cell steps so thin features cannot be
+/// tunneled, then binary-searches the blocking step.
+fn density_sweep(
+    world: &VoxelWorld,
+    position: Vec3,
+    axis: usize,
+    distance: f32,
+    shape: CollisionShape,
+) -> (f32, bool) {
+    let positive = distance > 0.0;
+    let total = distance.abs();
+    let probe = |at: f32| {
+        let mut p = position;
+        p[axis] += if positive { at } else { -at };
+        face_density(world, &face_samples(p, axis, positive, shape))
+    };
+    let mut contact = false;
+    let mut free = 0.0f32;
+    let mut blocked_at = f32::NAN;
+    while free < total - EPSILON {
+        let next = (free + 0.25).min(total);
+        match probe(next) {
+            Some(d) if d > 0.0 => {
+                blocked_at = next;
+                break;
+            }
+            Some(d) => {
+                contact |= d > -CONTACT_SKIN;
+                free = next;
+            }
+            None => free = next,
+        }
+    }
+    if blocked_at.is_nan() {
+        return (distance, contact);
+    }
+    // Binary-search the largest displacement keeping every sample at/below zero.
+    let (mut lo, mut hi) = (free, blocked_at);
+    for _ in 0..10 {
+        let mid = (lo + hi) * 0.5;
+        match probe(mid) {
+            Some(d) if d > 0.0 => hi = mid,
+            _ => lo = mid,
+        }
+    }
+    (if positive { lo } else { -lo }, true)
+}
+
+/// First displacement in `(0, STEP_HEIGHT]` where the whole body is clear of
+/// terrain density and discrete solids, or `None` when deeply embedded.
+fn depenetrate_up(world: &VoxelWorld, position: Vec3, shape: CollisionShape) -> Option<f32> {
+    let clear = |up: f32| {
+        let lifted = position + Vec3::Y * up;
+        let (min, max) = bounds(lifted, shape);
+        let bottom = face_samples(lifted, 1, false, shape);
+        let top = face_samples(lifted, 1, true, shape);
+        let dense = face_density(world, &bottom)
+            .into_iter()
+            .chain(face_density(world, &top))
+            .all(|d| d <= 0.0);
+        if !dense {
+            return false;
+        }
+        let first = (min + Vec3::splat(EPSILON)).floor().as_ivec3();
+        let last = (max - Vec3::splat(EPSILON)).floor().as_ivec3();
+        !(first.y..=last.y).any(|y| {
+            (first.z..=last.z).any(|z| {
+                (first.x..=last.x).any(|x| solid(world, IVec3::new(x, y, z)))
+            })
+        })
+    };
+    if clear(0.0) {
+        return Some(0.0);
+    }
+    let mut lo = 0.0f32;
+    let mut hi = STEP_HEIGHT;
+    if !clear(hi) {
+        return None;
+    }
+    for _ in 0..10 {
+        let mid = (lo + hi) * 0.5;
+        if clear(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(hi)
+}
+
+/// Sweeps the leading AABB face across every crossed voxel plane, not just its
+/// endpoint, then refines against the smooth density field. Sequential axes
+/// preserve tangential displacement when a wall blocks one component.
 fn sweep_axis(
     world: &VoxelWorld,
     position: &mut Vec3,
@@ -137,6 +286,18 @@ fn sweep_axis(
     distance: f32,
     shape: CollisionShape,
 ) -> bool {
+    // Feet already inside terrain: climb out vertically within step height.
+    // Horizontal axes stay permeable so the vertical pass can resolve it.
+    // Upward sweeps skip this: rising carries the face out of the surface.
+    if axis == 1
+        && distance <= 0.0
+        && face_density(world, &face_samples(*position, 1, false, shape))
+            .is_some_and(|d| d > 0.0)
+        && let Some(up) = depenetrate_up(world, *position, shape)
+    {
+        position.y += up;
+        return true;
+    }
     if distance == 0.0 {
         return false;
     }
@@ -160,8 +321,10 @@ fn sweep_axis(
     } else {
         (face + distance).ceil() as i32
     };
+    let mut allowed = distance;
+    let mut hit = false;
     let mut plane = first;
-    while if positive {
+    'planes: while if positive {
         plane <= last
     } else {
         plane >= last
@@ -173,20 +336,23 @@ fn sweep_axis(
                 cell[other_a] = a;
                 cell[other_b] = b;
                 if solid(world, cell) {
-                    let allowed = plane as f32 - face;
-                    position[axis] += if positive {
-                        allowed.max(0.0).min(distance)
+                    let room = plane as f32 - face;
+                    allowed = if positive {
+                        room.max(0.0).min(distance)
                     } else {
-                        allowed.min(0.0).max(distance)
+                        room.min(0.0).max(distance)
                     };
-                    return true;
+                    hit = true;
+                    break 'planes;
                 }
             }
         }
         plane += if positive { 1 } else { -1 };
     }
-    position[axis] += distance;
-    false
+    // The density sweep never moves further than the discrete scan allowed.
+    let (smooth, touched) = density_sweep(world, *position, axis, allowed, shape);
+    position[axis] += smooth;
+    hit || touched || smooth != distance
 }
 
 /// Sweep against terrain and observed loose cubes without extrapolating snapshots.

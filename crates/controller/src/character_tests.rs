@@ -62,7 +62,7 @@ fn short_animal_passes_under_ceiling_that_blocks_human() {
     }
     assert!((human.motion.position.z - 0.3).abs() < EPSILON);
     assert!(critter.motion.position.z < -1.0);
-    assert_eq!(critter.motion.position.y, 0.0);
+    assert!((critter.motion.position.y + 0.5).abs() < 0.01);
 }
 
 #[test]
@@ -114,7 +114,8 @@ fn animal_profile_limits_acceleration_strafe_turn_and_jump() {
         ..Default::default()
     };
     tick(&world, &mut state, &body, &profile, &mut intent);
-    assert_eq!(state.motion.position, Vec3::new(0.5, 0.0, 0.5));
+    assert_eq!(state.motion.position.x, 0.5);
+    assert_eq!(state.motion.position.z, 0.5);
     assert!(!intent.jump);
     intent.movement = Vec2::Y;
     intent.turn = 1000.0;
@@ -145,7 +146,7 @@ fn held_movement_persists_but_jump_is_consumed_without_retrigger() {
         );
     }
     assert!(state.motion.grounded);
-    assert_eq!(state.motion.position.y, 0.0);
+    assert!((state.motion.position.y + 0.5).abs() < 0.01);
     assert!((state.motion.position.x - 1.7).abs() < 0.0001);
     assert!(!intent.jump);
     assert_eq!(intent.movement, Vec2::X * 0.1);
@@ -334,12 +335,14 @@ fn headless_plugin_runs_script_before_motor_and_matches_direct_ticks() {
 #[test]
 fn zero_gravity_retains_support_but_clears_it_after_leaving_edge() {
     let mut world = tests::arena();
-    for x in 1..4 {
+    // The pit must clear the actor's trilinear footprint (cells x/z 0 and 1)
+    // at the start, then remove support once it walks over it.
+    for x in 2..5 {
         for z in -1..=1 {
             world.set_block(IVec3::new(x, -1, z), AIR);
         }
     }
-    let mut state = actor(Vec3::new(0.5, 0.0, 0.5));
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
     let profile = MovementProfile {
         gravity: 0.0,
         ..Default::default()
@@ -374,7 +377,7 @@ fn current_support_controls_acceleration_not_previous_grounded_flag() {
         air_control: 0.0,
         ..Default::default()
     };
-    let initial = actor(Vec3::new(0.5, 0.0, 0.5));
+    let initial = actor(Vec3::new(0.5, -0.5, 0.5));
     let mut state = initial;
     let mut intent = CharacterIntent {
         movement: Vec2::X,
@@ -390,7 +393,13 @@ fn current_support_controls_acceleration_not_previous_grounded_flag() {
     assert!(state.motion.position.x > initial.motion.position.x);
     state = initial;
     state.motion.grounded = true;
-    world.set_block(IVec3::new(0, -1, 0), AIR);
+    // A single dug cell is only a shallow dip in smooth terrain; remove real
+    // support under the actor.
+    for x in -1..=1 {
+        for z in -1..=1 {
+            world.set_block(IVec3::new(x, -1, z), AIR);
+        }
+    }
     tick(
         &world,
         &mut state,
@@ -426,5 +435,5 @@ fn large_actor_can_separate_from_a_deeply_embedded_cube() {
         !(min.cmplt(cube.position + Vec3::splat(0.5 - EPSILON)).all()
             && max.cmpgt(cube.position - Vec3::splat(0.5 - EPSILON)).all())
     );
-    assert!(state.motion.position.y >= 0.0);
+    assert!(state.motion.position.y >= -0.51);
 }
