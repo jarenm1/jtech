@@ -1,69 +1,147 @@
-//! Procedural grayscale texture atlas: one 128x128 luminance tile per
-//! material, laid out in a horizontal row. The triplanar shader samples `.r`
-//! and multiplies it into the vertex tint, so tiles are pure luminance noise
-//! around 1.0 — hue lives in `voxel_world::block_color`.
+//! Procedural texture atlas: one 128x128 RGB tile per material, laid out in a
+//! horizontal row, with mipmaps. The triplanar shader samples the tile by
+//! material id; vertex color stays white so the texture carries the full
+//! material color. Material blending happens in texture space via `uv0` +
+//! vertex alpha.
 //!
 //! All noise is periodic on the tile lattice so textures tile seamlessly.
 
 use bevy::{
     asset::RenderAssetUsages,
-    image::Image,
+    image::{Image, ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor},
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 
 pub const ATLAS_TILE: usize = 128;
 pub const ATLAS_TILES: usize = 8;
+const MIP_LEVELS: u32 = 8; // 128 -> 1
 
-/// Builds the material atlas: tile index = material id.
+/// Shadow / mid / highlight tones per material (sRGB hex). The noise field
+/// picks a point on this ramp per texel, so hue varies inside a material.
+const PALETTE: [[u32; 3]; ATLAS_TILES] = [
+    [0x000000, 0x000000, 0x000000], // air: unused
+    [0x162E24, 0x2D4A3E, 0x5A7D6A], // grass: pine / ivy / sage
+    [0x1C1613, 0x3D3028, 0x5C4D43], // dirt: obsidian / umber / clay
+    [0x1D2226, 0x3C444B, 0x616D75], // stone: slate / flint / lichen
+    [0x2A2118, 0x4A3C2C, 0x6B5B45], // sand: dark ochre ramp
+    [0x1A120C, 0x2A1D14, 0x453322], // wood: dark timber ramp
+    [0x241318, 0x3A2430, 0x54384A], // bedroll: dark wine ramp
+    [0x000000, 0x000000, 0x000000], // unused
+];
+
+/// Builds the material atlas: a 128x128 texture array, layer = material id,
+/// each layer with a full mip chain (LayerMajor order).
 pub fn texture_atlas() -> Image {
-    let mut data = vec![0u8; ATLAS_TILE * ATLAS_TILE * ATLAS_TILES];
+    let mut data = Vec::new();
     for material in 0..ATLAS_TILES {
-        for y in 0..ATLAS_TILE {
-            for x in 0..ATLAS_TILE {
-                data[material * ATLAS_TILE * ATLAS_TILE + y * ATLAS_TILE + x] =
-                    tile_texel(material as u8, x, y);
+        let mut level = base_level(material as u8);
+        let mut width = ATLAS_TILE;
+        for _ in 0..MIP_LEVELS {
+            data.extend_from_slice(&level);
+            level = downsample(&level, width);
+            width /= 2;
+        }
+    }
+    // `Image::new` asserts data == mip-0 size; build directly for mip data.
+    let mut image = Image::new_uninit(
+        Extent3d {
+            width: ATLAS_TILE as u32,
+            height: ATLAS_TILE as u32,
+            depth_or_array_layers: ATLAS_TILES as u32,
+        },
+        TextureDimension::D2,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.data = Some(data);
+    image.texture_descriptor.mip_level_count = MIP_LEVELS;
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: 16,
+        ..Default::default()
+    });
+    image
+}
+
+/// Mip 0 for one material layer at full resolution.
+fn base_level(material: u8) -> Vec<u8> {
+    let mut data = vec![0u8; ATLAS_TILE * ATLAS_TILE * 4];
+    for y in 0..ATLAS_TILE {
+        for x in 0..ATLAS_TILE {
+            let rgb = tile_texel(material, x, y);
+            let i = (y * ATLAS_TILE + x) * 4;
+            data[i..i + 3].copy_from_slice(&rgb);
+            data[i + 3] = 255;
+        }
+    }
+    data
+}
+
+
+/// Box-filters one mip level down by 2x.
+fn downsample(level: &[u8], w: usize) -> Vec<u8> {
+    let h = w; // square tiles
+    let (w2, h2) = (w / 2, h / 2);
+    let mut out = vec![0u8; w2 * h2 * 4];
+    for y in 0..h2 {
+        for x in 0..w2 {
+            let mut sum = [0u32; 4];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = ((y * 2 + dy) * w + x * 2 + dx) * 4;
+                    for c in 0..4 {
+                        sum[c] += level[i + c] as u32;
+                    }
+                }
+            }
+            let o = (y * w2 + x) * 4;
+            for c in 0..4 {
+                out[o + c] = (sum[c] / 4) as u8;
             }
         }
     }
-    Image::new(
-        Extent3d {
-            width: (ATLAS_TILE * ATLAS_TILES) as u32,
-            height: ATLAS_TILE as u32,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::R8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
-    )
+    out
 }
 
-fn tile_texel(material: u8, x: usize, y: usize) -> u8 {
-    // (base luminance, amplitude, recipe)
-    let v = match material {
-        // Grass: fine speckle over a soft mid-frequency mottle.
-        1 => 0.82 + 0.18 * fbm(x, y, 16, 2, 11) + 0.06 * fbm(x, y, 64, 1, 12) - 0.03,
-        // Dirt: broad blotches with sparse dark specks.
-        2 => {
-            let base = 0.80 + 0.20 * fbm(x, y, 8, 2, 21);
-            if hash(x, y, 22) > 0.985 {
-                base - 0.25
-            } else {
-                base
-            }
-        }
-        // Stone: strongest high-frequency grain; geometry already bumps.
-        3 => 0.74 + 0.26 * fbm(x, y, 32, 3, 31),
-        // Sand: uniform fine grain, low contrast.
-        4 => 0.86 + 0.14 * fbm(x, y, 32, 1, 41),
+fn tile_texel(material: u8, x: usize, y: usize) -> [u8; 3] {
+    let [shadow, mid, high] = PALETTE[material as usize];
+    // Position on the shadow->highlight ramp: broad mottle plus fine detail.
+    let ramp = match material {
+        // Stone: strongest high-frequency grain.
+        3 => 0.15 + 0.7 * fbm(x, y, 32, 3, 31),
         // Wood: grain stretched vertically (low x frequency).
-        5 => 0.76 + 0.24 * fbm_aniso(x, y, 4, 16, 2, 51),
-        // Bedroll: soft cloth, lowest contrast.
-        6 => 0.86 + 0.14 * fbm(x, y, 4, 2, 61),
-        // Air/unused: neutral.
-        _ => 1.0,
+        5 => 0.15 + 0.7 * fbm_aniso(x, y, 4, 16, 2, 51),
+        // Bedroll: soft cloth, low contrast.
+        6 => 0.3 + 0.4 * fbm(x, y, 4, 2, 61),
+        // Grass/dirt/sand: mid-frequency mottle + fine speckle.
+        _ => 0.1 + 0.6 * fbm(x, y, 16, 2, 11 + material as u64 * 10)
+            + 0.2 * fbm(x, y, 64, 1, 12 + material as u64 * 10),
     };
-    (v.clamp(0.0, 1.0) * 255.0) as u8
+    let ramp = ramp.clamp(0.0, 1.0);
+    let (a, b, t) = if ramp < 0.5 {
+        (shadow, mid, ramp * 2.0)
+    } else {
+        (mid, high, (ramp - 0.5) * 2.0)
+    };
+    let (ar, ag, ab) = unpack(a);
+    let (br, bg, bb) = unpack(b);
+    [
+        (ar + (br - ar) * t) as u8,
+        (ag + (bg - ag) * t) as u8,
+        (ab + (bb - ab) * t) as u8,
+    ]
+}
+
+fn unpack(hex: u32) -> (f32, f32, f32) {
+    (
+        (hex >> 16 & 0xFF) as f32,
+        (hex >> 8 & 0xFF) as f32,
+        (hex & 0xFF) as f32,
+    )
 }
 
 /// Periodic value-noise fBm in [0, 1]. `period` is lattice cells per tile.
@@ -147,5 +225,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn atlas_has_full_mip_chain() {
+        let image = texture_atlas();
+        assert_eq!(image.texture_descriptor.mip_level_count, MIP_LEVELS);
+        // Per layer: 128 + 64 + ... + 1 pixels, 4 bytes each.
+        let pixels_per_layer: usize = (0..MIP_LEVELS)
+            .map(|m| (ATLAS_TILE >> m) * (ATLAS_TILE >> m))
+            .sum();
+        assert_eq!(
+            image.data.as_ref().unwrap().len(),
+            pixels_per_layer * ATLAS_TILES * 4
+        );
     }
 }

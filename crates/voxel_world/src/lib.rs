@@ -108,16 +108,17 @@ const OFFSETS: [IVec3; 27] = {
     offsets
 };
 
-/// Material tints: a dark, desaturated palette that reads as one world.
-/// Luminance detail comes from the texture atlas; these carry hue only.
+/// Material mid-tones (linear RGB from the sRGB palette). The texture atlas
+/// carries the full shadow/mid/highlight ramp; this is the representative
+/// color for UI, maps, and untextured consumers.
 pub fn block_color(block: u8) -> [f32; 4] {
     match block {
-        GRASS => [0.10, 0.17, 0.055, 1.0],
-        DIRT => [0.13, 0.085, 0.05, 1.0],
-        STONE => [0.115, 0.125, 0.14, 1.0],
-        SAND => [0.26, 0.21, 0.12, 1.0],
-        WOOD => [0.11, 0.065, 0.035, 1.0],
-        BEDROLL => [0.16, 0.075, 0.10, 1.0],
+        GRASS => [0.027, 0.072, 0.053, 1.0],  // #2D4A3E overgrown ivy
+        DIRT => [0.051, 0.031, 0.022, 1.0],   // #3D3028 root umber
+        STONE => [0.048, 0.060, 0.073, 1.0],  // #3C444B weathered flint
+        SAND => [0.076, 0.049, 0.027, 1.0],   // #4A3C2C dark ochre
+        WOOD => [0.024, 0.011, 0.006, 1.0],   // #2A1D14 dark timber
+        BEDROLL => [0.047, 0.018, 0.030, 1.0], // #3A2430 dark wine
         _ => [0.0; 4],
     }
 }
