@@ -1044,11 +1044,14 @@ fn cave_fbm_max(x: i32, y: i32, z: i32, size: i32, seed: u64) -> f64 {
 
 /// Signed terrain density at one world voxel: a ramp crossing zero at
 /// `raw_height`, saturated before caves carve so tunnels open at any depth.
-fn terrain_density(x: i64, y: i64, z: i64, raw_height: f32, seed: u64) -> i8 {
+/// `shelter` is the lowest surface height in the column's neighborhood: cave
+/// depth is measured from it so a cave deep under a plateau cannot breach a
+/// hillside whose own surface is lower.
+fn terrain_density(x: i64, y: i64, z: i64, raw_height: f32, shelter: f32, seed: u64) -> i8 {
     let base = ((f64::from(raw_height) - y as f64) * 64.0)
         .max(f64::from(DENSITY_AIR))
         .min(f64::from(DENSITY_SOLID));
-    let depth = f64::from(raw_height) - CAVE_DEPTH_FADE - y as f64;
+    let depth = f64::from(shelter) - CAVE_DEPTH_FADE - y as f64;
     if base <= f64::from(DENSITY_AIR) || depth <= 0.0 {
         return base as i8;
     }
@@ -1192,6 +1195,39 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
     }
     let base_x = i64::from(coord.x) * i64::from(CHUNK_SIZE);
     let base_z = i64::from(coord.z) * i64::from(CHUNK_SIZE);
+    // Shelter field: the lowest raw surface within ~12 blocks, sampled on a
+    // stride-4 lattice. Caves measure depth from this, not the column's own
+    // surface, so tunnels under high ground cannot open through lower slopes.
+    // The 2-block margin covers the strided sample missing the true minimum.
+    const SHELTER_RADIUS: i64 = 12;
+    const SHELTER_STRIDE: i64 = 4;
+    const SHELTER_MARGIN: f32 = 2.0;
+    const SHELTER_W: usize = (2 * SHELTER_RADIUS / SHELTER_STRIDE + 1) as usize;
+    let mut shelter_grid = [f32::INFINITY; SHELTER_W * SHELTER_W];
+    for sz in 0..SHELTER_W {
+        for sx in 0..SHELTER_W {
+            shelter_grid[sz * SHELTER_W + sx] = generator
+                .sample(
+                    base_x + (sx as i64 * SHELTER_STRIDE - SHELTER_RADIUS),
+                    base_z + (sz as i64 * SHELTER_STRIDE - SHELTER_RADIUS),
+                    seed,
+                )
+                .raw_height;
+        }
+    }
+    let shelter = |x: i64, z: i64, own: f32| -> f32 {
+        let mut low = own;
+        for sz in 0..SHELTER_W {
+            for sx in 0..SHELTER_W {
+                let dx = sx as i64 * SHELTER_STRIDE - SHELTER_RADIUS - x;
+                let dz = sz as i64 * SHELTER_STRIDE - SHELTER_RADIUS - z;
+                if dx * dx + dz * dz <= SHELTER_RADIUS * SHELTER_RADIUS {
+                    low = low.min(shelter_grid[sz * SHELTER_W + sx]);
+                }
+            }
+        }
+        low - SHELTER_MARGIN
+    };
     let mut chunk = Chunk {
         revision: 0,
         storage: Storage::Uniform(AIR),
@@ -1206,6 +1242,7 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
                     i64::from(world_y),
                     base_z + i64::from(local_z),
                     column.raw_height,
+                    shelter(local_x as i64, local_z as i64, column.raw_height),
                     seed,
                 );
                 let material = if density <= 0 {
