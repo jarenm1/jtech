@@ -739,6 +739,18 @@ impl ChunkNeighborhood {
         };
         (slot, local_coord(local))
     }
+    /// Whether the chunk at a neighborhood offset is loaded.
+    pub fn has(&self, offset: IVec3) -> bool {
+        let grid = ((offset.z + 1) * 9 + (offset.y + 1) * 3 + (offset.x + 1)) as usize;
+        let slot = if grid == 13 {
+            0
+        } else if grid < 13 {
+            grid + 1
+        } else {
+            grid
+        };
+        self.chunks[slot].is_some()
+    }
     /// Material at a local coordinate; `AIR` for missing chunks.
     pub fn block(&self, local: IVec3) -> u8 {
         if local.cmpge(IVec3::ZERO).all() && local.cmplt(IVec3::splat(CHUNK_SIZE)).all() {

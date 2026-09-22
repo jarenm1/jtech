@@ -1195,13 +1195,13 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
     }
     let base_x = i64::from(coord.x) * i64::from(CHUNK_SIZE);
     let base_z = i64::from(coord.z) * i64::from(CHUNK_SIZE);
-    // Shelter field: the lowest raw surface within ~12 blocks, sampled on a
+    // Shelter field: the lowest raw surface within ~20 blocks, sampled on a
     // stride-4 lattice. Caves measure depth from this, not the column's own
     // surface, so tunnels under high ground cannot open through lower slopes.
-    // The 2-block margin covers the strided sample missing the true minimum.
-    const SHELTER_RADIUS: i64 = 12;
+    // The 3-block margin covers the strided sample missing the true minimum.
+    const SHELTER_RADIUS: i64 = 20;
     const SHELTER_STRIDE: i64 = 4;
-    const SHELTER_MARGIN: f32 = 2.0;
+    const SHELTER_MARGIN: f32 = 3.0;
     const SHELTER_W: usize = (2 * SHELTER_RADIUS / SHELTER_STRIDE + 1) as usize;
     let mut shelter_grid = [f32::INFINITY; SHELTER_W * SHELTER_W];
     for sz in 0..SHELTER_W {
