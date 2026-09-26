@@ -1,16 +1,19 @@
 //! Server-owned non-player characters driven by `CharacterIntent`.
 //!
-//! Actors share the character motor with human players and future policies: the
-//! training dummy is the degenerate policy with an empty intent. Melee swings
-//! arrive through the same input/intent channel a learned agent would use, and
-//! `resolve_attacks` runs inside the deterministic simulation tick.
+//! Actors share the character motor with human players and future policies.
+//! Each actor carries a species (`ActorKind`) plus a brain: `External` actors
+//! are driven through `set_actor_intent`, `Scripted` actors run a crate
+//! `brains::Brain` against the same `ActorObservation` a learned policy sees.
+//! Melee swings arrive through the same input/intent channel a learned agent
+//! would use, and `resolve_attacks` runs inside the deterministic simulation
+//! tick.
 use super::{Player, Simulation};
 use controller::{
     CharacterBody, CharacterIntent, CharacterState, MovementProfile, step_character,
 };
 use gameplay::{
     Health,
-    combat::{SwingTarget, resolve_swing},
+    combat::{MeleeSpec, SwingTarget, resolve_swing},
 };
 use glam::{Vec2, Vec3};
 use physics::{
@@ -18,7 +21,7 @@ use physics::{
     look_direction,
 };
 use protocol::ActorSnapshot;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use voxel_world::VoxelWorld;
 
 /// Fixed ticks a dead actor waits before respawning at its spawn point.
@@ -27,6 +30,159 @@ const ACTOR_RESPAWN_TICKS: u64 = 300;
 const ACTOR_TARGET: u64 = 1 << 63;
 /// Bound on the replicated actor set.
 pub const MAX_ACTORS: usize = 32;
+
+/// Actions a species is allowed to express, bit flags over intent fields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActorCapabilities(pub u32);
+impl ActorCapabilities {
+    pub const JUMP: Self = Self(1 << 0);
+    pub const MELEE: Self = Self(1 << 1);
+    /// Held-item resolution through the melee table; innate `melee` otherwise.
+    pub const ITEM: Self = Self(1 << 2);
+    pub const NONE: Self = Self(0);
+    pub const fn all() -> Self {
+        Self(u32::MAX)
+    }
+    pub const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
+}
+
+/// Which policy drives an actor. `External` actors never run a scripted brain.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrainKind {
+    External,
+    Idle,
+    Hunter,
+    Flee,
+}
+
+/// Species data: one table entry per spawnable actor archetype.
+#[derive(Clone, Copy, Debug)]
+pub struct ActorKind {
+    pub name: &'static str,
+    pub body: CharacterBody,
+    pub profile: MovementProfile,
+    /// Maximum health; `Health::new(health)` at spawn.
+    pub health: u16,
+    pub capabilities: ActorCapabilities,
+    /// Innate weapon; `ITEM` actors may resolve equipment later.
+    pub melee: MeleeSpec,
+    pub brain: BrainKind,
+}
+impl ActorKind {
+    /// Today's training dummy: player defaults, hands, stands still.
+    pub fn dummy() -> Self {
+        Self {
+            name: "dummy",
+            body: CharacterBody::default(),
+            profile: MovementProfile::default(),
+            health: gameplay::PLAYER_MAX_HEALTH,
+            capabilities: ActorCapabilities::all(),
+            melee: gameplay::combat::MELEE_HANDS,
+            brain: BrainKind::Idle,
+        }
+    }
+    /// Heavy melee bruiser: slow, thick, hunts the nearest player.
+    pub fn titan() -> Self {
+        Self {
+            name: "titan",
+            body: CharacterBody::new(
+                CollisionShape::new(0.8, 0.8, 2.6).unwrap_or_default(),
+                600.0,
+            )
+            .unwrap_or_default(),
+            profile: MovementProfile {
+                speed: 3.0,
+                ..MovementProfile::default()
+            },
+            health: 400,
+            capabilities: ActorCapabilities::MELEE,
+            melee: MeleeSpec {
+                range: 6.0,
+                damage: 40,
+                cooldown_ticks: 60,
+                knockback: 800.0,
+            },
+            brain: BrainKind::Hunter,
+        }
+    }
+    /// Fragile training prey: unarmed, flees attackers.
+    pub fn decoy() -> Self {
+        Self {
+            name: "decoy",
+            body: CharacterBody::new(
+                CollisionShape::new(0.25, 0.25, 1.2).unwrap_or_default(),
+                40.0,
+            )
+            .unwrap_or_default(),
+            profile: MovementProfile {
+                speed: 4.0,
+                ..MovementProfile::default()
+            },
+            health: 100,
+            capabilities: ActorCapabilities::JUMP,
+            melee: MeleeSpec {
+                range: 0.5,
+                damage: 1,
+                cooldown_ticks: 60,
+                knockback: 0.0,
+            },
+            brain: BrainKind::Flee,
+        }
+    }
+}
+
+/// Entity reference inside simulation events and observations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SimEntity {
+    Player(u64),
+    Actor(u32),
+}
+
+/// Per-tick attribution event pushed onto `Simulation::events`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SimEvent {
+    DamageDealt {
+        source: SimEntity,
+        target: SimEntity,
+        /// Points actually lost, capped at the victim's remaining health.
+        amount: u16,
+        killed: bool,
+    },
+    ActorDied {
+        id: u32,
+        killer: Option<SimEntity>,
+    },
+}
+
+/// One nearby entity as a policy sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObservedEntity {
+    pub entity: SimEntity,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub distance: f32,
+    /// False when terrain occludes the eye-to-eye segment.
+    pub line_of_sight: bool,
+}
+
+/// The flat observation a brain consumes each tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActorObservation {
+    pub tick: u64,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub yaw: f32,
+    pub grounded: bool,
+    pub health: Health,
+    /// Own melee cooldown elapsed.
+    pub attack_ready: bool,
+    /// Own innate melee range, for spacing decisions.
+    pub melee_range: f32,
+    pub nearest_player: Option<ObservedEntity>,
+    pub nearest_actor: Option<ObservedEntity>,
+}
 
 /// A server character with no network session: motor state, tuning, health,
 /// and the intent a policy writes each tick.
@@ -39,6 +195,15 @@ pub(super) struct Actor {
     pub spawn: Vec3,
     pub respawn_at: Option<u64>,
     pub attack_ready: u64,
+    pub kind: ActorKind,
+    pub brain: ActorBrain,
+}
+
+/// Runtime policy holder. `External` reads the stored intent; `Scripted`
+/// derives one per tick inside `advance_actors`.
+pub(super) enum ActorBrain {
+    External,
+    Scripted(Box<dyn crate::brains::Brain>),
 }
 
 impl Actor {
@@ -52,9 +217,95 @@ impl Actor {
     }
 }
 
+/// Bound the intent and zero fields the species cannot express.
+fn gate_intent(intent: CharacterIntent, capabilities: ActorCapabilities) -> CharacterIntent {
+    let mut intent = intent.bounded();
+    if !capabilities.contains(ActorCapabilities::JUMP) {
+        intent.jump = false;
+    }
+    if !capabilities.contains(ActorCapabilities::MELEE) {
+        intent.attack = false;
+    }
+    if !capabilities.contains(ActorCapabilities::ITEM) {
+        intent.held_item = 0;
+    }
+    intent
+}
+
+/// Eye-to-eye terrain occlusion; the raycast normalizes the direction.
+fn line_of_sight(world: &VoxelWorld, from: Vec3, to: Vec3) -> bool {
+    let eye = from + Vec3::Y * EYE_HEIGHT;
+    let target_eye = to + Vec3::Y * EYE_HEIGHT;
+    let offset = target_eye - eye;
+    world
+        .raycast(eye, offset, offset.length())
+        .is_none()
+}
+
+/// Build one actor's policy view: own state plus the nearest living player
+/// and actor. `self_id` excludes the observer from its own actor search.
+/// Depleted actors still observe (respawn bookkeeping needs nothing here, but
+/// `observe` answers for any existing id).
+fn observation_of(
+    actor: &Actor,
+    self_id: u64,
+    actors: &ActorMap,
+    players: &HashMap<u64, Player>,
+    world: &VoxelWorld,
+    tick: u64,
+) -> ActorObservation {
+    let feet = actor.state.motion.position;
+    let observe = |entity: SimEntity, position: Vec3, velocity: Vec3| ObservedEntity {
+        entity,
+        position,
+        velocity,
+        distance: position.distance(feet),
+        line_of_sight: line_of_sight(world, feet, position),
+    };
+    let nearest_player = players
+        .iter()
+        .filter(|(_, player)| !player.health.is_depleted() && !player.state.noclip)
+        .map(|(&id, player)| {
+            observe(
+                SimEntity::Player(id),
+                player.state.position,
+                player.state.velocity,
+            )
+        })
+        .min_by(|a, b| a.distance.total_cmp(&b.distance));
+    let nearest_actor = actors
+        .iter()
+        .filter(|&(&id, other)| u64::from(id) != self_id && !other.health.is_depleted())
+        .map(|(&id, other)| {
+            observe(
+                SimEntity::Actor(id),
+                other.state.motion.position,
+                other.state.motion.velocity,
+            )
+        })
+        .min_by(|a, b| a.distance.total_cmp(&b.distance));
+    ActorObservation {
+        tick,
+        position: feet,
+        velocity: actor.state.motion.velocity,
+        yaw: actor.state.yaw,
+        grounded: actor.state.motion.grounded,
+        health: actor.health,
+        attack_ready: tick >= actor.attack_ready,
+        melee_range: actor.kind.melee.range,
+        nearest_player,
+        nearest_actor,
+    }
+}
+
 impl Simulation {
     /// Spawn a static training actor at a supported position. Returns its id.
     pub fn spawn_actor(&mut self, position: Vec3) -> Option<u32> {
+        self.spawn_actor_kind(ActorKind::dummy(), position)
+    }
+
+    /// Spawn one instance of a species at a supported position. Returns its id.
+    pub fn spawn_actor_kind(&mut self, kind: ActorKind, position: Vec3) -> Option<u32> {
         if self.actors.len() >= MAX_ACTORS || !position.is_finite() {
             return None;
         }
@@ -70,23 +321,67 @@ impl Simulation {
                     },
                     yaw: 0.0,
                 },
-                body: CharacterBody::default(),
-                profile: MovementProfile::default(),
+                body: kind.body,
+                profile: kind.profile,
                 intent: CharacterIntent::default(),
-                health: Health::default(),
+                health: Health::new(kind.health).unwrap_or_default(),
                 spawn: position,
                 respawn_at: None,
                 attack_ready: 0,
+                kind,
+                brain: match kind.brain {
+                    BrainKind::External => ActorBrain::External,
+                    scripted => ActorBrain::Scripted(crate::brains::build_brain(scripted)),
+                },
             },
         );
         Some(id)
+    }
+
+    /// Drive an actor externally; the intended path for `BrainKind::External`
+    /// actors but accepted for any kind (scripted brains overwrite it next
+    /// tick). Returns false for an absent id.
+    pub fn set_actor_intent(&mut self, id: u32, intent: CharacterIntent) -> bool {
+        let Some(actor) = self.actors.get_mut(&id) else {
+            return false;
+        };
+        actor.intent = gate_intent(intent, actor.kind.capabilities);
+        true
+    }
+
+    /// One actor's policy view for tests, trainers and inspection tools.
+    pub fn observe(&self, id: u32, world: &VoxelWorld) -> Option<ActorObservation> {
+        let actor = self.actors.get(&id)?;
+        Some(observation_of(
+            actor,
+            u64::from(id),
+            &self.actors,
+            &self.players,
+            world,
+            self.tick,
+        ))
     }
 
     /// Step every living actor one fixed tick and revive actors whose respawn
     /// delay elapsed. Held movement persists; `resolve_attacks` consumes the
     /// attack edge after the motor step.
     pub(super) fn advance_actors(&mut self, world: &VoxelWorld, bodies: &[DynamicCollider]) {
-        for actor in self.actors.values_mut() {
+        // Observations see pre-step state for every living actor at once so
+        // brains never observe a half-advanced tick. The map leaves self.actors
+        // while observations borrow it.
+        let actors = std::mem::take(&mut self.actors);
+        let observations: BTreeMap<u32, ActorObservation> = actors
+            .iter()
+            .filter(|(_, actor)| !actor.health.is_depleted())
+            .map(|(&id, actor)| {
+                (
+                    id,
+                    observation_of(actor, u64::from(id), &actors, &self.players, world, self.tick),
+                )
+            })
+            .collect();
+        self.actors = actors;
+        for (&id, actor) in self.actors.iter_mut() {
             if actor.health.is_depleted() {
                 if self.tick >= actor.respawn_at.unwrap_or(u64::MAX) {
                     actor.state.motion.position = actor.spawn;
@@ -97,7 +392,11 @@ impl Simulation {
                 }
                 continue;
             }
-            let mut intent = actor.intent;
+            let mut intent = match &mut actor.brain {
+                ActorBrain::Scripted(brain) => brain.act(&observations[&id], self.tick),
+                ActorBrain::External => actor.intent,
+            };
+            intent = gate_intent(intent, actor.kind.capabilities);
             step_character(
                 world,
                 &mut actor.state,
@@ -186,9 +485,22 @@ impl Simulation {
                 let actor_id = (hit.target & !ACTOR_TARGET) as u32;
                 if let Some(actor) = self.actors.get_mut(&actor_id) {
                     actor.state.apply_impulse(&actor.body, hit.impulse);
-                    actor.health.damage(hit.damage);
+                    let was_depleted = actor.health.is_depleted();
+                    let amount = actor.health.damage(hit.damage);
                     if actor.health.is_depleted() {
                         actor.respawn_at = Some(self.tick + ACTOR_RESPAWN_TICKS);
+                    }
+                    self.events.push(SimEvent::DamageDealt {
+                        source: SimEntity::Player(id),
+                        target: SimEntity::Actor(actor_id),
+                        amount,
+                        killed: actor.health.is_depleted(),
+                    });
+                    if !was_depleted && actor.health.is_depleted() {
+                        self.events.push(SimEvent::ActorDied {
+                            id: actor_id,
+                            killer: Some(SimEntity::Player(id)),
+                        });
                     }
                 }
             } else {
@@ -202,13 +514,11 @@ impl Simulation {
     }
 
     /// One actor swing: level aim along the actor's yaw against every other
-    /// living actor and player. Consumes the intent edge and starts cooldown.
+    /// living actor and player. The innate species spec applies; `ITEM`
+    /// actors may resolve equipment later. Consumes the intent edge and
+    /// starts cooldown.
     fn swing_actor(&mut self, world: &VoxelWorld, id: u32) {
-        let spec = self
-            .packages
-            .melee_table()
-            .spec(self.actors[&id].intent.held_item)
-            .unwrap_or(gameplay::combat::MELEE_HANDS);
+        let spec = self.actors[&id].kind.melee;
         let actor = &self.actors[&id];
         let origin = actor.state.motion.position + Vec3::Y * EYE_HEIGHT;
         let direction = look_direction(actor.state.yaw, 0.0);
@@ -242,16 +552,39 @@ impl Simulation {
             let target_id = (hit.target & !ACTOR_TARGET) as u32;
             if let Some(victim) = self.actors.get_mut(&target_id) {
                 victim.state.apply_impulse(&victim.body, hit.impulse);
-                victim.health.damage(hit.damage);
+                let was_depleted = victim.health.is_depleted();
+                let amount = victim.health.damage(hit.damage);
                 if victim.health.is_depleted() {
                     victim.respawn_at = Some(self.tick + ACTOR_RESPAWN_TICKS);
+                }
+                self.events.push(SimEvent::DamageDealt {
+                    source: SimEntity::Actor(id),
+                    target: SimEntity::Actor(target_id),
+                    amount,
+                    killed: victim.health.is_depleted(),
+                });
+                if !was_depleted && victim.health.is_depleted() {
+                    self.events.push(SimEvent::ActorDied {
+                        id: target_id,
+                        killer: Some(SimEntity::Actor(id)),
+                    });
                 }
             }
         } else {
             if let Some(victim) = self.players.get_mut(&hit.target) {
                 apply_player_impulse(&mut victim.state, hit.impulse);
             }
-            self.damage_player(hit.target, hit.damage);
+            if let Some(amount) = self.damage_player(hit.target, hit.damage) {
+                self.events.push(SimEvent::DamageDealt {
+                    source: SimEntity::Actor(id),
+                    target: SimEntity::Player(hit.target),
+                    amount,
+                    killed: self
+                        .players
+                        .get(&hit.target)
+                        .is_some_and(|victim| victim.health.is_depleted()),
+                });
+            }
         }
     }
 
@@ -283,5 +616,5 @@ impl Simulation {
     }
 }
 
-/// Re-exported so `Simulation` can store the map without leaking the type.
-pub(super) type ActorMap = HashMap<u32, Actor>;
+/// Deterministic order so brains and events see a stable actor sequence.
+pub(super) type ActorMap = BTreeMap<u32, Actor>;

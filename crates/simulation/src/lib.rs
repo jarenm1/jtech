@@ -8,6 +8,7 @@ mod blast_jump_tests;
 mod bombardment_tests;
 mod bow;
 mod bow_server;
+mod brains;
 mod explosion;
 mod health;
 mod items;
@@ -39,6 +40,10 @@ use terrain_stream::interests;
 use voxel_world::{
     BrushEdit, CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, Voxel, VoxelWorld, chunk_coord, index,
     local_coord,
+};
+
+pub use actors::{
+    ActorCapabilities, ActorKind, ActorObservation, BrainKind, ObservedEntity, SimEntity, SimEvent,
 };
 
 const MAX_INPUT_QUEUE: usize = 32;
@@ -196,8 +201,9 @@ impl Plugin for SimulationPlugin {
                 scatter,
                 spawn,
                 spawn_chunks,
-                actors: HashMap::new(),
+                actors: BTreeMap::new(),
                 next_actor: 1,
+                events: Vec::new(),
             })
             .add_systems(Update, advance);
         // The training dummy shares the player spawn volume so it is always
@@ -360,6 +366,7 @@ pub struct Simulation {
     spawn_chunks: HashSet<IVec3>,
     actors: actors::ActorMap,
     next_actor: u32,
+    events: Vec<SimEvent>,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -938,6 +945,10 @@ impl Simulation {
             }
         }
         self.physics = Some(physics);
+    }
+    /// Take the per-tick event stream, leaving an empty buffer.
+    pub fn drain_events(&mut self) -> Vec<SimEvent> {
+        std::mem::take(&mut self.events)
     }
 }
 fn validate_player_edit(
