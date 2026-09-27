@@ -554,6 +554,8 @@ fn explosive_bow() -> Result<()> {
         metrics_every: 0,
         gpu_physics: false,
         packages: package_root.clone(),
+        // A wandering hunter would hit scripted bots.
+        spawn_titan: false,
         ..Default::default()
     })?;
     let address = plugin.local_addr();
@@ -897,6 +899,8 @@ fn main() -> Result<()> {
         bind: "127.0.0.1:0".parse()?,
         radius: 1,
         metrics_every: 0,
+        // A wandering hunter would hit scripted bots.
+        spawn_titan: false,
         ..Default::default()
     })?;
     let address = plugin.local_addr();

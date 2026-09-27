@@ -53,6 +53,11 @@ environment layer.
 New species = a table entry + optionally a `Brain`. No motor changes unless a
 species needs a new `LocomotionMode` (fly/swim — deferred).
 
+At startup the server spawns a `dummy` at spawn+4 and a `titan` at spawn+24
+(inside the eagerly generated spawn chunks). `ServerConfig::spawn_titan`
+(`server --no-titan`) drops the hunter for deterministic tests/smoke.
+
+
 ## Determinism notes
 
 - Actor iteration is `BTreeMap`-ordered; combat damage events record actual
