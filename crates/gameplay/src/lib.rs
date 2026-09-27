@@ -90,7 +90,7 @@ impl Health {
 }
 
 /// One owned stack: an item id and its count. Item 0 is never stored.
-pub type ItemStack = (u8, u32);
+pub type ItemStack = (u32, u32);
 
 /// Unbounded per-item stacks gathered from the world, in first-seen order.
 /// The server owns mutations; clients display the replicated copy. Counts are
@@ -128,13 +128,13 @@ impl Inventory {
         Self::default()
     }
 
-    fn position(&self, item: u8) -> Option<usize> {
+    fn position(&self, item: u32) -> Option<usize> {
         self.entries.iter().position(|&(id, _)| id == item)
     }
 
     /// Total owned count across every entry for `item`; equipment instances
     /// each contribute their own entry.
-    pub fn count(&self, item: u8) -> u32 {
+    pub fn count(&self, item: u32) -> u32 {
         self.entries
             .iter()
             .filter(|&&(id, _)| id == item)
@@ -157,7 +157,7 @@ impl Inventory {
 
     /// Add `amount`, appending a new stack for unseen items. Returns the
     /// amount accepted; only item 0 or a saturated count is refused.
-    pub fn add(&mut self, item: u8, amount: u32) -> u32 {
+    pub fn add(&mut self, item: u32, amount: u32) -> u32 {
         if item == 0 || amount == 0 {
             return 0;
         }
@@ -176,7 +176,7 @@ impl Inventory {
 
     /// Add one equipment instance as its own entry, even when the item is
     /// already owned. Returns 1, or 0 for item 0.
-    pub fn add_equipment(&mut self, item: u8) -> u32 {
+    pub fn add_equipment(&mut self, item: u32) -> u32 {
         if item == 0 {
             return 0;
         }
@@ -186,7 +186,7 @@ impl Inventory {
 
     /// Remove up to `amount` across every entry for `item`, returning how many
     /// were taken. Empty entries are dropped from the list.
-    pub fn take(&mut self, item: u8, amount: u32) -> u32 {
+    pub fn take(&mut self, item: u32, amount: u32) -> u32 {
         let mut remaining = amount;
         let mut index = 0;
         while remaining > 0 && index < self.entries.len() {

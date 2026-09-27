@@ -281,7 +281,7 @@ fn blast_spec(value: SteelVal) -> Result<BlastSpec, String> {
 pub struct MeleeWeapon {
     /// Item id; must exceed `protocol::EXPLOSIVE_BOW_ITEM` so it cannot shadow
     /// hands, block materials, or the bow.
-    pub id: u8,
+    pub id: u32,
     /// Owning package id, assigned when the weapon merges into the table.
     pub package: String,
     /// Display name for logs and a future presentation API.
@@ -296,7 +296,7 @@ pub struct MeleeWeapon {
 pub struct MeleePackage {
     generation: u64,
     weapons: Vec<MeleeWeapon>,
-    spawn_items: Vec<(u8, u32)>,
+    spawn_items: Vec<(u32, u32)>,
 }
 
 impl MeleePackage {
@@ -325,7 +325,7 @@ impl MeleePackage {
             Ok(_) => return Err("spawn-items must be a list of (id count) pairs".into()),
             Err(_) => Vec::new(),
         };
-        let registered: HashSet<u8> = weapons.iter().map(|weapon| weapon.id).collect();
+        let registered: HashSet<u32> = weapons.iter().map(|weapon| weapon.id).collect();
         for &(item, _) in &spawn_items {
             if !registered.contains(&item) {
                 return Err(format!(
@@ -349,12 +349,16 @@ fn melee_weapon(value: SteelVal, package_dir: &Path) -> Result<MeleeWeapon, Stri
         return Err("melee-weapon takes id, name, range, damage, cooldown-ticks, knockback, optional model".into());
     }
     let id = integer(&fields[0], "weapon id")?;
-    if !(0..=u8::MAX as isize).contains(&id) || id as u8 <= protocol::EXPLOSIVE_BOW_ITEM {
-        return Err(format!(
-            "weapon id must be an integer in {}..=255",
-            protocol::EXPLOSIVE_BOW_ITEM + 1
-        ));
-    }
+    let id = u32::try_from(id)
+        .ok()
+        .filter(|id| *id > protocol::EXPLOSIVE_BOW_ITEM)
+        .ok_or_else(|| {
+            format!(
+                "weapon id must be an integer in {}..={}",
+                protocol::EXPLOSIVE_BOW_ITEM + 1,
+                u32::MAX
+            )
+        })?;
     let SteelVal::StringV(name) = &fields[1] else {
         return Err("weapon name must be a string".into());
     };
@@ -385,7 +389,7 @@ fn melee_weapon(value: SteelVal, package_dir: &Path) -> Result<MeleeWeapon, Stri
     })?;
     let model = weapon_model(&fields[6], package_dir)?;
     Ok(MeleeWeapon {
-        id: id as u8,
+        id,
         package: String::new(),
         name,
         spec,
@@ -426,7 +430,7 @@ fn weapon_model(value: &SteelVal, package_dir: &Path) -> Result<Option<String>, 
     Ok(Some(path.to_string()))
 }
 
-fn spawn_item(value: SteelVal) -> Result<(u8, u32), String> {
+fn spawn_item(value: SteelVal) -> Result<(u32, u32), String> {
     let SteelVal::ListV(pair) = value else {
         return Err("spawn-items entries must be (id count) pairs".into());
     };
@@ -435,14 +439,13 @@ fn spawn_item(value: SteelVal) -> Result<(u8, u32), String> {
     }
     let id = integer(&pair[0], "spawn item id")?;
     let count = integer(&pair[1], "spawn item count")?;
-    if !(0..=u8::MAX as isize).contains(&id) {
-        return Err("spawn item id must be an integer in 0..=255".into());
-    }
+    let id = u32::try_from(id)
+        .map_err(|_| format!("spawn item id must be an integer in 0..={}", u32::MAX))?;
     // Equipment grants one inventory entry per count; keep the loadout bounded.
     if !(1..=64).contains(&count) {
         return Err("spawn item count must be an integer in 1..=64".into());
     }
-    Ok((id as u8, count as u32))
+    Ok((id, count as u32))
 }
 
 fn integer(value: &SteelVal, name: &str) -> Result<isize, String> {
@@ -498,14 +501,14 @@ fn bound(name: &str, value: f32, min: f32, max: f32) -> Result<(), String> {
 /// already-loaded one.
 #[derive(Clone, Default)]
 pub struct MeleeTable {
-    weapons: Arc<HashMap<u8, MeleeWeapon>>,
-    spawn_items: Arc<Vec<(u8, u32)>>,
+    weapons: Arc<HashMap<u32, MeleeWeapon>>,
+    spawn_items: Arc<Vec<(u32, u32)>>,
 }
 
 impl MeleeTable {
     /// Authored spec for a registered weapon item; `None` for hands, blocks,
     /// the bow, and unknown ids.
-    pub fn spec(&self, item: u8) -> Option<MeleeSpec> {
+    pub fn spec(&self, item: u32) -> Option<MeleeSpec> {
         self.weapons.get(&item).map(|weapon| weapon.spec)
     }
 
@@ -515,7 +518,7 @@ impl MeleeTable {
     }
 
     /// Registered weapons are equipment; everything else stacks.
-    pub fn kind(&self, item: u8) -> protocol::ItemKind {
+    pub fn kind(&self, item: u32) -> protocol::ItemKind {
         if self.weapons.contains_key(&item) {
             protocol::ItemKind::Equipment
         } else {
@@ -524,7 +527,7 @@ impl MeleeTable {
     }
 
     /// Items every player receives on spawn and respawn, merged across packages.
-    pub fn spawn_items(&self) -> &[(u8, u32)] {
+    pub fn spawn_items(&self) -> &[(u32, u32)] {
         &self.spawn_items
     }
 }

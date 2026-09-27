@@ -31,7 +31,7 @@ pub(super) struct Drop {
 }
 
 impl Drop {
-    fn new(id: u32, position: Vec3, item: u8, count: u32) -> Self {
+    fn new(id: u32, position: Vec3, item: u32, count: u32) -> Self {
         // The golden angle spreads successive drops without shared RNG state.
         let angle = id as f32 * 2.399_963_2;
         let velocity = Vec3::new(angle.cos(), 0.0, angle.sin()) * DROP_SPREAD + Vec3::Y * DROP_POP;
@@ -92,7 +92,7 @@ impl Drop {
 impl Simulation {
     /// Add up to `amount` of `item` to a player's inventory. Returns the amount
     /// accepted; unknown players return `None`.
-    pub fn grant_item(&mut self, id: u64, item: u8, amount: u32) -> Option<u32> {
+    pub fn grant_item(&mut self, id: u64, item: u32, amount: u32) -> Option<u32> {
         let equipment =
             self.packages.melee_table().kind(item) == protocol::ItemKind::Equipment;
         let player = self.players.get_mut(&id)?;
@@ -114,11 +114,11 @@ impl Simulation {
 impl Simulation {
     /// Leave a dropped stack at `position`. The authoritative destruction path
     /// calls this for grid and loose-block destruction alike.
-    pub(super) fn spawn_drop(&mut self, position: Vec3, item: u8, count: u32) {
+    pub(super) fn spawn_drop(&mut self, position: Vec3, item: u32, count: u32) {
         let equipment =
             self.packages.melee_table().kind(item) == protocol::ItemKind::Equipment;
         if item == 0
-            || (item > voxel_world::WOOD && !equipment)
+            || (item > u32::from(voxel_world::WOOD) && !equipment)
             || count == 0
             || !position.is_finite()
         {

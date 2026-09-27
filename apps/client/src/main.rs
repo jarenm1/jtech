@@ -147,7 +147,7 @@ struct ClientSession {
     /// Selected hotbar slot, 1-10.
     selected: u8,
     /// Item id assigned to each hotbar slot; `None` is an empty slot.
-    hotbar: [Option<u8>; 10],
+    hotbar: [Option<u32>; 10],
     bow_power: BowPower,
     packages: package_hud::ServerPackages,
     request: u64,
@@ -236,7 +236,7 @@ impl Default for ClientSession {
 
 impl ClientSession {
     /// Item id the selected hotbar slot holds; 0 means empty hands.
-    fn held_item(&self) -> u8 {
+    fn held_item(&self) -> u32 {
         self.hotbar
             .get(usize::from(self.selected) - 1)
             .copied()
@@ -1285,7 +1285,7 @@ fn capture_screenshot(
 }
 /// Granted equipment lands in empty hotbar slots so spawn loadouts are usable
 fn auto_hotbar(mut session: ResMut<ClientSession>, options: Res<Options>) {
-    let weapons: Vec<u8> = session
+    let weapons: Vec<u32> = session
         .packages
         .melee_weapons
         .iter()

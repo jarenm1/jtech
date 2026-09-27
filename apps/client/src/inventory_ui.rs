@@ -34,7 +34,7 @@ pub(crate) enum DragSource {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Drag {
-    item: u8,
+    item: u32,
     source: DragSource,
 }
 
@@ -46,7 +46,7 @@ pub(crate) struct InventoryGrid;
 
 /// One grid cell; carries the item id it renders.
 #[derive(Component)]
-pub(crate) struct InventoryCell(u8);
+pub(crate) struct InventoryCell(u32);
 
 /// The floating tile that follows the cursor during a drag.
 #[derive(Component)]
@@ -167,7 +167,7 @@ pub(crate) fn sync(
     });
 }
 
-fn spawn_cell(grid: &mut ChildSpawnerCommands, item: u8, name: String, count: Option<u32>) {
+fn spawn_cell(grid: &mut ChildSpawnerCommands, item: u32, name: String, count: Option<u32>) {
     grid.spawn((
         Button,
         Node {
@@ -310,7 +310,7 @@ pub(crate) fn drag(
     }
 }
 
-fn spawn_ghost(commands: &mut Commands, item: u8) {
+fn spawn_ghost(commands: &mut Commands, item: u32) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -430,14 +430,14 @@ mod tests {
     fn grid_rebuilds_with_replicated_stacks() {
         let mut app = app();
         let mut inventory = gameplay::Inventory::new();
-        inventory.add(voxel_world::STONE, 40);
-        inventory.add(voxel_world::WOOD, 7);
+        inventory.add(u32::from(voxel_world::STONE), 40);
+        inventory.add(u32::from(voxel_world::WOOD), 7);
         app.world_mut().resource_mut::<ClientSession>().inventory = inventory;
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::Tab);
         app.update();
-        let items: Vec<u8> = app
+        let items: Vec<u32> = app
             .world_mut()
             .query::<&InventoryCell>()
             .iter(app.world())
@@ -445,7 +445,7 @@ mod tests {
             .collect();
         assert_eq!(
             items,
-            vec![EXPLOSIVE_BOW_ITEM, voxel_world::STONE, voxel_world::WOOD]
+            vec![EXPLOSIVE_BOW_ITEM, u32::from(voxel_world::STONE), u32::from(voxel_world::WOOD)]
         );
     }
 }

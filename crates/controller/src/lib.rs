@@ -22,7 +22,7 @@ pub struct CharacterIntent {
     pub jump: bool,
     pub attack: bool,
     /// Item the character swings with; the host maps it to a melee spec.
-    pub held_item: u8,
+    pub held_item: u32,
 }
 impl CharacterIntent {
     pub fn bounded(self) -> Self {
