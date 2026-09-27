@@ -483,11 +483,13 @@ fn launch_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
         frames: None,
         screenshot: None,
         lighting: lighting::DayCycle::default(),
+        presets: Vec::new(),
     })
     .insert_resource(launcher_session())
     .init_resource::<ButtonInput<KeyCode>>()
     .init_resource::<AccumulatedMouseMotion>()
     .init_resource::<pause_menu::PauseMenu>()
+    .init_resource::<admin_panel::AdminPanel>()
     .add_systems(Update, controls);
     let cursor = app
         .world_mut()
@@ -886,6 +888,7 @@ fn controls_block_look_and_slot_changes_while_dead() {
         frames: None,
         screenshot: None,
         lighting: lighting::DayCycle::default(),
+        presets: Vec::new(),
     })
     .insert_resource(ClientSession {
         selected: 3,
@@ -894,6 +897,7 @@ fn controls_block_look_and_slot_changes_while_dead() {
     .init_resource::<ButtonInput<KeyCode>>()
     .init_resource::<AccumulatedMouseMotion>()
     .init_resource::<pause_menu::PauseMenu>()
+    .init_resource::<admin_panel::AdminPanel>()
     .add_systems(Update, controls);
     app.world_mut().spawn(CursorOptions {
         visible: false,
@@ -968,6 +972,7 @@ fn left_click_plays_swing_animation_without_a_melee_target() {
     app.init_resource::<ButtonInput<MouseButton>>()
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<pause_menu::PauseMenu>()
+        .init_resource::<admin_panel::AdminPanel>()
         .init_resource::<RemoteActors>()
         .init_resource::<RemotePlayers>()
         .insert_resource(arena())

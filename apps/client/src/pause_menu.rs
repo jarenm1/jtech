@@ -6,7 +6,8 @@ use bevy::{
 };
 
 use crate::{
-    ClientSession, Options, game_hud::GameplayHud, inventory_ui::InventoryUi, package_hud,
+    ClientSession, Options, admin_panel::AdminPanel, game_hud::GameplayHud,
+    inventory_ui::InventoryUi, package_hud,
 };
 
 #[derive(Resource, Default)]
@@ -135,13 +136,16 @@ pub(crate) fn input(
     options: Res<Options>,
     mut menu: ResMut<PauseMenu>,
     mut inventory: ResMut<InventoryUi>,
+    admin: Res<AdminPanel>,
 ) {
     menu.suppress_frame = false;
     if !buttons.any_pressed([MouseButton::Left, MouseButton::Right]) {
         menu.wait_for_release = false;
     }
     if keys.just_pressed(KeyCode::Escape) && window.focused {
-        if inventory.open {
+        if admin.open || admin.closed_this_frame {
+            // The admin console owns this Esc; nothing to peel here.
+        } else if inventory.open {
             // Escape peels the topmost layer first: panel, then menu.
             inventory.open = false;
             menu.hold_for_mouse_release();
@@ -231,12 +235,16 @@ pub(crate) fn sync(
 pub(crate) fn sync_cursor(
     menu: Res<PauseMenu>,
     inventory: Res<InventoryUi>,
+    admin: Res<AdminPanel>,
     session: Res<ClientSession>,
     options: Res<Options>,
     mut cursor: Single<&mut CursorOptions>,
 ) {
-    cursor.visible =
-        menu.open || inventory.open || session.health.is_depleted() || options.bot;
+    cursor.visible = menu.open
+        || inventory.open
+        || admin.open
+        || session.health.is_depleted()
+        || options.bot;
     cursor.grab_mode = if cursor.visible {
         CursorGrabMode::None
     } else {
@@ -244,8 +252,8 @@ pub(crate) fn sync_cursor(
     };
 }
 
-pub(crate) fn gameplay_enabled(menu: Res<PauseMenu>) -> bool {
-    !menu.blocks_gameplay()
+pub(crate) fn gameplay_enabled(menu: Res<PauseMenu>, admin: Res<AdminPanel>) -> bool {
+    !menu.blocks_gameplay() && !admin.open
 }
 
 #[cfg(test)]
@@ -257,6 +265,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<PauseMenu>()
             .init_resource::<InventoryUi>()
+            .init_resource::<AdminPanel>()
             .init_resource::<ClientSession>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()
@@ -267,6 +276,7 @@ mod tests {
                 frames: None,
                 screenshot: None,
                 lighting: crate::lighting::DayCycle::default(),
+                presets: Vec::new(),
             })
             .add_message::<AppExit>()
             .add_systems(Startup, |mut commands: Commands| spawn(&mut commands))

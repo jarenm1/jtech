@@ -82,6 +82,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "admin"
+version = "0.1.0"
+dependencies = [
+ "bevy_ecs",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4814,6 +4821,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "admin",
  "bevy_app",
  "bevy_ecs",
  "controller",
@@ -4889,6 +4897,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 name = "simulation"
 version = "0.1.0"
 dependencies = [
+ "admin",
  "bevy_app",
  "bevy_ecs",
  "controller",
@@ -5694,6 +5703,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "voxel-client"
 version = "0.1.0"
 dependencies = [
+ "admin",
  "bevy",
  "controller",
  "gameplay",

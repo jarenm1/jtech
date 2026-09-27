@@ -12,7 +12,7 @@
 
 use bevy::{prelude::*, ui::FocusPolicy};
 
-use crate::{ClientSession, game_hud, pause_menu::PauseMenu};
+use crate::{ClientSession, admin_panel::AdminPanel, game_hud, pause_menu::PauseMenu};
 
 /// Local inventory panel state. `shown` caches the last rendered inventory and
 /// weapon set so the grid only rebuilds when the replicated contents change.
@@ -123,8 +123,9 @@ pub(crate) fn input(
     window: Single<&Window>,
     mut ui: ResMut<InventoryUi>,
     mut menu: ResMut<PauseMenu>,
+    admin: Res<AdminPanel>,
 ) {
-    if keys.just_pressed(KeyCode::Tab) && window.focused && !menu.open {
+    if keys.just_pressed(KeyCode::Tab) && window.focused && !menu.open && !admin.open {
         ui.open = !ui.open;
         if !ui.open {
             // A held click must not reach gameplay the frame the panel closes.
@@ -348,6 +349,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<InventoryUi>()
             .init_resource::<PauseMenu>()
+            .init_resource::<AdminPanel>()
             .init_resource::<ClientSession>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()
@@ -357,6 +359,7 @@ mod tests {
                 frames: None,
                 screenshot: None,
                 lighting: crate::lighting::DayCycle::default(),
+                presets: Vec::new(),
             })
             .add_systems(Startup, |mut commands: Commands| {
                 spawn(&mut commands);

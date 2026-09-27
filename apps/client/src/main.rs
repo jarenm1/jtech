@@ -1,4 +1,5 @@
 use controller::PlayerInput;
+mod admin_panel;
 mod death_overlay;
 mod drops;
 mod game_hud;
@@ -19,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use admin::{AdminFlags, FlagValue};
 use bevy::{
     app::AppExit,
     input::mouse::AccumulatedMouseMotion,
@@ -32,6 +34,7 @@ use protocol::{
     ClientMessage, EditRejection, Health, InputPacket, Inventory, ServerMessage, Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
+use lighting::DayCycle;
 use voxel_world::{
     CHUNK_SIZE, Chunk, VoxelWorld, WORLD_MAX_Y, WORLD_MIN_Y, WorldPlugin, chunk_coord,
 };
@@ -43,6 +46,8 @@ struct Options {
     frames: Option<u64>,
     screenshot: Option<String>,
     lighting: lighting::DayCycle,
+    /// `--set name=value` admin flag overrides.
+    presets: Vec<String>,
 }
 
 impl Options {
@@ -53,6 +58,7 @@ impl Options {
             frames: None,
             screenshot: None,
             lighting: lighting::DayCycle::default(),
+            presets: Vec::new(),
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -106,9 +112,16 @@ impl Options {
                         options.lighting.day_seconds = value;
                     }
                 }
+                "--set" => {
+                    let assignment = args.next().ok_or("--set needs name=value")?;
+                    if !assignment.contains('=') {
+                        return Err("--set needs name=value".into());
+                    }
+                    options.presets.push(assignment);
+                }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-0 hotbar | Tab inventory | Esc pause menu | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS] [--set flag=value]...\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | ` admin console | 1-0 hotbar | Tab inventory | Esc pause menu | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -384,6 +397,38 @@ struct ClientPlugin;
 
 impl Plugin for ClientPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<AdminFlags>()
+            .init_resource::<admin_panel::AdminPanel>();
+        {
+            let (presets, cycle) = {
+                let world = app.world();
+                (
+                    world.resource::<Options>().presets.clone(),
+                    *world.resource::<DayCycle>(),
+                )
+            };
+            let mut flags = app.world_mut().resource_mut::<AdminFlags>();
+            for assignment in presets {
+                if let Err(error) = flags.preset(&assignment) {
+                    eprintln!("admin: ignoring --set {assignment}: {error}");
+                }
+            }
+            flags.register(
+                "day_length",
+                FlagValue::Float(cycle.day_seconds),
+                "seconds per full day; 0 freezes time",
+            );
+            flags.register(
+                "time_of_day",
+                FlagValue::Float(cycle.hour),
+                "current hour in [0, 24)",
+            );
+            flags.register(
+                "noclip",
+                FlagValue::Bool(false),
+                "request noclip flight (server-authoritative)",
+            );
+        }
         app.add_plugins(controller::ControllerPlugin::default());
         app.add_systems(
             FixedUpdate,
@@ -430,6 +475,13 @@ impl Plugin for ClientPlugin {
                     scatter::sync_scatter,
                 )
                     .chain(),
+            )
+            // The console owns Esc while open, so it reads input first.
+            .add_systems(
+                Update,
+                (admin_panel::input, admin_panel::sync)
+                    .chain()
+                    .before(pause_menu::input),
             )
             .add_systems(
                 Update,
@@ -539,6 +591,7 @@ fn setup(
     inventory_ui::spawn(&mut commands);
     game_hud::spawn(&mut commands);
     pause_menu::spawn(&mut commands);
+    admin_panel::spawn(&mut commands);
     death_overlay::spawn(&mut commands, &mut images);
     health_hud::spawn(&mut commands);
     launcher_hud::spawn(&mut commands);
@@ -939,8 +992,9 @@ fn controls(
     mut session: ResMut<ClientSession>,
     cursor: Single<&CursorOptions>,
     menu: Res<pause_menu::PauseMenu>,
+    admin: Res<admin_panel::AdminPanel>,
 ) {
-    if menu.blocks_gameplay() || session.health.is_depleted() {
+    if menu.blocks_gameplay() || admin.open || session.health.is_depleted() {
         return;
     }
     if !cursor.visible && !options.bot {
@@ -982,10 +1036,12 @@ fn predict(
     mut session: ResMut<ClientSession>,
     loose: Res<loose_blocks::LooseBlocks>,
     menu: Res<pause_menu::PauseMenu>,
+    admin: Res<admin_panel::AdminPanel>,
 ) {
     if session.id.is_none() || session.transport.is_none() {
         return;
     }
+    let blocked = menu.blocks_gameplay() || admin.open;
     if session.health.is_depleted() {
         session.jump_pending = false;
         if let Some(packet) = session.death_heartbeat(time.delta_secs())
@@ -996,7 +1052,7 @@ fn predict(
         }
         return;
     }
-    if !menu.blocks_gameplay()
+    if !blocked
         && !options.bot
         && !cursor.visible
         && keys.just_pressed(KeyCode::KeyV)
@@ -1013,7 +1069,7 @@ fn predict(
         return;
     }
     session.capture_jump(
-        !options.bot && !cursor.visible && !menu.blocks_gameplay(),
+        !options.bot && !cursor.visible && !blocked,
         keys.just_pressed(KeyCode::Space),
     );
     session.accumulator += time.delta_secs().min(0.1);
@@ -1029,7 +1085,7 @@ fn predict(
         let mut movement = [0.0, 0.0];
         let mut jump = false;
         let mut descend = false;
-        if options.bot && !menu.blocks_gameplay() {
+        if options.bot && !blocked {
             // Reproducible traversal for profiling the real rendered client.
             let phase = (session.sequence / 240) % 4;
             movement = match phase {
@@ -1039,7 +1095,7 @@ fn predict(
                 _ => [-1.0, 0.0],
             };
             jump = session.sequence.is_multiple_of(90);
-        } else if !cursor.visible && !menu.blocks_gameplay() {
+        } else if !cursor.visible && !blocked {
             movement[0] = f32::from(u8::from(keys.pressed(KeyCode::KeyD)))
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyA)));
             movement[1] = f32::from(u8::from(keys.pressed(KeyCode::KeyW)))
@@ -1089,8 +1145,10 @@ fn edit_blocks(
     time: Res<Time>,
     mut fire_repeat: Local<FireRepeat>,
     menu: Res<pause_menu::PauseMenu>,
+    admin: Res<admin_panel::AdminPanel>,
 ) {
     if menu.blocks_gameplay()
+        || admin.open
         || cursor.visible
         || session.transport.is_none()
         || session.id.is_none()

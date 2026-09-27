@@ -20,6 +20,7 @@ mod physics_slice;
 mod streaming;
 mod projectile;
 mod terrain_stream;
+use admin::{AdminFlags, FlagValue};
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
 use gameplay::{Health, Inventory};
@@ -107,6 +108,8 @@ pub struct SimulationPlugin {
     physics: parking_lot::Mutex<Option<PhysicsSlice>>,
     generator: std::sync::Arc<voxel_world::terrain::TerrainGenerator>,
     terrain: parking_lot::Mutex<Option<terrain_stream::TerrainStream>>,
+    /// `--set name=value` assignments, staged until `AdminFlags` exists.
+    presets: parking_lot::Mutex<Vec<String>>,
 }
 impl SimulationPlugin {
     pub fn bind(config: ServerConfig) -> io::Result<Self> {
@@ -142,14 +145,59 @@ impl SimulationPlugin {
             physics: parking_lot::Mutex::new(physics),
             generator,
             terrain: parking_lot::Mutex::new(Some(terrain)),
+            presets: parking_lot::Mutex::new(Vec::new()),
         })
     }
     pub fn local_addr(&self) -> SocketAddr {
         self.config.bind
     }
+    /// Stage a `name=value` flag override. Pending values are claimed by the
+    /// matching [`AdminFlags::register`] during `build`; names no flag claims
+    /// are reported once at `finish`.
+    pub fn set_flag(&self, assignment: &str) -> Result<(), String> {
+        match assignment.split_once('=') {
+            Some((name, _)) if !name.is_empty() => {
+                self.presets.lock().push(assignment.to_string());
+                Ok(())
+            }
+            _ => Err(format!("expected name=value, got '{assignment}'")),
+        }
+    }
 }
 impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<AdminFlags>();
+        // Stage CLI `--set` values first so registrations below claim them.
+        for assignment in std::mem::take(&mut *self.presets.lock()) {
+            if let Err(error) = app.world_mut().resource_mut::<AdminFlags>().preset(&assignment)
+            {
+                eprintln!("admin: ignoring --set {assignment}: {error}");
+            }
+        }
+        let titan = {
+            let mut flags = app.world_mut().resource_mut::<AdminFlags>();
+            flags.register(
+                "metrics_every",
+                FlagValue::Float(self.config.metrics_every as f64),
+                "print server metrics every N ticks; 0 disables",
+            );
+            flags.register_const(
+                "gpu_physics",
+                FlagValue::Bool(self.config.gpu_physics),
+                "GPU rigid-body physics; startup-bound",
+            );
+            flags.register_const(
+                "seed",
+                FlagValue::Text(self.config.seed.to_string()),
+                "terrain seed; startup-bound",
+            );
+            flags.register(
+                "spawn_titan",
+                FlagValue::Bool(self.config.spawn_titan),
+                "keep one titan hunter alive near spawn",
+            );
+            flags.bool("spawn_titan")
+        };
         app.add_plugins(controller::ControllerPlugin::on(Update));
         app.configure_sets(Update, controller::ControllerSet::Intent.after(advance));
         app.add_systems(
@@ -210,13 +258,13 @@ impl Plugin for SimulationPlugin {
                 next_actor: 1,
                 events: VecDeque::new(),
             })
-            .add_systems(Update, advance);
+            .add_systems(Update, (advance, titan_flag).chain());
         // The training dummy shares the player spawn volume so it is always
         // reachable on foot; `available_spawn` keeps it off occupied cells.
         // A titan hunts from further out so it does not immediately engage
         // whoever spawns.
         let mut kinds = vec![ActorKind::dummy()];
-        if self.config.spawn_titan {
+        if titan {
             kinds.push(ActorKind::titan());
         }
         // Offsets stay inside the eagerly generated spawn chunks (±1 chunk
@@ -240,6 +288,38 @@ impl Plugin for SimulationPlugin {
                 }
             }
         }
+    }
+
+    /// After every plugin registered its flags, `--set` names nobody claimed
+    /// are typos worth surfacing once.
+    fn finish(&self, app: &mut App) {
+        for name in app.world_mut().resource_mut::<AdminFlags>().take_unclaimed() {
+            eprintln!("admin: --set {name}: no such flag");
+        }
+    }
+}
+
+/// Keep the `spawn_titan` flag honest: spawn a hunter near spawn while enabled,
+/// remove every titan the moment it is turned off. Dead titans respawn on their
+/// own timer, so only presence needs policing here.
+fn titan_flag(flags: Res<AdminFlags>, mut sim: ResMut<Simulation>, world: Res<VoxelWorld>) {
+    let titan = ActorKind::titan();
+    if !flags.bool("spawn_titan") {
+        sim.actors.retain(|_, actor| actor.kind.name != titan.name);
+        return;
+    }
+    if sim.actors.values().any(|actor| actor.kind.name == titan.name) {
+        return;
+    }
+    let bodies = sim
+        .physics
+        .as_ref()
+        .map(|physics| physics.dynamic_colliders())
+        .unwrap_or_default();
+    if let Some(position) =
+        terrain_stream::available_spawn(&world, sim.spawn + Vec3::new(24.0, 0.0, 0.0), &bodies)
+    {
+        sim.spawn_actor_kind(titan, position);
     }
 }
 struct Player {
@@ -1107,7 +1187,11 @@ fn restore(world: &mut VoxelWorld, coord: IVec3, journal: Option<&Journal>) {
         );
     }
 }
-fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
+fn advance(
+    mut simulation: ResMut<Simulation>,
+    mut world: ResMut<VoxelWorld>,
+    flags: Res<AdminFlags>,
+) {
     let started = Instant::now();
     let sim = &mut *simulation;
     sim.tick += 1;
@@ -1490,7 +1574,8 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     if sim.tick_times.len() > 3600 {
         sim.tick_times.pop_front();
     }
-    if sim.config.metrics_every > 0 && sim.tick.is_multiple_of(sim.config.metrics_every) {
+    let metrics_every = flags.float("metrics_every") as u64;
+    if metrics_every > 0 && sim.tick.is_multiple_of(metrics_every) {
         sim.print_metrics(world.chunks.len());
     }
 }
