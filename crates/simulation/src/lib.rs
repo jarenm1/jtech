@@ -83,6 +83,9 @@ pub struct ServerConfig {
     pub metrics_every: u64,
     pub gpu_physics: bool,
     pub packages: std::path::PathBuf,
+    /// Spawn one `titan` hunter NPC near the spawn dummy at startup. Integration
+    /// smoke tests disable it so scripted flows stay deterministic.
+    pub spawn_titan: bool,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -93,6 +96,7 @@ impl Default for ServerConfig {
             metrics_every: 600,
             gpu_physics: false,
             packages: game_packages::default_directory(),
+            spawn_titan: true,
         }
     }
 }
@@ -208,14 +212,31 @@ impl Plugin for SimulationPlugin {
             .add_systems(Update, advance);
         // The training dummy shares the player spawn volume so it is always
         // reachable on foot; `available_spawn` keeps it off occupied cells.
-        {
+        // A titan hunts from further out so it does not immediately engage
+        // whoever spawns.
+        let mut kinds = vec![ActorKind::dummy()];
+        if self.config.spawn_titan {
+            kinds.push(ActorKind::titan());
+        }
+        // Offsets stay inside the eagerly generated spawn chunks (±1 chunk
+        // around spawn ≈ 32 blocks) so `available_spawn` never sees void.
+        let offsets = [
+            spawn + Vec3::new(4.0, 0.0, 0.0),
+            spawn + Vec3::new(24.0, 0.0, 0.0),
+        ];
+        let positions: Vec<Option<Vec3>> = {
             let world = app.world().resource::<VoxelWorld>();
-            if let Some(position) =
-                terrain_stream::available_spawn(world, spawn + Vec3::new(4.0, 0.0, 0.0), &[])
-            {
-                app.world_mut()
-                    .resource_mut::<Simulation>()
-                    .spawn_actor(position);
+            offsets
+                .into_iter()
+                .map(|offset| terrain_stream::available_spawn(world, offset, &[]))
+                .collect()
+        };
+        {
+            let mut sim = app.world_mut().resource_mut::<Simulation>();
+            for (kind, position) in kinds.into_iter().zip(positions) {
+                if let Some(position) = position {
+                    sim.spawn_actor_kind(kind, position);
+                }
             }
         }
     }
@@ -1751,6 +1772,38 @@ mod tests {
                 .all(|coord| world.chunks.contains_key(coord))
         );
     }
+    #[test]
+    fn startup_spawns_titan_unless_disabled() {
+        let app = headless_app(1);
+        let names: Vec<&str> = app
+            .world()
+            .resource::<Simulation>()
+            .actors
+            .values()
+            .map(|actor| actor.kind.name)
+            .collect();
+        assert_eq!(names, ["dummy", "titan"]);
+
+        let mut app = App::new();
+        app.add_plugins(
+            SimulationPlugin::headless(ServerConfig {
+                radius: 1,
+                metrics_every: 0,
+                spawn_titan: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let names: Vec<&str> = app
+            .world()
+            .resource::<Simulation>()
+            .actors
+            .values()
+            .map(|actor| actor.kind.name)
+            .collect();
+        assert_eq!(names, ["dummy"]);
+    }
+
 
     #[test]
     fn generated_completion_replays_latest_journal_and_never_overwrites_loaded() {

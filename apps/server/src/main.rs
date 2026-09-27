@@ -20,12 +20,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..64 (default 16)] [--ticks N] [--metrics-every 600] [--gpu-physics] [--packages DIR]"
+                "server [--bind 127.0.0.1:4000] [--seed 7] [--radius 1..64 (default 16)] [--ticks N] [--metrics-every 600] [--gpu-physics] [--no-titan] [--packages DIR]"
             );
             return Ok(());
         }
         if arg == "--gpu-physics" {
             config.gpu_physics = true;
+            continue;
+        }
+        if arg == "--no-titan" {
+            config.spawn_titan = false;
             continue;
         }
         let value = args
