@@ -57,7 +57,7 @@ struct Bot {
     yaw: f32,
     attack: bool,
     actors: HashMap<u32, ActorSnapshot>,
-    selected: u8,
+    selected: u32,
     jitter: bool,
 }
 impl Bot {
@@ -1010,7 +1010,7 @@ fn main() -> Result<()> {
     )?;
     // Melee package: the loadout reached the welcome inventory and the weapon
     // table replicated with the package set.
-    for item in [7u8, 8, 9] {
+    for item in [7u32, 8, 9] {
         // check_health killed first: its gear scattered and may have been
         // re-collected, so counts can exceed the granted one.
         require(

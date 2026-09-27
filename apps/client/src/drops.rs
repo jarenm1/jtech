@@ -98,7 +98,7 @@ impl Drops {
             .filter(|drop| {
                 drop.position.is_finite()
                     && drop.count > 0
-                    && ((1..=voxel_world::WOOD).contains(&drop.item)
+                    && ((1..=u32::from(voxel_world::WOOD)).contains(&drop.item)
                         || packages.is_equipment(drop.item))
             })
             .collect();

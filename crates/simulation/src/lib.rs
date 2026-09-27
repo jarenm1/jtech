@@ -720,7 +720,7 @@ impl Simulation {
     fn destroyed(&mut self, target: IVec3, material: u8, body: Option<u32>) {
         self.metrics.destroyed_blocks += 1;
         eprintln!("destroyed target={target} material={material} body={body:?}");
-        self.spawn_drop(target.as_vec3() + Vec3::splat(0.5), material, 1);
+        self.spawn_drop(target.as_vec3() + Vec3::splat(0.5), u32::from(material), 1);
     }
     /// One authoritative voxel transaction path for edits, detachment, and settlement.
     fn record_change(&mut self, _world: &VoxelWorld, target: IVec3, voxel: Voxel, from: u64, to: u64) {
@@ -1976,7 +1976,7 @@ mod tests {
 
         sim.destroyed(ground, voxel_world::STONE, None);
         assert_eq!(sim.drops.len(), 1);
-        assert_eq!(sim.drops[0].snapshot.item, voxel_world::STONE);
+        assert_eq!(sim.drops[0].snapshot.item, u32::from(voxel_world::STONE));
         assert_eq!(
             sim.drops[0].snapshot.position,
             ground.as_vec3() + Vec3::splat(0.5)
@@ -2007,7 +2007,7 @@ mod tests {
         sim.players.insert(1, player);
         sim.collect_drops();
         assert!(sim.drops.is_empty());
-        assert_eq!(sim.players[&1].inventory.count(voxel_world::STONE), 1);
+        assert_eq!(sim.players[&1].inventory.count(u32::from(voxel_world::STONE)), 1);
         assert!(sim.players[&1].inventory_dirty);
         put_resources(&mut app, world, sim);
     }
@@ -2017,7 +2017,7 @@ mod tests {
         let mut app = headless_app(1);
         let (_world, mut sim) = take_resources(&mut app);
         for (item, count, position) in [
-            (0_u8, 1_u32, Vec3::ZERO),
+            (0_u32, 1_u32, Vec3::ZERO),
             (10, 1, Vec3::ZERO),
             (3, 0, Vec3::ZERO),
             (3, 1, Vec3::new(f32::NAN, 0.0, 0.0)),
@@ -2026,7 +2026,7 @@ mod tests {
         }
         assert!(sim.drops.is_empty());
         for _ in 0..protocol::MAX_DROPS + 5 {
-            sim.spawn_drop(Vec3::ZERO, voxel_world::STONE, 1);
+            sim.spawn_drop(Vec3::ZERO, u32::from(voxel_world::STONE), 1);
         }
         assert_eq!(sim.drops.len(), protocol::MAX_DROPS);
         assert!(
@@ -2048,9 +2048,9 @@ mod tests {
 
         let mut player = Player::new();
         player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
-        player.inventory.add(voxel_world::STONE, 1_000_000);
+        player.inventory.add(u32::from(voxel_world::STONE), 1_000_000);
         sim.players.insert(1, player);
-        sim.spawn_drop(ground.as_vec3() + Vec3::splat(0.5), voxel_world::STONE, 3);
+        sim.spawn_drop(ground.as_vec3() + Vec3::splat(0.5), u32::from(voxel_world::STONE), 3);
         for _ in 0..40 {
             sim.advance_drops(&world);
         }
@@ -2058,7 +2058,7 @@ mod tests {
         // Uncapped stacks take the whole drop; nothing is left behind.
         assert!(sim.drops.is_empty());
         assert_eq!(
-            sim.players[&1].inventory.count(voxel_world::STONE),
+            sim.players[&1].inventory.count(u32::from(voxel_world::STONE)),
             1_000_003
         );
         assert!(sim.players[&1].inventory_dirty);

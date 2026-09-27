@@ -144,7 +144,7 @@ impl Simulation {
             return false;
         };
         self.cancel_player_strikes(id);
-        let loadout: Vec<(u8, u32)> = self.packages.melee_table().spawn_items().to_vec();
+        let loadout: Vec<(u32, u32)> = self.packages.melee_table().spawn_items().to_vec();
         let player = self.players.get_mut(&id).expect("respawn checked player");
         player.state.position = position;
         player.state.velocity = Vec3::ZERO;
@@ -235,7 +235,7 @@ mod tests {
 
         assert!(sim.players[&1].inventory.is_empty());
         assert!(sim.players[&1].inventory_dirty);
-        let dropped: Vec<(u8, u32)> = sim
+        let dropped: Vec<(u32, u32)> = sim
             .drops
             .iter()
             .map(|drop| (drop.snapshot.item, drop.snapshot.count))
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(sim.players[&1].life, 1);
         assert_eq!(sim.player_health(1), Some(Health::default()));
         // The package loadout is re-granted after death scattered the old gear.
-        for item in [7u8, 8, 9] {
+        for item in [7u32, 8, 9] {
             assert_eq!(sim.players[&1].inventory.count(item), 1);
         }
         let player = &sim.players[&1];

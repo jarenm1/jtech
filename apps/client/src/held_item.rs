@@ -14,7 +14,7 @@ struct HeldItem;
 pub(crate) struct HeldState {
     entity: Option<Entity>,
     /// Item the current entity renders; respawn on change.
-    item: u8,
+    item: u32,
     /// The spawned entity renders the package model, not the cube fallback.
     model_loaded: bool,
     cube: Option<Handle<Mesh>>,
@@ -95,8 +95,8 @@ pub(crate) fn update(
                     .clone();
                 let [r, g, b, _] = if item == EXPLOSIVE_BOW_ITEM {
                     [0.45, 0.3, 0.15, 1.0]
-                } else if (1..=voxel_world::WOOD).contains(&item) {
-                    voxel_world::block_color(item)
+                } else if item <= u32::from(voxel_world::WOOD) && item >= 1 {
+                    voxel_world::block_color(item as u8)
                 } else {
                     [0.55, 0.55, 0.6, 1.0]
                 };

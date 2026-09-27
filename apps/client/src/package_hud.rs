@@ -46,7 +46,7 @@ impl ServerPackages {
 
     /// Swing reach for the held item; unarmed reach when the item is not a
     /// replicated weapon.
-    pub fn melee_range(&self, item: u8) -> f32 {
+    pub fn melee_range(&self, item: u32) -> f32 {
         self.melee_weapons
             .iter()
             .find(|weapon| weapon.item == item)
@@ -56,7 +56,7 @@ impl ServerPackages {
     }
 
     /// Authored display name for a replicated weapon item.
-    pub fn melee_name(&self, item: u8) -> Option<&str> {
+    pub fn melee_name(&self, item: u32) -> Option<&str> {
         self.melee_weapons
             .iter()
             .find(|weapon| weapon.item == item)
@@ -64,7 +64,7 @@ impl ServerPackages {
     }
 
     /// Unique non-stacking items (weapons); everything else is a stack.
-    pub fn is_equipment(&self, item: u8) -> bool {
+    pub fn is_equipment(&self, item: u32) -> bool {
         self.melee_weapons
             .iter()
             .any(|weapon| weapon.item == item && weapon.kind == protocol::ItemKind::Equipment)

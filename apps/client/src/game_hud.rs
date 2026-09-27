@@ -353,38 +353,40 @@ pub(crate) fn update(
 
 /// Display name for an item id; replicated weapon names win, unknown ids read
 /// as a numbered unknown.
-pub(crate) fn item_name(session: &ClientSession, item: u8) -> String {
+pub(crate) fn item_name(session: &ClientSession, item: u32) -> String {
     if let Some(name) = session.packages.melee_name(item) {
         return name.to_string();
     }
-    match item {
-        voxel_world::GRASS => "Grass".into(),
-        voxel_world::DIRT => "Dirt".into(),
-        voxel_world::STONE => "Stone".into(),
-        voxel_world::SAND => "Sand".into(),
-        voxel_world::WOOD => "Wood".into(),
-        EXPLOSIVE_BOW_ITEM => "Explosive Bow".into(),
-        other => format!("Item {other}"),
+    if item == EXPLOSIVE_BOW_ITEM {
+        return "Explosive Bow".into();
+    }
+    match u8::try_from(item) {
+        Ok(voxel_world::GRASS) => "Grass".into(),
+        Ok(voxel_world::DIRT) => "Dirt".into(),
+        Ok(voxel_world::STONE) => "Stone".into(),
+        Ok(voxel_world::SAND) => "Sand".into(),
+        Ok(voxel_world::WOOD) => "Wood".into(),
+        _ => format!("Item {item}"),
     }
 }
 /// Empty stacks keep their material hue at low alpha so the tile reads as spent.
-fn item_swatch(item: u8, empty: bool) -> Color {
+fn item_swatch(item: u32, empty: bool) -> Color {
     let color = item_color(item);
     if empty { color.with_alpha(0.25) } else { color }
 }
 
 /// Base swatch color for an item id.
-pub(crate) fn item_color(item: u8) -> Color {
-    match item {
-        voxel_world::GRASS => Color::srgb(0.36, 0.60, 0.26),
-        voxel_world::DIRT => Color::srgb(0.45, 0.30, 0.19),
-        voxel_world::STONE => Color::srgb(0.55, 0.56, 0.58),
-        voxel_world::SAND => Color::srgb(0.82, 0.73, 0.48),
-        voxel_world::WOOD => Color::srgb(0.55, 0.38, 0.21),
+pub(crate) fn item_color(item: u32) -> Color {
+    match u8::try_from(item) {
+        Ok(voxel_world::GRASS) => Color::srgb(0.36, 0.60, 0.26),
+        Ok(voxel_world::DIRT) => Color::srgb(0.45, 0.30, 0.19),
+        Ok(voxel_world::STONE) => Color::srgb(0.55, 0.56, 0.58),
+        Ok(voxel_world::SAND) => Color::srgb(0.82, 0.73, 0.48),
+        Ok(voxel_world::WOOD) => Color::srgb(0.55, 0.38, 0.21),
         // Melee weapons: cool steel hues distinct from terrain materials.
-        7 => Color::srgb(0.70, 0.72, 0.78),
-        8 => Color::srgb(0.48, 0.42, 0.55),
-        9 => Color::srgb(0.60, 0.55, 0.40),
+        Ok(7) => Color::srgb(0.70, 0.72, 0.78),
+        Ok(8) => Color::srgb(0.48, 0.42, 0.55),
+        Ok(9) => Color::srgb(0.60, 0.55, 0.40),
         _ => palette::AMBER,
     }
 }

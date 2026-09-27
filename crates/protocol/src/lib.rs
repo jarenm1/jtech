@@ -7,7 +7,7 @@ use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -16,8 +16,10 @@ pub const MAX_ARROWS: usize = 32;
 /// Ceiling for one complete dropped-item replication, matching the server bound.
 pub const MAX_DROPS: usize = 64;
 /// Item id of the package-loaded explosive bow. It is not a carried stack:
-/// every client may hotbar it regardless of inventory contents.
-pub const EXPLOSIVE_BOW_ITEM: u8 = 6;
+/// every client may hotbar it regardless of inventory contents. Item ids are
+/// u32: ids 0–5 are hands and block materials, the bow claims 6, and packages
+/// share the wide namespace above it.
+pub const EXPLOSIVE_BOW_ITEM: u32 = 6;
 pub const EXPLOSIVE_BOW_SHOTS_PER_SECOND: u32 = 25;
 /// Horizontal chunk radius shared by server configuration and client camera bounds.
 pub const DEFAULT_VIEW_RADIUS: i32 = 16;
@@ -227,7 +229,7 @@ pub enum ItemKind {
 /// parameters used for crosshair routing and future combat UI.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MeleeWeaponInfo {
-    pub item: u8,
+    pub item: u32,
     /// Package that authored this weapon; namespaces its asset paths.
     pub package: String,
     pub name: String,
@@ -268,7 +270,7 @@ pub struct ArrowSnapshot {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DropSnapshot {
     pub id: u32,
-    pub item: u8,
+    pub item: u32,
     pub count: u32,
     pub position: Vec3,
 }
@@ -521,11 +523,11 @@ mod tests {
     fn inventory_decode_rejects_malformed_stacks() {
         // Item 0 and zero counts are not valid inventories; duplicate ids are
         // legal because equipment occupies one entry per instance.
-        for entries in [vec![(0_u8, 5_u32)], vec![(3, 0)]] {
+        for entries in [vec![(0_u32, 5_u32)], vec![(3, 0)]] {
             let bytes = encode(&entries, MAX_FRAME).unwrap();
             assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_err());
         }
-        let bytes = encode(&vec![(3_u8, 5_u32), (7, 1), (7, 1)], MAX_FRAME).unwrap();
+        let bytes = encode(&vec![(3_u32, 5_u32), (7, 1), (7, 1)], MAX_FRAME).unwrap();
         assert!(decode::<Inventory>(&bytes, MAX_FRAME).is_ok());
     }
 

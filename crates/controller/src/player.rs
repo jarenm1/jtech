@@ -20,7 +20,7 @@ pub struct PlayerInput {
     /// One-tick melee request; the redundant input tail makes the edge reliable.
     pub attack: bool,
     /// Held item id; the server maps it to melee specs.
-    pub selected: u8,
+    pub selected: u32,
 }
 
 #[path = "noclip.rs"]

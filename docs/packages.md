@@ -106,8 +106,8 @@ server uses the same existing projectile/explosion messages for presentation.
 | `weapons` | List of `(melee-weapon id name range damage cooldown-ticks knockback [model])` |
 | `spawn-items` | Optional list of `(id count)` pairs granted on spawn and respawn |
 
-`melee-weapon` is a host-provided constructor. `id` is an integer above 6 and
-unique across loaded packages; `name` is a display string replicated to
+`melee-weapon` is a host-provided constructor. `id` is an integer above 6 up to
+2³²−1 and unique across loaded packages; `name` is a display string replicated to
 clients; `range` is metres 0.1–16; `damage` is whole health points 1–65535;
 `cooldown-ticks` is fixed60 ticks 0–600; `knockback` is kg·m/s 0–10000.
 Head-zone hits double damage; unarmed hands stay the fallback for unregistered
