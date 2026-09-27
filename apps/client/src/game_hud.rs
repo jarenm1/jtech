@@ -10,11 +10,9 @@ use bevy::{
     prelude::*,
     text::LineBreak,
 };
-use protocol::EXPLOSIVE_BOW_ITEM;
+use crate::{ClientSession, package_hud::ServerPackages};
 
-use crate::ClientSession;
-
-/// Marks top-level gameplay HUD nodes (game, health and bow widgets) so the
+/// Marks top-level gameplay HUD nodes (game, health and launcher widgets) so the
 /// menu can hide them with a single query. The package panel deliberately
 /// omits this marker.
 #[derive(Component)]
@@ -311,7 +309,7 @@ pub(crate) fn update(
     }
     **selected_label = Text::new(item_name(&session, session.held_item()));
     for (slot, mut text) in &mut counts {
-        // Equipment and the bow are not stacks; their tiles show no count.
+        // Equipment is not a stack; its tile shows no count.
         let item = session.hotbar[slot.index()];
         let stack = item.is_some_and(|item| !session.packages.is_equipment(item));
         let count = if stack {
@@ -328,8 +326,12 @@ pub(crate) fn update(
     for (swatch, mut color) in &mut swatches {
         color.0 = match session.hotbar[swatch.index()] {
             // Equipment is always usable; only stacks dim when spent.
-            Some(item) if session.packages.is_equipment(item) => item_swatch(item, false),
-            Some(item) => item_swatch(item, session.inventory.count(item) == 0),
+            Some(item) if session.packages.is_equipment(item) => {
+                item_swatch(&session.packages, item, false)
+            }
+            Some(item) => {
+                item_swatch(&session.packages, item, session.inventory.count(item) == 0)
+            }
             None => palette::SLOT,
         };
     }
@@ -357,8 +359,8 @@ pub(crate) fn item_name(session: &ClientSession, item: u32) -> String {
     if let Some(name) = session.packages.melee_name(item) {
         return name.to_string();
     }
-    if item == EXPLOSIVE_BOW_ITEM {
-        return "Explosive Bow".into();
+    if let Some(name) = session.packages.launcher_name(item) {
+        return name.to_string();
     }
     match u8::try_from(item) {
         Ok(voxel_world::GRASS) => "Grass".into(),
@@ -370,8 +372,12 @@ pub(crate) fn item_name(session: &ClientSession, item: u32) -> String {
     }
 }
 /// Empty stacks keep their material hue at low alpha so the tile reads as spent.
-fn item_swatch(item: u32, empty: bool) -> Color {
-    let color = item_color(item);
+fn item_swatch(packages: &ServerPackages, item: u32, empty: bool) -> Color {
+    let color = if packages.is_launcher(item) {
+        Color::srgb(0.45, 0.30, 0.15)
+    } else {
+        item_color(item)
+    };
     if empty { color.with_alpha(0.25) } else { color }
 }
 

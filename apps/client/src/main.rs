@@ -1,11 +1,11 @@
 use controller::PlayerInput;
-mod bow_power_hud;
 mod death_overlay;
 mod drops;
 mod game_hud;
 mod health_hud;
 mod held_item;
 mod inventory_ui;
+mod launcher_hud;
 mod lighting;
 mod loose_blocks;
 mod package_hud;
@@ -29,8 +29,7 @@ use bevy::{
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerState, look_direction};
 use protocol::{
-    BowPower, ClientMessage, EXPLOSIVE_BOW_ITEM, EditRejection, Health, InputPacket, Inventory,
-    ServerMessage, Snapshot,
+    ClientMessage, EditRejection, Health, InputPacket, Inventory, ServerMessage, Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{
@@ -148,7 +147,8 @@ struct ClientSession {
     selected: u8,
     /// Item id assigned to each hotbar slot; `None` is an empty slot.
     hotbar: [Option<u32>; 10],
-    bow_power: BowPower,
+    /// Power preset index into the held launcher's authored `powers` list.
+    launch_power: u8,
     packages: package_hud::ServerPackages,
     request: u64,
     accepted_edits: u64,
@@ -211,12 +211,8 @@ impl Default for ClientSession {
             pitch: -0.25,
             correction: Vec3::ZERO,
             selected: 6,
-            hotbar: {
-                let mut hotbar = [None; 10];
-                hotbar[5] = Some(EXPLOSIVE_BOW_ITEM);
-                hotbar
-            },
-            bow_power: BowPower::default(),
+            hotbar: [None; 10],
+            launch_power: 0,
             packages: package_hud::ServerPackages::default(),
             request: 0,
             accepted_edits: 0,
@@ -242,6 +238,18 @@ impl ClientSession {
             .copied()
             .flatten()
             .unwrap_or(0)
+    }
+
+    /// Advance the power preset of the held launcher; a no-op for any other
+    /// item or a launcher with an empty authored `powers` list.
+    fn cycle_launch_power(&mut self) {
+        let Some(launcher) = self.packages.launcher(self.held_item()) else {
+            return;
+        };
+        let count = launcher.powers.len().min(usize::from(u8::MAX) + 1);
+        if count > 0 {
+            self.launch_power = ((u32::from(self.launch_power) + 1) % count as u32) as u8;
+        }
     }
 
     fn capture_jump(&mut self, enabled: bool, pressed: bool) {
@@ -409,7 +417,7 @@ impl Plugin for ClientPlugin {
                     death_overlay::sync,
                     pause_menu::sync_cursor,
                     controls,
-                    bow_power_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
+                    launcher_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
                     predict,
                     edit_blocks,
                     held_item::update,
@@ -417,7 +425,7 @@ impl Plugin for ClientPlugin {
                     game_hud::update,
                     game_hud::update_fps,
                     health_hud::update,
-                    bow_power_hud::update,
+                    launcher_hud::update,
                     package_hud::update,
                     scatter::sync_scatter,
                 )
@@ -533,7 +541,7 @@ fn setup(
     pause_menu::spawn(&mut commands);
     death_overlay::spawn(&mut commands, &mut images);
     health_hud::spawn(&mut commands);
-    bow_power_hud::spawn(&mut commands);
+    launcher_hud::spawn(&mut commands);
     package_hud::spawn(&mut commands);
 }
 
@@ -678,10 +686,10 @@ fn receive_network(
             ServerMessage::Physics { tick, bodies } => {
                 loose.receive(tick, &bodies, &mut commands, &loose_assets);
             }
-            ServerMessage::Projectiles { tick, arrows } => {
+            ServerMessage::Projectiles { tick, projectiles: snapshots } => {
                 projectiles.receive(
                     tick,
-                    &arrows,
+                    &snapshots,
                     &mut commands,
                     &projectile_assets,
                     Instant::now(),
@@ -704,13 +712,33 @@ fn receive_network(
             ServerMessage::Packages {
                 revision,
                 packages,
-                bow_shots_per_second,
+                launchers,
                 melee_weapons,
                 assets,
             } => {
                 session
                     .packages
-                    .receive(revision, packages, bow_shots_per_second, melee_weapons);
+                    .receive(revision, packages, launchers, melee_weapons);
+                // Launcher items are replicated, not hardcoded: the first one
+                // takes the slot the bow used to occupy when nothing else does.
+                if !session
+                    .hotbar
+                    .iter()
+                    .flatten()
+                    .any(|item| session.packages.is_launcher(*item))
+                    && session.hotbar[5].is_none()
+                    && let Some(launcher) = session.packages.launchers.first()
+                {
+                    session.hotbar[5] = Some(launcher.item);
+                }
+                let power_limit = session
+                    .packages
+                    .launcher(session.held_item())
+                    .or_else(|| session.packages.launchers.first())
+                    .map_or(0, |launcher| launcher.powers.len());
+                session.launch_power = session.launch_power.min(
+                    u8::try_from(power_limit.saturating_sub(1)).unwrap_or(u8::MAX),
+                );
                 for request in package_assets.sync(assets) {
                     session.send(request);
                 }
@@ -921,9 +949,7 @@ fn controls(
     }
     session.selected = selected_slot(&keys).unwrap_or(session.selected);
     if !options.bot && !cursor.visible && keys.just_pressed(KeyCode::KeyR) {
-        if session.held_item() == EXPLOSIVE_BOW_ITEM {
-            session.bow_power = session.bow_power.next();
-        }
+        session.cycle_launch_power();
     }
 }
 
@@ -1061,7 +1087,7 @@ fn edit_blocks(
     actors: Res<RemoteActors>,
     remotes: Res<RemotePlayers>,
     time: Res<Time>,
-    mut bow_repeat: Local<BowRepeat>,
+    mut fire_repeat: Local<FireRepeat>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
     if menu.blocks_gameplay()
@@ -1070,7 +1096,7 @@ fn edit_blocks(
         || session.id.is_none()
         || session.health.is_depleted()
     {
-        *bow_repeat = BowRepeat::default();
+        *fire_repeat = FireRepeat::default();
         return;
     }
     let strike = keys.just_pressed(KeyCode::KeyF);
@@ -1089,17 +1115,22 @@ fn edit_blocks(
         session.swing_at = Some(Instant::now());
     }
     let hit = buttons.just_pressed(MouseButton::Left) && !melee;
-    let bow_shot = repeat_bow(
-        &mut bow_repeat,
+    let launcher_shot = repeat_fire(
+        &mut fire_repeat,
         time.elapsed_secs_f64(),
-        session.held_item() == EXPLOSIVE_BOW_ITEM
+        session.packages.is_launcher(session.held_item())
             && buttons.pressed(MouseButton::Right)
             && !strike
             && !hit,
-        session.packages.bow_shots_per_second,
+        // A launcher with no authored powers is unshootable: rate 0.
+        session
+            .packages
+            .launcher(session.held_item())
+            .filter(|launcher| !launcher.powers.is_empty())
+            .map_or(0, |launcher| launcher.shots_per_second),
     );
-    let secondary = if session.held_item() == EXPLOSIVE_BOW_ITEM {
-        bow_shot
+    let secondary = if session.packages.is_launcher(session.held_item()) {
+        launcher_shot
     } else {
         buttons.just_pressed(MouseButton::Right)
     };
@@ -1142,13 +1173,13 @@ fn melee_target(
 }
 
 #[derive(Default)]
-struct BowRepeat {
+struct FireRepeat {
     next: Option<f64>,
     rate: u32,
 }
 
 /// Repeat while held, preserving fractional-frame cadence without catch-up bursts.
-fn repeat_bow(repeat: &mut BowRepeat, now: f64, held: bool, rate: u32) -> bool {
+fn repeat_fire(repeat: &mut FireRepeat, now: f64, held: bool, rate: u32) -> bool {
     if repeat.rate != rate {
         repeat.next = None;
         repeat.rate = rate;
@@ -1177,14 +1208,15 @@ fn block_action(
     hit: bool,
     secondary: bool,
 ) -> Option<ClientMessage> {
-    // Bow shots do not need a nearby grid target. The server owns the arrow origin.
-    if !strike && !hit && secondary && session.held_item() == EXPLOSIVE_BOW_ITEM {
+    // Launcher shots do not need a nearby grid target. The server owns the origin.
+    if !strike && !hit && secondary && session.packages.is_launcher(session.held_item()) {
         session.request += 1;
-        return Some(ClientMessage::FireBow {
+        return Some(ClientMessage::FireLauncher {
             request: session.request,
+            item: session.held_item(),
             yaw: session.yaw,
             pitch: session.pitch,
-            power: session.bow_power,
+            power: session.launch_power,
         });
     }
     if !strike && !hit {

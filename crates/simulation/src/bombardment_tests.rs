@@ -75,11 +75,11 @@ fn simultaneous_remote_blasts_release_and_move_supported_terrain() {
             sim.detonations.push_back((
                 id as u32,
                 base.as_vec3() + Vec3::new(6.5, 10.02, 6.5),
-                crate::packages::test_blast(protocol::BowPower::Standard),
+                crate::packages::test_blast(1),
                 None,
             ));
         }
-        sim.advance_bow(world);
+        sim.advance_launchers(world);
         assert_eq!(sim.metrics.explosions, 2);
         let initial = sim.physics.as_ref().unwrap().snapshots();
         // Each detonation carves one crater and launches one debris body.
@@ -134,11 +134,11 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
             sim.detonations.push_back((
                 id as u32,
                 cell.as_vec3() + Vec3::splat(0.5) - Vec3::X * 1.0,
-                crate::packages::test_blast(protocol::BowPower::Standard),
+                crate::packages::test_blast(1),
                 None,
             ));
         }
-        sim.advance_bow(world);
+        sim.advance_launchers(world);
         let initial = sim.physics.as_ref().unwrap().snapshots();
         // One debris body per detonation, spawned undamaged.
         assert_eq!(initial.len(), 2);
@@ -152,10 +152,10 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
         sim.detonations.push_back((
             2,
             initial[1].position + Vec3::Z * 2.75,
-            crate::packages::test_blast(protocol::BowPower::Standard),
+            crate::packages::test_blast(1),
             None,
         ));
-        sim.advance_bow(world);
+        sim.advance_launchers(world);
         assert_eq!(sim.detonations.len(), 1);
         assert_eq!(sim.metrics.explosions, 2);
         assert_eq!(
@@ -165,7 +165,7 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
         complete(sim, world);
         let moving = sim.physics.as_ref().unwrap().snapshots();
         assert!(moving.iter().all(|body| body.velocity.length() > 0.1));
-        sim.advance_bow(world);
+        sim.advance_launchers(world);
         assert!(sim.detonations.is_empty());
         let damaged = sim.physics.as_ref().unwrap().body_damage(survivor);
         assert!(damaged > initial_damage);
@@ -175,10 +175,10 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
         sim.detonations.push_back((
             3,
             victim.position,
-            crate::packages::test_blast(protocol::BowPower::Standard),
+            crate::packages::test_blast(1),
             None,
         ));
-        sim.advance_bow(world);
+        sim.advance_launchers(world);
         assert_eq!(sim.metrics.destroyed_blocks, 1);
         let remaining = sim.physics.as_ref().unwrap().snapshots();
         assert_eq!(remaining.len(), 1);
@@ -198,16 +198,16 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
         sim.detonations.push_back((
             4,
             body.position,
-            crate::packages::test_blast(protocol::BowPower::Standard),
+            crate::packages::test_blast(1),
             None,
         ));
         sim.detonations.push_back((
             5,
             body.position,
-            crate::packages::test_blast(protocol::BowPower::Standard),
+            crate::packages::test_blast(1),
             None,
         ));
-        sim.advance_bow(world);
+        sim.advance_launchers(world);
         assert!(sim.physics.as_ref().unwrap().snapshots().is_empty());
         assert_eq!(sim.metrics.destroyed_blocks, 2);
         sim.observe_physics(world);

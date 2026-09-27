@@ -1,8 +1,7 @@
 //! Blast jumps through the ordinary server movement, projectile and GPU schedules.
 use super::*;
-use protocol::BowPower;
 
-fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
+fn ground_shot(gpu: bool, power: u8, pitch: f32) -> f32 {
     let mut app = App::new();
     app.add_plugins(
         SimulationPlugin::headless(ServerConfig {
@@ -27,8 +26,8 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
     {
         let mut sim = app.world_mut().resource_mut::<Simulation>();
         sim.players.insert(1, player);
-        sim.fire_bow(&world, 1, 1, 0.0, pitch, power);
-        assert_eq!(sim.metrics.bow_shots, 1);
+        sim.fire_launcher(&world, 1, 1, 6, 0.0, pitch, power);
+        assert_eq!(sim.metrics.launches, 1);
     }
     app.insert_resource(world);
     let mut peak = 10.0_f32;
@@ -66,10 +65,10 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
 #[test]
 fn ground_shots_have_visible_lift_through_server_ticks() {
     for (power, minimum_rise) in [
-        (BowPower::Low, [1.3, 0.7, 0.08]),
-        (BowPower::Standard, [3.5, 2.0, 0.4]),
-        (BowPower::High, [8.0, 5.0, 1.0]),
-        (BowPower::Extreme, [18.0, 11.0, 3.0]),
+        (0, [1.3, 0.7, 0.08]),
+        (1, [3.5, 2.0, 0.4]),
+        (2, [8.0, 5.0, 1.0]),
+        (3, [18.0, 11.0, 3.0]),
     ] {
         for (pitch, minimum) in [-1.54, -1.2, -0.8].into_iter().zip(minimum_rise) {
             let rise = ground_shot(false, power, pitch);
@@ -85,7 +84,7 @@ fn ground_shots_have_visible_lift_through_server_ticks() {
 #[ignore = "requires a headless GPU adapter"]
 fn ground_shots_have_visible_lift_with_gpu_debris() {
     let _guard = physics_slice::GPU_TEST_LOCK.lock().unwrap();
-    for (power, minimum) in [(BowPower::Standard, 2.0), (BowPower::Extreme, 11.0)] {
+    for (power, minimum) in [(1, 2.0), (3, 11.0)] {
         let rise = ground_shot(true, power, -1.2);
         assert!(rise > minimum, "{power:?}: rise={rise}, minimum={minimum}");
     }

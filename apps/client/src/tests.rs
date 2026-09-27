@@ -402,8 +402,34 @@ fn delayed_launch_result_does_not_replace_newer_hit_feedback() {
     assert_eq!(client.rejected_edits, 1);
 }
 
+fn launcher() -> protocol::LauncherInfo {
+    protocol::LauncherInfo {
+        item: protocol::FIRST_PACKAGE_ITEM,
+        package: "explosive-bow".into(),
+        name: "Explosive Bow".into(),
+        powers: vec![
+            "Low".into(),
+            "Standard".into(),
+            "High".into(),
+            "Extreme".into(),
+        ],
+        shots_per_second: 25,
+    }
+}
+
+/// Session holding a replicated launcher in slot 6.
+fn launcher_session() -> ClientSession {
+    let mut client = ClientSession {
+        selected: 6,
+        ..default()
+    };
+    client.packages.launchers = vec![launcher()];
+    client.hotbar[5] = Some(protocol::FIRST_PACKAGE_ITEM);
+    client
+}
+
 #[test]
-fn bow_slot_selection_and_untargeted_shot_routing() {
+fn launcher_slot_selection_and_untargeted_shot_routing() {
     let mut keys = ButtonInput::<KeyCode>::default();
     keys.press(KeyCode::Digit6);
     assert_eq!(selected_slot(&keys), Some(6));
@@ -411,17 +437,18 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
         selected: selected_slot(&keys).unwrap(),
         yaw: 0.75,
         pitch: 1.0,
-        ..default()
+        ..launcher_session()
     };
-    // Empty/unloaded terrain and sky aiming must not suppress bow shots.
+    // Empty/unloaded terrain and sky aiming must not suppress launcher shots.
     let world = VoxelWorld::default();
     assert!(matches!(
         block_action(&mut client, &world, false, false, true),
-        Some(ClientMessage::FireBow {
+        Some(ClientMessage::FireLauncher {
             request: 1,
+            item: protocol::FIRST_PACKAGE_ITEM,
             yaw: 0.75,
             pitch: 1.0,
-            power: BowPower::Standard,
+            power: 0,
         })
     ));
     assert!(block_action(&mut client, &world, false, false, false).is_none());
@@ -434,32 +461,21 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
 }
 
 #[test]
-fn bow_requests_copy_each_selected_power() {
-    let mut client = ClientSession {
-        selected: 6,
-        ..default()
-    };
+fn launcher_requests_copy_each_selected_power() {
+    let mut client = launcher_session();
     let world = VoxelWorld::default();
-    for (index, power) in [
-        BowPower::Low,
-        BowPower::Standard,
-        BowPower::High,
-        BowPower::Extreme,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        client.bow_power = power;
+    for index in 0u8..4 {
+        client.launch_power = index;
         assert!(matches!(
             block_action(&mut client, &world, false, false, true),
-            Some(ClientMessage::FireBow { power: sent, request, .. })
-                if sent == power && request == index as u64 + 1
+            Some(ClientMessage::FireLauncher { power: sent, request, .. })
+                if sent == index && request == u64::from(index) + 1
         ));
     }
 }
 
 #[test]
-fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
+fn launch_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
     let mut app = App::new();
     app.insert_resource(Options {
         server: "127.0.0.1:4000".parse().unwrap(),
@@ -468,10 +484,7 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
         screenshot: None,
         lighting: lighting::DayCycle::default(),
     })
-    .insert_resource(ClientSession {
-        selected: 6,
-        ..default()
-    })
+    .insert_resource(launcher_session())
     .init_resource::<ButtonInput<KeyCode>>()
     .init_resource::<AccumulatedMouseMotion>()
     .init_resource::<pause_menu::PauseMenu>()
@@ -485,25 +498,26 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
         })
         .id();
     assert_eq!(
-        app.world().resource::<ClientSession>().bow_power,
-        BowPower::Standard
+        app.world().resource::<ClientSession>().launch_power,
+        0
     );
-    for expected in [
-        BowPower::High,
-        BowPower::Extreme,
-        BowPower::Low,
-        BowPower::Standard,
-    ] {
+    for expected in [1u8, 2, 3, 0] {
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::KeyR);
         app.update();
-        assert_eq!(app.world().resource::<ClientSession>().bow_power, expected);
+        assert_eq!(
+            app.world().resource::<ClientSession>().launch_power,
+            expected
+        );
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .clear();
         app.update();
-        assert_eq!(app.world().resource::<ClientSession>().bow_power, expected);
+        assert_eq!(
+            app.world().resource::<ClientSession>().launch_power,
+            expected
+        );
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .reset_all();
@@ -514,8 +528,8 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
             .press(key);
         app.update();
         assert_eq!(
-            app.world().resource::<ClientSession>().bow_power,
-            BowPower::Standard
+            app.world().resource::<ClientSession>().launch_power,
+            0
         );
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -531,8 +545,8 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
         .press(KeyCode::KeyR);
     app.update();
     assert_eq!(
-        app.world().resource::<ClientSession>().bow_power,
-        BowPower::Standard
+        app.world().resource::<ClientSession>().launch_power,
+        0
     );
     app.world_mut()
         .entity_mut(cursor)
@@ -542,13 +556,13 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
     app.world_mut().resource_mut::<ClientSession>().selected = 3;
     app.update();
     assert_eq!(
-        app.world().resource::<ClientSession>().bow_power,
-        BowPower::Standard
+        app.world().resource::<ClientSession>().launch_power,
+        0
     );
 }
 
 #[test]
-fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
+fn held_item_hits_and_debug_launches_use_grid_actions() {
     let mut client = ClientSession {
         selected: 6,
         pitch: -1.0,
@@ -573,17 +587,18 @@ fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
         assert!(block_action(&mut client, &world, false, false, true).is_none());
     }
 }
+
 #[test]
-fn bow_cadence_changes_immediately_and_zero_rate_disables_firing() {
-    let mut repeat = BowRepeat::default();
-    assert!(repeat_bow(&mut repeat, 0.0, true, 1));
-    assert!(repeat_bow(&mut repeat, 0.1, true, 10));
-    assert!(!repeat_bow(&mut repeat, 0.11, true, 10));
-    assert!(repeat_bow(&mut repeat, 0.2, true, 10));
-    assert!(!repeat_bow(&mut repeat, 0.3, true, 0));
+fn fire_cadence_changes_immediately_and_zero_rate_disables_firing() {
+    let mut repeat = FireRepeat::default();
+    assert!(repeat_fire(&mut repeat, 0.0, true, 1));
+    assert!(repeat_fire(&mut repeat, 0.1, true, 10));
+    assert!(!repeat_fire(&mut repeat, 0.11, true, 10));
+    assert!(repeat_fire(&mut repeat, 0.2, true, 10));
+    assert!(!repeat_fire(&mut repeat, 0.3, true, 0));
     assert_eq!(repeat.next, None);
-    assert!(!repeat_bow(&mut repeat, 1.0, true, 0));
-    assert!(repeat_bow(&mut repeat, 1.1, true, 25));
+    assert!(!repeat_fire(&mut repeat, 1.0, true, 0));
+    assert!(repeat_fire(&mut repeat, 1.1, true, 25));
 }
 
 #[test]

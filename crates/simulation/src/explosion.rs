@@ -4,8 +4,7 @@ use game_packages::BlastSpec;
 use glam::{IVec3, Vec3};
 use gpu_physics::{TerrainContact, material};
 use physics::{PLAYER_HEIGHT, PLAYER_MASS, PlayerState};
-#[cfg(test)]
-use protocol::BowPower;
+
 use protocol::PhysicsBodySnapshot;
 use voxel_world::{CHUNK_SIZE, MIN_CHUNK_Y, VoxelWorld};
 
@@ -53,7 +52,7 @@ pub(super) fn plan(
     bodies: &[PhysicsBodySnapshot],
     players: &[(u64, PlayerState)],
     center: Vec3,
-    power: BowPower,
+    power: u8,
 ) -> Vec<BlastLoad> {
     plan_blast(
         world,
@@ -110,7 +109,7 @@ pub(super) fn plan_blast(
         let direction = offset.try_normalize().unwrap_or(Vec3::Y);
         // Trace to exposed faces, not the cube center: at a wall impact a
         // center ray would enter the struck voxel before reaching its neighbors.
-        // A moving body can overlap the arrow between completed observations.
+        // A moving body can overlap the projectile between completed observations.
         let contains_blast = offset.abs().cmple(Vec3::splat(0.5)).all();
         let mut surface_normal = Vec3::ZERO;
         for axis in 0..3 {
@@ -131,7 +130,7 @@ pub(super) fn plan_blast(
             if terrain_clear
                 && !bodies.iter().any(|body| {
                     target != Target::Body(body.id)
-                        && super::bow::ray_cube(center, aim, body.position, reach).is_some()
+                        && super::projectile::ray_cube(center, aim, body.position, reach).is_some()
                 })
             {
                 surface_normal += normal * offset[axis].abs();
@@ -240,7 +239,7 @@ fn player_ray_clear(
     world.raycast(center, aim, reach).is_none()
         && !bodies
             .iter()
-            .any(|body| super::bow::ray_cube(center, aim, body.position, reach).is_some())
+            .any(|body| super::projectile::ray_cube(center, aim, body.position, reach).is_some())
 }
 #[cfg(test)]
 mod tests {
@@ -272,7 +271,7 @@ mod tests {
                 &[],
                 &[],
                 Vec3::new(6.5, 10.02, 6.5),
-                BowPower::Standard,
+                1,
             );
             let mut destroyed = 0;
             let mut released = 0;
@@ -298,7 +297,7 @@ mod tests {
                 .iter()
                 .map(|load| load.contact.dissipated_energy + load.kinetic_energy)
                 .sum();
-            assert!(total <= crate::packages::test_blast(BowPower::Standard).energy + 0.01);
+            assert!(total <= crate::packages::test_blast(1).energy + 0.01);
             outcomes.push((mat, destroyed, released));
         }
         eprintln!("surface blast (material, destroyed, released): {outcomes:?}");
@@ -324,7 +323,7 @@ mod tests {
             &[],
             &[],
             Vec3::new(5.98, 4.5, 4.5),
-            BowPower::Standard,
+            1,
         );
         assert!(plan.len() > 1);
         assert!(
@@ -339,7 +338,7 @@ mod tests {
             .iter()
             .map(|load| load.contact.dissipated_energy + load.kinetic_energy)
             .sum();
-        assert!(total <= crate::packages::test_blast(BowPower::Standard).energy + 0.01);
+        assert!(total <= crate::packages::test_blast(1).energy + 0.01);
         assert!(plan.iter().any(|load| material(3).damage_energy(
             load.contact.dissipated_energy,
             load.contact.force,
@@ -399,7 +398,7 @@ mod tests {
             &[near, far],
             &[],
             Vec3::new(2.5, 4., 4.),
-            BowPower::Standard,
+            1,
         );
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].target, Target::Body(1));
@@ -410,11 +409,11 @@ mod tests {
                 &[near],
                 &[],
                 Vec3::new(12., 4., 4.),
-                BowPower::Standard
+                1
             )
             .is_empty()
         );
-        let inside = plan(&world, &[near, far], &[], near.position, BowPower::Standard);
+        let inside = plan(&world, &[near, far], &[], near.position, 1);
         assert_eq!(inside.len(), 1);
         assert_eq!(inside[0].target, Target::Body(near.id));
         assert!(inside[0].contact.dissipated_energy > 0.0);
@@ -431,7 +430,7 @@ mod tests {
             material: 3,
         };
         let mut previous_force = 0.0;
-        for power in BowPower::ALL {
+        for power in 0..crate::packages::test_package().powers().len() as u8 {
             let loads = plan(&world, &[body], &[], body.position, power);
             assert_eq!(loads.len(), 1);
             let load = &loads[0];
@@ -449,9 +448,9 @@ mod tests {
             assert_eq!(plan(&world, &[body], &[], inside, power).len(), 1);
         }
         let center = body.position - Vec3::X * 5.5;
-        assert!(plan(&world, &[body], &[], center, BowPower::High).is_empty());
+        assert!(plan(&world, &[body], &[], center, 2).is_empty());
         assert_eq!(
-            plan(&world, &[body], &[], center, BowPower::Extreme).len(),
+            plan(&world, &[body], &[], center, 3).len(),
             1
         );
     }
@@ -471,7 +470,7 @@ mod tests {
         let players = [(1, player), (2, player)];
         let center = Vec3::new(10.5, 10.02, 10.5);
         let mut previous = 0.0;
-        for power in BowPower::ALL {
+        for power in 0..crate::packages::test_package().powers().len() as u8 {
             let loads = plan(&world, &[], &players, center, power);
             let first = loads
                 .iter()
@@ -519,7 +518,7 @@ mod tests {
         let center = Vec3::new(8.5, 10.9, 10.5);
         let players = [(1, player)];
         assert_eq!(
-            plan(&world, &[], &players, center, BowPower::Standard).len(),
+            plan(&world, &[], &players, center, 1).len(),
             1
         );
         assert!(
@@ -528,7 +527,7 @@ mod tests {
                 &[],
                 &players,
                 center - Vec3::X * 5.0,
-                BowPower::Standard
+                1
             )
             .is_empty()
         );
@@ -536,7 +535,7 @@ mod tests {
             noclip: true,
             ..player
         };
-        assert!(plan(&world, &[], &[(1, flying)], center, BowPower::Standard).is_empty());
+        assert!(plan(&world, &[], &[(1, flying)], center, 1).is_empty());
         let body = PhysicsBodySnapshot {
             id: 1,
             position: Vec3::new(9.5, 10.9, 10.5),
@@ -544,7 +543,7 @@ mod tests {
             material: 3,
         };
         assert!(
-            plan(&world, &[body], &players, center, BowPower::Standard)
+            plan(&world, &[body], &players, center, 1)
                 .iter()
                 .all(|load| load.target != Target::Player(1))
         );
@@ -552,7 +551,7 @@ mod tests {
             world.set_block(IVec3::new(9, y, 10), 3).unwrap();
         }
         assert!(
-            plan(&world, &[], &players, center, BowPower::Standard)
+            plan(&world, &[], &players, center, 1)
                 .iter()
                 .all(|load| load.target != Target::Player(1))
         );
@@ -567,7 +566,7 @@ mod tests {
             ..Default::default()
         };
         let damage = |world: &VoxelWorld, players: &[(u64, PlayerState)]| {
-            plan(world, &[], players, center, BowPower::Standard)
+            plan(world, &[], players, center, 1)
                 .into_iter()
                 .filter(|load| matches!(load.target, Target::Player(_)))
                 .map(|load| load.player_damage)

@@ -3,7 +3,6 @@
 //! else a small cube tinted with the item's block color. Empty hands show
 //! nothing. glTF units are meters — models render at authored size.
 use bevy::prelude::*;
-use protocol::EXPLOSIVE_BOW_ITEM;
 
 use crate::{ClientSession, PlayerCamera, package_assets::PackageAssets};
 
@@ -93,7 +92,7 @@ pub(crate) fn update(
                     .cube
                     .get_or_insert_with(|| meshes.add(Cuboid::new(0.04, 0.04, 0.24)))
                     .clone();
-                let [r, g, b, _] = if item == EXPLOSIVE_BOW_ITEM {
+                let [r, g, b, _] = if session.packages.is_launcher(item) {
                     [0.45, 0.3, 0.15, 1.0]
                 } else if item <= u32::from(voxel_world::WOOD) && item >= 1 {
                     voxel_world::block_color(item as u8)

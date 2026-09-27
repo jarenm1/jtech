@@ -5,7 +5,9 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 
-use crate::{ClientSession, Options, game_hud::GameplayHud, inventory_ui::InventoryUi};
+use crate::{
+    ClientSession, Options, game_hud::GameplayHud, inventory_ui::InventoryUi, package_hud,
+};
 
 #[derive(Resource, Default)]
 pub(crate) struct PauseMenu {
@@ -92,7 +94,7 @@ pub(crate) fn spawn(commands: &mut Commands) {
                     ));
                     for (action, label) in [
                         (MenuAction::Resume, "Resume"),
-                        (MenuAction::Power, "Bow power"),
+                        (MenuAction::Power, "Launcher power"),
                         (MenuAction::Quit, "Quit game"),
                     ] {
                         panel
@@ -170,7 +172,7 @@ pub(crate) fn actions(
         }
         match action {
             MenuAction::Resume => menu.resume(),
-            MenuAction::Power => session.bow_power = session.bow_power.next(),
+            MenuAction::Power => session.cycle_launch_power(),
             MenuAction::Quit => {
                 exit.write(AppExit::Success);
             }
@@ -210,7 +212,17 @@ pub(crate) fn sync(
     for (interaction, mut color) in &mut buttons {
         color.0 = button_color(*interaction);
     }
-    power.0 = format!("Bow power   {}", session.bow_power.label());
+    power.0 = match session.packages.launcher(session.held_item()) {
+        Some(launcher) => {
+            let label = package_hud::ServerPackages::launcher_power_label(
+                launcher,
+                session.launch_power,
+            )
+            .unwrap_or("");
+            format!("{}   {}", launcher.name, label)
+        }
+        None => "Launcher power".into(),
+    };
 }
 
 /// Single writer for cursor state. Any overlay that needs the mouse — pause
@@ -338,13 +350,21 @@ mod tests {
             .focused = false;
         app.update();
         assert!(app.world().resource::<PauseMenu>().open);
-        let power = app.world().resource::<ClientSession>().bow_power;
+        {
+            let session = &mut *app.world_mut().resource_mut::<ClientSession>();
+            session.packages.launchers = vec![protocol::LauncherInfo {
+                item: protocol::FIRST_PACKAGE_ITEM,
+                package: "explosive-bow".into(),
+                name: "Explosive Bow".into(),
+                powers: vec!["Standard".into(), "High".into()],
+                shots_per_second: 25,
+            }];
+            session.hotbar[5] = Some(protocol::FIRST_PACKAGE_ITEM);
+            session.selected = 6;
+        }
         press_action(&mut app, MenuAction::Power);
         app.update();
-        assert_eq!(
-            app.world().resource::<ClientSession>().bow_power,
-            power.next()
-        );
+        assert_eq!(app.world().resource::<ClientSession>().launch_power, 1);
         press_action(&mut app, MenuAction::Quit);
         app.update();
         assert_eq!(app.world().resource::<Messages<AppExit>>().len(), 1);

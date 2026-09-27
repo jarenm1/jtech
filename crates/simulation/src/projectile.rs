@@ -1,15 +1,14 @@
 //! Authoritative point-projectile flight with swept terrain and loose-cube hits.
+//! Flight parameters come from the launcher package that fired the shot.
 use game_packages::Shot;
 use glam::Vec3;
-#[cfg(test)]
-use protocol::BowPower;
-use protocol::{ArrowSnapshot, PhysicsBodySnapshot};
+use protocol::{PhysicsBodySnapshot, ProjectileSnapshot};
 use voxel_world::VoxelWorld;
 
-pub(super) struct Arrow {
-    pub snapshot: ArrowSnapshot,
+pub(super) struct Projectile {
+    pub snapshot: ProjectileSnapshot,
     pub shot: Shot,
-    /// Player id that fired the arrow; kept on queued detonations for event
+    /// Player id that fired it; kept on queued detonations for event
     /// attribution.
     pub shooter: Option<u64>,
     age: u32,
@@ -23,23 +22,22 @@ pub(super) enum Flight {
     Expired,
 }
 
-impl Arrow {
+impl Projectile {
     #[cfg(test)]
-    pub fn new(id: u32, origin: Vec3, direction: Vec3, power: BowPower) -> Self {
-        let shot = game_packages::PackageHost::new(&game_packages::default_directory())
-            .fire(power)
-            .unwrap();
-        Self::from_shot(id, origin, direction, shot)
+    pub fn new(id: u32, origin: Vec3, direction: Vec3, power: u8) -> Self {
+        Self::from_shot(id, origin, direction, crate::packages::test_shot(power))
     }
 
     pub fn from_shot(id: u32, origin: Vec3, direction: Vec3, shot: Shot) -> Self {
         Self {
-            snapshot: ArrowSnapshot {
+            snapshot: ProjectileSnapshot {
                 id,
                 position: origin,
                 velocity: direction * shot.projectile.speed,
             },
             shot,
+            // Player id that fired it; kept on queued detonations for event
+            // attribution.
             shooter: None,
             age: 0,
             traveled: 0.0,
@@ -159,28 +157,28 @@ mod tests {
     }
 
     #[test]
-    fn arrow_flies_beyond_edit_reach_and_hits_first_wall_once() {
+    fn projectile_flies_beyond_edit_reach_and_hits_first_wall_once() {
         let mut world = empty_world();
         for y in 0..16 {
             world.set_block(IVec3::new(20, y, 2), 3).unwrap();
         }
-        let mut arrow = Arrow::new(7, Vec3::new(2.5, 10.5, 2.5), Vec3::X, BowPower::Standard);
+        let mut projectile = Projectile::new(7, Vec3::new(2.5, 10.5, 2.5), Vec3::X, 1);
         for _ in 0..100 {
-            match arrow.step(&world, &[]) {
+            match projectile.step(&world, &[]) {
                 Flight::Flying => {}
                 Flight::Impact(position) => {
                     assert!((position.x - 19.98).abs() < 0.001);
                     assert!(position.y < 10.5);
                     return;
                 }
-                Flight::Expired => panic!("arrow expired before wall"),
+                Flight::Expired => panic!("projectile expired before wall"),
             }
         }
-        panic!("arrow tunneled through wall");
+        panic!("projectile tunneled through wall");
     }
 
     #[test]
-    fn swept_arrow_hits_loose_body_before_terrain() {
+    fn swept_projectile_hits_loose_body_before_terrain() {
         let world = empty_world();
         let body = PhysicsBodySnapshot {
             id: 1,
@@ -188,8 +186,8 @@ mod tests {
             velocity: Vec3::ZERO,
             material: 3,
         };
-        let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, BowPower::Standard);
-        let Flight::Impact(position) = arrow.step(&world, &[body]) else {
+        let mut projectile = Projectile::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, 1);
+        let Flight::Impact(position) = projectile.step(&world, &[body]) else {
             panic!("missed body");
         };
         assert!((position.x - 2.98).abs() < 0.001);
@@ -200,18 +198,21 @@ mod tests {
     }
 
     #[test]
-    fn arrows_expire_at_range_and_loaded_boundary() {
+    fn projectiles_expire_at_range_and_loaded_boundary() {
         let world = empty_world();
-        let mut arrow = Arrow::new(1, Vec3::new(1., 20., 1.), Vec3::X, BowPower::Standard);
+        let mut projectile = Projectile::new(1, Vec3::new(1., 20., 1.), Vec3::X, 1);
         for _ in 0..180 {
-            if matches!(arrow.step(&world, &[]), Flight::Expired) {
-                assert!(arrow.snapshot.position.x <= 65.0 && arrow.snapshot.position.x > 64.0);
+            if matches!(projectile.step(&world, &[]), Flight::Expired) {
+                assert!(
+                    projectile.snapshot.position.x <= 65.0
+                        && projectile.snapshot.position.x > 64.0
+                );
                 break;
             }
         }
-        assert!(arrow.traveled >= arrow.shot.projectile.max_travel);
-        let mut arrow = Arrow::new(2, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
-        assert!(matches!(arrow.step(&world, &[]), Flight::Expired));
+        assert!(projectile.traveled >= projectile.shot.projectile.max_travel);
+        let mut projectile = Projectile::new(2, Vec3::new(95.9, 10., 1.), Vec3::X, 1);
+        assert!(matches!(projectile.step(&world, &[]), Flight::Expired));
     }
 
     #[test]
@@ -223,18 +224,24 @@ mod tests {
             velocity: Vec3::ZERO,
             material: 3,
         };
-        let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, BowPower::Standard);
+        let mut projectile = Projectile::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, 1);
         assert!(matches!(
-            arrow.tick(&world, &[stale], false),
+            projectile.tick(&world, &[stale], false),
             Flight::Flying
         ));
-        assert_eq!(arrow.snapshot.position.x, 2.9);
-        assert!(matches!(arrow.tick(&world, &[], true), Flight::Flying));
-        assert!((arrow.snapshot.position.x - 4.1).abs() < 0.001);
-        for _ in 0..arrow.shot.projectile.max_age_ticks {
-            arrow.tick(&world, &[], false);
+        assert_eq!(projectile.snapshot.position.x, 2.9);
+        assert!(matches!(
+            projectile.tick(&world, &[], true),
+            Flight::Flying
+        ));
+        assert!((projectile.snapshot.position.x - 4.1).abs() < 0.001);
+        for _ in 0..projectile.shot.projectile.max_age_ticks {
+            projectile.tick(&world, &[], false);
         }
-        assert!(matches!(arrow.tick(&world, &[], false), Flight::Expired));
-        assert!(arrow.pending_steps <= 3);
+        assert!(matches!(
+            projectile.tick(&world, &[], false),
+            Flight::Expired
+        ));
+        assert!(projectile.pending_steps <= 3);
     }
 }

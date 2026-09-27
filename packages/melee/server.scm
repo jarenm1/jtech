@@ -2,8 +2,8 @@
 ;; Edit and save this file to reload; new swings use the new generation.
 ;;
 ;; Each (melee-weapon id name range damage cooldown-ticks knockback) registers
-;; one item id in the shared melee table. Ids must exceed the bow's id 6 and
-;; must not collide with ids other loaded packages claim. range is metres,
+;; one item id in the shared item table. Ids start at 6 — hands and blocks
+;; own 0–5 — and must not collide with ids other loaded packages claim. range is metres,
 ;; damage whole health points, cooldown-ticks fixed60 ticks, knockback kg·m/s.
 ;; Head-zone hits still double damage; hands stay the unarmed fallback.
 ;; Weapons are equipment: each copy takes an inventory slot and drops on death.

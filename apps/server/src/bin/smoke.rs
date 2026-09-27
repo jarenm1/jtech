@@ -5,8 +5,8 @@ use glam::{IVec3, Vec3};
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerState};
 use protocol::{
-    ActorSnapshot, ArrowSnapshot, ClientMessage, EditRejection, Health, InputPacket, Inventory,
-    PackageState, PackageStatus, ServerMessage,
+    ActorSnapshot, ClientMessage, EditRejection, Health, InputPacket, Inventory, PackageState,
+    PackageStatus, ProjectileSnapshot, ServerMessage,
 };
 use simulation::{ServerConfig, Simulation, SimulationPlugin};
 use std::{
@@ -38,14 +38,14 @@ struct Bot {
     edits: HashMap<u64, bool>,
     damage: HashMap<u64, f32>,
     rejections: HashMap<u64, EditRejection>,
-    flights: Vec<(u64, Vec<ArrowSnapshot>)>,
+    flights: Vec<(u64, Vec<ProjectileSnapshot>)>,
     explosions: Vec<(u32, Vec3, f32)>,
     inventory: Inventory,
     chunks: usize,
     /// Scatter instances received across all chunks, and the announced species.
     scatter: usize,
     scatter_species: usize,
-    packages: Vec<(u64, Vec<PackageStatus>, u32, Vec<protocol::MeleeWeaponInfo>)>,
+    packages: Vec<(u64, Vec<PackageStatus>, Vec<protocol::LauncherInfo>, Vec<protocol::MeleeWeaponInfo>)>,
     /// Latest announced asset manifest plus reassembled downloads.
     asset_manifest: Vec<protocol::PackageAssetInfo>,
     assets: HashMap<(String, String), Vec<u8>>,
@@ -192,7 +192,9 @@ impl Bot {
                     }
                 }
                 ServerMessage::Physics { .. } => {}
-                ServerMessage::Projectiles { tick, arrows } => self.flights.push((tick, arrows)),
+                ServerMessage::Projectiles {
+                    tick, projectiles
+                } => self.flights.push((tick, projectiles)),
                 ServerMessage::Explosion {
                     id,
                     position,
@@ -203,12 +205,12 @@ impl Bot {
                 ServerMessage::Packages {
                     revision,
                     packages,
-                    bow_shots_per_second,
+                    launchers,
                     melee_weapons,
                     assets,
                 } => {
                     self.packages
-                        .push((revision, packages, bow_shots_per_second, melee_weapons));
+                        .push((revision, packages, launchers, melee_weapons));
                     self.asset_manifest = assets.clone();
                     for info in assets {
                         let key = (info.package.clone(), info.path.clone());
@@ -536,12 +538,15 @@ fn package_fixture() -> Result<(PathBuf, PathBuf, String)> {
 }
 
 fn latest_package(bot: &Bot) -> Option<(&PackageStatus, u32)> {
-    let (_, packages, rate, _) = bot.packages.last()?;
+    let (_, packages, launchers, _) = bot.packages.last()?;
     Some((
         packages
             .iter()
             .find(|package| package.id == "explosive-bow")?,
-        *rate,
+        launchers
+            .iter()
+            .find(|launcher| launcher.item == 6)?
+            .shots_per_second,
     ))
 }
 
@@ -617,14 +622,8 @@ fn explosive_bow() -> Result<()> {
             "(define shots-per-second 25)",
             "(define shots-per-second 20)",
         )
-        .replace(
-            "(projectile 36.0 3.0 64.0 180)",
-            "(projectile 18.0 3.0 64.0 180)",
-        )
-        .replace(
-            "(list-ref '(3.0 4.0 5.0 6.0) power)",
-            "(list-ref '(5.0 6.0 7.0 8.0) power)",
-        );
+        .replace("(projectile 36.0 3.0 64.0 180)", "(projectile 18.0 3.0 64.0 180)")
+        .replace("(car preset)", "(+ 2.0 (car preset))");
     fs::write(&package_path, &tuned)?;
     drive(&mut app, &mut [&mut first, &mut second], 420, [0.0; 2], 0.0)?;
     for bot in [&first, &second] {
@@ -671,19 +670,21 @@ fn explosive_bow() -> Result<()> {
     )?;
     drop(late);
     let yaw = -std::f32::consts::FRAC_PI_2;
-    let shot = ClientMessage::FireBow {
+    let shot = ClientMessage::FireLauncher {
         request: 1,
+        item: 6,
         yaw,
         pitch: 0.0,
-        power: protocol::BowPower::Standard,
+        power: 1,
     };
     first.net.send(shot.clone())?;
     first.net.send(shot.clone())?;
-    first.net.send(ClientMessage::FireBow {
+    first.net.send(ClientMessage::FireLauncher {
         request: 2,
+        item: 6,
         yaw,
         pitch: 0.0,
-        power: protocol::BowPower::Standard,
+        power: 1,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 120, [0.0; 2], 0.0)?;
     require(first.edits.get(&1) == Some(&true), "bow shot was rejected")?;
@@ -708,29 +709,29 @@ fn explosive_bow() -> Result<()> {
         let visible: Vec<_> = bot
             .flights
             .iter()
-            .flat_map(|(_, arrows)| arrows)
-            .filter(|arrow| arrow.id == id)
+            .flat_map(|(_, projectiles)| projectiles)
+            .filter(|projectile| projectile.id == id)
             .collect();
         require(
             visible.len() >= 2
                 && visible
                     .iter()
-                    .all(|arrow| arrow.position.is_finite() && arrow.velocity.is_finite())
+                    .all(|projectile| projectile.position.is_finite() && projectile.velocity.is_finite())
                 && visible.last().unwrap().position.x > visible[0].position.x + 1.0
                 && visible
                     .iter()
-                    .any(|arrow| (arrow.velocity.length() - 18.0).abs() < 1.0),
-            "reloaded bow moving arrow did not expose the native speed policy",
+                    .any(|projectile| (projectile.velocity.length() - 18.0).abs() < 1.0),
+            "reloaded bow moving projectile did not expose the native speed policy",
         )?;
         require(
             bot.flights
                 .iter()
-                .all(|(_, arrows)| arrows.iter().all(|arrow| arrow.id == id))
+                .all(|(_, projectiles)| projectiles.iter().all(|projectile| projectile.id == id))
                 && bot
                     .flights
                     .last()
-                    .is_some_and(|(_, arrows)| arrows.is_empty()),
-            "bow replay spawned another arrow or impact left an active arrow",
+                    .is_some_and(|(_, projectiles)| projectiles.is_empty()),
+            "bow replay spawned another projectile or impact left an active projectile",
         )?;
     }
     let destroyed: Vec<_> = wall
@@ -756,11 +757,12 @@ fn explosive_bow() -> Result<()> {
     first.edits.remove(&1);
     first.edits.remove(&2);
     first.net.send(shot)?;
-    first.net.send(ClientMessage::FireBow {
+    first.net.send(ClientMessage::FireLauncher {
         request: 2,
+        item: 6,
         yaw,
         pitch: 0.0,
-        power: protocol::BowPower::Standard,
+        power: 1,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
     require(
@@ -776,15 +778,16 @@ fn explosive_bow() -> Result<()> {
                 && bot
                     .flights
                     .iter()
-                    .all(|(_, arrows)| arrows.iter().all(|arrow| arrow.id == id)),
+                    .all(|(_, projectiles)| projectiles.iter().all(|projectile| projectile.id == id)),
             "bow replay repeated flight, explosion, or terrain damage",
         )?;
     }
-    first.net.send(ClientMessage::FireBow {
+    first.net.send(ClientMessage::FireLauncher {
         request: 3,
+        item: 6,
         yaw,
         pitch: 0.5,
-        power: protocol::BowPower::Standard,
+        power: 1,
     })?;
     drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
     require(
@@ -795,7 +798,7 @@ fn explosive_bow() -> Result<()> {
         require(
             bot.flights
                 .iter()
-                .any(|(_, arrows)| arrows.iter().any(|arrow| arrow.id != id)),
+                .any(|(_, projectiles)| projectiles.iter().any(|projectile| projectile.id != id)),
             "later bow shot did not replicate to both clients",
         )?;
     }

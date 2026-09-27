@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use bevy::{prelude::*, text::LineBreak};
-use protocol::{MeleeWeaponInfo, PackageState, PackageStatus};
+use protocol::{LauncherInfo, MeleeWeaponInfo, PackageState, PackageStatus};
 
 use crate::{ClientSession, game_hud::palette};
 
@@ -9,7 +9,9 @@ use crate::{ClientSession, game_hud::palette};
 pub(crate) struct ServerPackages {
     pub revision: Option<u64>,
     pub statuses: Vec<PackageStatus>,
-    pub bow_shots_per_second: u32,
+    /// Launcher items replicated with the package set; drives firing rate,
+    /// power presets and item display names without client-side duplication.
+    pub launchers: Vec<LauncherInfo>,
     /// Melee weapons replicated with the package set; drives swing routing
     /// and item display names without client-side duplication.
     pub melee_weapons: Vec<MeleeWeaponInfo>,
@@ -20,7 +22,7 @@ impl Default for ServerPackages {
         Self {
             revision: None,
             statuses: Vec::new(),
-            bow_shots_per_second: protocol::EXPLOSIVE_BOW_SHOTS_PER_SECOND,
+            launchers: Vec::new(),
             melee_weapons: Vec::new(),
         }
     }
@@ -31,7 +33,7 @@ impl ServerPackages {
         &mut self,
         revision: u64,
         statuses: Vec<PackageStatus>,
-        bow_shots_per_second: u32,
+        launchers: Vec<LauncherInfo>,
         melee_weapons: Vec<MeleeWeaponInfo>,
     ) {
         if self.revision.is_some_and(|current| revision <= current) {
@@ -39,8 +41,7 @@ impl ServerPackages {
         }
         self.revision = Some(revision);
         self.statuses = statuses;
-        // Zero disables firing when no bow package is active.
-        self.bow_shots_per_second = bow_shots_per_second;
+        self.launchers = launchers;
         self.melee_weapons = melee_weapons;
     }
 
@@ -63,11 +64,37 @@ impl ServerPackages {
             .map(|weapon| weapon.name.as_str())
     }
 
-    /// Unique non-stacking items (weapons); everything else is a stack.
+    /// Replicated info for a launcher item.
+    pub fn launcher(&self, item: u32) -> Option<&LauncherInfo> {
+        self.launchers.iter().find(|launcher| launcher.item == item)
+    }
+
+    /// True when the item is a replicated launcher.
+    pub fn is_launcher(&self, item: u32) -> bool {
+        self.launcher(item).is_some()
+    }
+
+    /// Authored display name for a replicated launcher item.
+    pub fn launcher_name(&self, item: u32) -> Option<&str> {
+        self.launcher(item).map(|launcher| launcher.name.as_str())
+    }
+
+    /// Display label for a launcher's power preset index, clamped to the
+    /// authored list. An empty `powers` list means unshootable.
+    pub fn launcher_power_label(launcher: &LauncherInfo, power: u8) -> Option<&str> {
+        launcher
+            .powers
+            .get(usize::from(power).min(launcher.powers.len().saturating_sub(1)))
+            .map(String::as_str)
+    }
+
+    /// Unique non-stacking items (launchers and weapons); everything else is a stack.
     pub fn is_equipment(&self, item: u32) -> bool {
-        self.melee_weapons
-            .iter()
-            .any(|weapon| weapon.item == item && weapon.kind == protocol::ItemKind::Equipment)
+        self.is_launcher(item)
+            || self
+                .melee_weapons
+                .iter()
+                .any(|weapon| weapon.item == item && weapon.kind == protocol::ItemKind::Equipment)
     }
 }
 
@@ -181,17 +208,27 @@ mod tests {
         }
     }
 
+    fn launcher() -> LauncherInfo {
+        LauncherInfo {
+            item: protocol::FIRST_PACKAGE_ITEM,
+            package: "explosive-bow".into(),
+            name: "Explosive Bow".into(),
+            powers: vec!["Low".into(), "Standard".into(), "High".into()],
+            shots_per_second: 25,
+        }
+    }
+
     #[test]
-    fn stale_package_messages_cannot_restore_old_state_or_firing_rate() {
+    fn stale_package_messages_cannot_restore_old_state_or_item_tables() {
         let mut packages = ServerPackages::default();
-        packages.receive(0, vec![status(0, PackageState::Loading)], 0, vec![]);
+        packages.receive(0, vec![status(0, PackageState::Loading)], vec![], vec![]);
         assert_eq!(packages.revision, Some(0));
-        packages.receive(2, vec![status(1, PackageState::Loaded)], 10, vec![]);
+        packages.receive(2, vec![status(1, PackageState::Loaded)], vec![launcher()], vec![]);
         for revision in [0, 1, 2] {
-            packages.receive(revision, vec![status(0, PackageState::Error)], 25, vec![]);
+            packages.receive(revision, vec![status(0, PackageState::Error)], vec![], vec![]);
         }
         assert_eq!(packages.revision, Some(2));
-        assert_eq!(packages.bow_shots_per_second, 10);
+        assert_eq!(packages.launchers.len(), 1);
         assert_eq!(packages.statuses[0].generation, 1);
         assert!(matches!(packages.statuses[0].state, PackageState::Loaded));
     }
@@ -225,7 +262,7 @@ mod tests {
             app.world_mut()
                 .resource_mut::<ClientSession>()
                 .packages
-                .receive(revision, vec![package], 10, vec![]);
+                .receive(revision, vec![package], vec![], vec![]);
             app.update();
             assert_eq!(
                 app.world().get::<Node>(panel).unwrap().display,
@@ -248,9 +285,6 @@ mod tests {
         let packages = &app.world().resource::<ClientSession>().packages;
         assert_eq!(packages.revision, None);
         assert!(packages.statuses.is_empty());
-        assert_eq!(
-            packages.bow_shots_per_second,
-            protocol::EXPLOSIVE_BOW_SHOTS_PER_SECOND
-        );
+        assert!(packages.launchers.is_empty());
     }
 }

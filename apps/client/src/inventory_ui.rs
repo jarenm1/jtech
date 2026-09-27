@@ -7,11 +7,10 @@
 //! into `PlayerInput::selected`. Dragging a hotbar slot onto another swaps the
 //! two assignments; dropping it on an inventory cell clears the slot.
 //!
-//! The explosive bow is a pseudo-item: it is not a carried stack, so the grid
-//! prepends a synthetic cell for it and every client may hotbar it.
+//! Launcher items are pseudo-items: they are not carried stacks, so the grid
+//! prepends one cell per replicated launcher and every client may hotbar them.
 
 use bevy::{prelude::*, ui::FocusPolicy};
-use protocol::EXPLOSIVE_BOW_ITEM;
 
 use crate::{ClientSession, game_hud, pause_menu::PauseMenu};
 
@@ -20,13 +19,17 @@ use crate::{ClientSession, game_hud, pause_menu::PauseMenu};
 #[derive(Resource, Default)]
 pub(crate) struct InventoryUi {
     pub open: bool,
-    shown: Option<(gameplay::Inventory, Vec<protocol::MeleeWeaponInfo>)>,
+    shown: Option<(
+        gameplay::Inventory,
+        Vec<protocol::LauncherInfo>,
+        Vec<protocol::MeleeWeaponInfo>,
+    )>,
 }
 
 /// Where a dragged stack came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DragSource {
-    /// An inventory grid cell (or the synthetic bow cell).
+    /// An inventory grid cell (or a synthetic launcher cell).
     Grid,
     /// Hotbar slot index 0..10.
     Hotbar(usize),
@@ -148,7 +151,11 @@ pub(crate) fn sync(
         ui.shown = None;
         return;
     }
-    let shown = (session.inventory.clone(), session.packages.melee_weapons.clone());
+    let shown = (
+        session.inventory.clone(),
+        session.packages.launchers.clone(),
+        session.packages.melee_weapons.clone(),
+    );
     if ui.shown.as_ref() == Some(&shown) {
         return;
     }
@@ -157,8 +164,10 @@ pub(crate) fn sync(
         commands.entity(cell).despawn();
     }
     commands.entity(*grid).with_children(|grid| {
-        // The bow is usable by everyone; show it ahead of carried stacks.
-        spawn_cell(grid, EXPLOSIVE_BOW_ITEM, game_hud::item_name(&session, EXPLOSIVE_BOW_ITEM), None);
+        // Launchers are usable by everyone; show them ahead of carried stacks.
+        for launcher in &session.packages.launchers {
+            spawn_cell(grid, launcher.item, launcher.name.clone(), None);
+        }
         for &(item, count) in session.inventory.entries() {
             // Equipment is unique; its cell shows no stack count.
             let count = (!session.packages.is_equipment(item)).then_some(count);
@@ -390,6 +399,16 @@ mod tests {
     fn tab_opens_the_panel_and_releases_the_cursor() {
         let mut app = app();
         app.world_mut()
+            .resource_mut::<ClientSession>()
+            .packages
+            .launchers = vec![protocol::LauncherInfo {
+            item: protocol::FIRST_PACKAGE_ITEM,
+            package: "explosive-bow".into(),
+            name: "Explosive Bow".into(),
+            powers: vec!["Standard".into()],
+            shots_per_second: 25,
+        }];
+        app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::Tab);
         app.update();
@@ -401,7 +420,7 @@ mod tests {
             .unwrap();
         assert!(cursor.visible);
         assert_eq!(cursor.grab_mode, CursorGrabMode::None);
-        // The grid shows the synthetic bow cell even with an empty inventory.
+        // The grid shows the launcher cell even with an empty inventory.
         let cells = app
             .world_mut()
             .query::<&InventoryCell>()
@@ -429,6 +448,16 @@ mod tests {
     #[test]
     fn grid_rebuilds_with_replicated_stacks() {
         let mut app = app();
+        app.world_mut()
+            .resource_mut::<ClientSession>()
+            .packages
+            .launchers = vec![protocol::LauncherInfo {
+            item: protocol::FIRST_PACKAGE_ITEM,
+            package: "explosive-bow".into(),
+            name: "Explosive Bow".into(),
+            powers: vec!["Standard".into()],
+            shots_per_second: 25,
+        }];
         let mut inventory = gameplay::Inventory::new();
         inventory.add(u32::from(voxel_world::STONE), 40);
         inventory.add(u32::from(voxel_world::WOOD), 7);
@@ -445,7 +474,11 @@ mod tests {
             .collect();
         assert_eq!(
             items,
-            vec![EXPLOSIVE_BOW_ITEM, u32::from(voxel_world::STONE), u32::from(voxel_world::WOOD)]
+            vec![
+                protocol::FIRST_PACKAGE_ITEM,
+                u32::from(voxel_world::STONE),
+                u32::from(voxel_world::WOOD),
+            ]
         );
     }
 }

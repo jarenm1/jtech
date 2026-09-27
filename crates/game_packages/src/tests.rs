@@ -24,7 +24,7 @@ impl Fixture {
         directory
     }
     fn write(&self, source: &str) {
-        fs::write(self.package(BOW_PACKAGE).join("server.scm"), source).unwrap();
+        fs::write(self.package(EXPLOSIVE_BOW_PACKAGE).join("server.scm"), source).unwrap();
     }
     fn write_package(&self, id: &str, source: &str) {
         fs::write(self.package(id).join("server.scm"), source).unwrap();
@@ -36,14 +36,19 @@ impl Drop for Fixture {
     }
 }
 
-fn compile(source: &str) -> Result<BowPackage, String> {
+fn compile(source: &str) -> Result<LauncherPackage, String> {
     let fixture = Fixture::new();
     fixture.write(source);
-    BowPackage::compile(
+    LauncherPackage::compile(
         source.to_owned(),
-        fixture.0.join(BOW_PACKAGE).join("server.scm"),
+        fixture.0.join(EXPLOSIVE_BOW_PACKAGE).join("server.scm"),
         1,
     )
+}
+
+/// Admitted shot for launcher item 6, like the simulation's fire path.
+fn shot(host: &PackageHost, power: u8) -> Result<Shot, String> {
+    host.launcher_table().shot(6, power)
 }
 
 fn status(host: &PackageHost, id: &str) -> PackageStatus {
@@ -68,13 +73,15 @@ fn poll_disk(host: &mut PackageHost) {
 }
 
 #[test]
-fn bow_package_authors_flight_and_each_blast_preset() {
+fn launcher_package_authors_item_presets_and_cadence() {
     let package = compile(BOW).unwrap();
+    assert_eq!(package.item, 6);
+    assert_eq!(package.name, "Explosive Bow");
     assert_eq!(package.shots_per_second, 25);
-    for (index, power) in BowPower::ALL.into_iter().enumerate() {
-        let projectile = package.projectile(power);
+    assert_eq!(package.powers().len(), 4);
+    for (index, power) in package.powers().iter().enumerate() {
         assert_eq!(
-            projectile,
+            power.projectile,
             ProjectileSpec {
                 speed: 36.0,
                 gravity: 3.0,
@@ -82,11 +89,14 @@ fn bow_package_authors_flight_and_each_blast_preset() {
                 max_age_ticks: 180
             }
         );
-        let blast = package.impact(power);
-        assert_eq!(blast.radius, [3.0, 4.0, 5.0, 6.0][index]);
-        assert_eq!(blast.energy, [3000.0, 6000.0, 12000.0, 24000.0][index]);
-        assert!((blast.player_speed.powi(2) - 324.0 * [0.5, 1.0, 2.0, 4.0][index]).abs() < 0.001);
+        assert_eq!(power.blast.radius, [3.0, 4.0, 5.0, 6.0][index]);
+        assert_eq!(power.blast.energy, [3000.0, 6000.0, 12000.0, 24000.0][index]);
+        assert!(
+            (power.blast.player_speed.powi(2) - 324.0 * [0.5, 1.0, 2.0, 4.0][index]).abs() < 0.001
+        );
     }
+    let labels: Vec<_> = package.powers().iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(labels, ["0.5x", "1x", "2x", "4x"]);
 }
 
 #[test]
@@ -94,24 +104,24 @@ fn edited_package_changes_new_shots_and_retains_in_flight_generation() {
     let fixture = Fixture::new();
     fixture.write(BOW);
     let mut host = PackageHost::new(&fixture.0);
-    let old = host.fire(BowPower::Standard).unwrap();
+    let old = shot(&host, 1).unwrap();
     fixture.write(
         &BOW.replace("36.0", "48.0")
             .replace("6000.0", "9000.0")
             .replace("second 25", "second 10"),
     );
     poll_disk(&mut host);
-    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Reloading);
-    assert_eq!(status(&host, BOW_PACKAGE).generation, 1);
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).state, PackageState::Reloading);
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).generation, 1);
     drain(&mut host);
-    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Loaded);
-    assert_eq!(status(&host, BOW_PACKAGE).generation, 2);
-    assert_eq!(host.shots_per_second(), 10);
-    let new = host.fire(BowPower::Standard).unwrap();
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).state, PackageState::Loaded);
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).generation, 2);
+    assert_eq!(host.launcher_table().get(6).unwrap().shots_per_second, 10);
+    let new = shot(&host, 1).unwrap();
     assert_eq!(new.projectile.speed, 48.0);
-    assert_eq!(new.impact().energy, 9000.0);
+    assert_eq!(new.blast.energy, 9000.0);
     assert_eq!(old.projectile.speed, 36.0);
-    assert_eq!(old.impact().energy, 6000.0);
+    assert_eq!(old.blast.energy, 6000.0);
     assert_eq!(old.generation(), 1);
 }
 
@@ -123,36 +133,33 @@ fn failed_reload_retains_last_good_package_and_recovers_after_save() {
     fixture.write("(define broken");
     poll_disk(&mut host);
     drain(&mut host);
-    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Error);
-    assert!(status(&host, BOW_PACKAGE).error.is_some());
-    assert_eq!(status(&host, BOW_PACKAGE).generation, 1);
-    assert_eq!(
-        host.fire(BowPower::Standard).unwrap().impact().energy,
-        6000.0
-    );
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).state, PackageState::Error);
+    assert!(status(&host, EXPLOSIVE_BOW_PACKAGE).error.is_some());
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).generation, 1);
+    assert_eq!(shot(&host, 1).unwrap().blast.energy, 6000.0);
     let revision = host.revision();
     poll_disk(&mut host);
     assert_eq!(host.revision(), revision);
     fixture.write(BOW);
     poll_disk(&mut host);
     drain(&mut host);
-    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Loaded);
-    assert!(status(&host, BOW_PACKAGE).error.is_none());
-    assert_eq!(status(&host, BOW_PACKAGE).generation, 2);
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).state, PackageState::Loaded);
+    assert!(status(&host, EXPLOSIVE_BOW_PACKAGE).error.is_none());
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).generation, 2);
 }
 
 #[test]
-fn missing_initial_package_disables_bow_until_created() {
+fn missing_initial_package_disables_its_item_until_created() {
     let fixture = Fixture::new();
     let mut host = PackageHost::new(&fixture.0);
     assert!(host.statuses().is_empty());
-    assert_eq!(host.shots_per_second(), 0);
-    assert!(host.fire(BowPower::Low).is_err());
+    assert!(host.launcher_table().get(6).is_none());
+    assert!(shot(&host, 0).is_err());
     fixture.write(BOW);
     poll_disk(&mut host);
-    assert_eq!(status(&host, BOW_PACKAGE).state, PackageState::Loading);
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).state, PackageState::Loading);
     drain(&mut host);
-    assert!(host.fire(BowPower::Low).is_ok());
+    assert!(shot(&host, 0).is_ok());
 }
 
 #[test]
@@ -164,36 +171,91 @@ fn a_second_save_supersedes_an_unpublished_candidate() {
     poll_disk(&mut host);
     fixture.write(&BOW.replace("36.0", "50.0"));
     drain(&mut host);
-    assert_eq!(
-        host.fire(BowPower::Standard).unwrap().projectile.speed,
-        50.0
-    );
-    assert_eq!(status(&host, BOW_PACKAGE).generation, 2);
+    assert_eq!(shot(&host, 1).unwrap().projectile.speed, 50.0);
+    assert_eq!(status(&host, EXPLOSIVE_BOW_PACKAGE).generation, 2);
 }
 
 #[test]
-fn invalid_api_and_commands_are_rejected_before_installation() {
+fn launcher_packages_share_the_item_namespace() {
+    const FLAK: &str = r#"
+(define package-api-version 1)
+(define package-kind "launcher")
+(define launcher-item 9)
+(define launcher-name "Flak Cannon")
+(define shots-per-second 4)
+(define powers (list (launcher-power "flak" (projectile 24.0 6.0 40.0 120)
+                              (explosion 2.0 800.0 6.0 0.5 0.001))))
+"#;
+    let fixture = Fixture::new();
+    fixture.write(BOW);
+    fixture.write_package("flak", FLAK);
+    let host = PackageHost::new(&fixture.0);
+    assert_eq!(host.launcher_table().get(9).unwrap().name, "Flak Cannon");
+    // A second launcher claiming the bow's item errors; sorted order wins.
+    fixture.write_package("z-flak", &FLAK.replace("item 9", "item 6"));
+    let mut host = PackageHost::new(&fixture.0);
+    poll_disk(&mut host);
+    drain(&mut host);
+    let conflict = status(&host, "z-flak");
+    assert_eq!(conflict.state, PackageState::Error);
+    assert!(conflict.error.unwrap().contains("item id 6"));
+    assert!(host.launcher_table().get(6).is_some());
+}
+
+#[test]
+fn launcher_and_melee_conflict_on_one_item_id() {
+    const BLADE: &str = r#"
+(define package-api-version 1)
+(define package-kind "melee")
+(define weapons (list (melee-weapon 6 "Blade" 3.0 12 24 300.0)))
+"#;
+    let fixture = Fixture::new();
+    // The bow claims item 6; a weapon claiming it too loses in sorted order.
+    fixture.write_package("z-melee", BLADE);
+    fixture.write(BOW);
+    let host = PackageHost::new(&fixture.0);
+    let conflict = status(&host, "z-melee");
+    assert_eq!(conflict.state, PackageState::Error);
+    assert!(conflict.error.unwrap().contains("item id 6"));
+    assert!(host.launcher_table().get(6).is_some());
+    assert!(host.melee_table().spec(6).is_none());
+}
+
+#[test]
+fn invalid_api_and_powers_are_rejected_before_installation() {
     for (from, to) in [
         ("version 1", "version 2"),
+        ("\"launcher\"", "\"bow\""),
+        ("item 6", "item 5"),
         ("second 25", "second 0"),
+        ("\"0.5x\"", "0.5"),
         ("36.0", "+nan.0"),
         ("180)", "180.5)"),
         ("6000.0", "-1.0"),
         ("0.35", "2.0"),
-        ("(blast-for-power power)", "(missing-blast power)"),
     ] {
         assert!(
             compile(&BOW.replace(from, to)).is_err(),
             "accepted {from} -> {to}"
         );
     }
+    // A launcher must author at least one selectable preset.
+    const EMPTY: &str = r#"
+(define package-api-version 1)
+(define package-kind "launcher")
+(define launcher-item 6)
+(define launcher-name "Bow")
+(define shots-per-second 1)
+(define powers (list))
+"#;
+    assert!(compile(EMPTY).is_err());
 }
 
 #[test]
-fn runaway_callback_is_interrupted() {
-    let source =
-        format!("{BOW}\n(set! projectile-for-power (lambda (power) (let loop () (loop))))");
-    let error = compile(&source).err().expect("loop was not interrupted");
+fn runaway_source_is_interrupted() {
+    let error = compile(&format!("{BOW}\n(let loop () (loop))"))
+        .err()
+        .expect("loop was not interrupted");
     assert!(error.contains("budget"), "{error}");
 }
 
@@ -267,7 +329,7 @@ fn melee_packages_merge_and_conflicting_ids_error_the_later_package() {
 #[test]
 fn invalid_melee_packages_are_rejected() {
     for (from, to) in [
-        ("(melee-weapon 7", "(melee-weapon 6"),
+        ("(melee-weapon 7", "(melee-weapon 5"),
         ("(melee-weapon 7", "(melee-weapon 7.5"),
         ("2.5 8 18", "2.5 8 18.5"),
         ("2.5 8 18", "20.0 8 18"),

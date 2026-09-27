@@ -467,7 +467,7 @@ impl Simulation {
                     && player.input.attack
                     && self.tick >= player.attack_ready
                     // Registered weapons require ownership; hands, blocks and
-                    // the bow swing the unarmed default as before.
+                    // launchers swing the unarmed default as before.
                     && melee
                         .spec(player.input.selected)
                         .is_none_or(|_| player.inventory.count(player.input.selected) > 0)

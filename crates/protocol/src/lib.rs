@@ -1,5 +1,3 @@
-mod bow_power;
-pub use bow_power::BowPower;
 use controller::PlayerInput;
 pub use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
@@ -12,15 +10,13 @@ pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
 pub const MAX_FRAME: usize = 128 * 1024;
-pub const MAX_ARROWS: usize = 32;
+pub const MAX_PROJECTILES: usize = 32;
 /// Ceiling for one complete dropped-item replication, matching the server bound.
 pub const MAX_DROPS: usize = 64;
-/// Item id of the package-loaded explosive bow. It is not a carried stack:
-/// every client may hotbar it regardless of inventory contents. Item ids are
-/// u32: ids 0–5 are hands and block materials, the bow claims 6, and packages
-/// share the wide namespace above it.
-pub const EXPLOSIVE_BOW_ITEM: u32 = 6;
-pub const EXPLOSIVE_BOW_SHOTS_PER_SECOND: u32 = 25;
+/// Lowest item id a package may claim. Item ids are u32: ids 0–5 are hands
+/// and block materials; launcher and melee packages share the namespace
+/// above this floor.
+pub const FIRST_PACKAGE_ITEM: u32 = 6;
 /// Horizontal chunk radius shared by server configuration and client camera bounds.
 pub const DEFAULT_VIEW_RADIUS: i32 = 16;
 pub const MAX_VIEW_RADIUS: i32 = 64;
@@ -98,12 +94,14 @@ pub enum ClientMessage {
         target: IVec3,
         expected_revision: u64,
     },
-    /// Aim and power preset; the server authors muzzle, velocity, blast, and cooldown.
-    FireBow {
+    /// Held launcher item, aim, and authored power preset index; the server
+    /// authors muzzle, velocity, blast, and cooldown.
+    FireLauncher {
         request: u64,
+        item: u32,
         yaw: f32,
         pitch: f32,
-        power: BowPower,
+        power: u8,
     },
     Respawn {
         life: u64,
@@ -163,7 +161,7 @@ pub enum ServerMessage {
     /// Complete replacement of the bounded projectile set, at 20 Hz.
     Projectiles {
         tick: u64,
-        arrows: Vec<ArrowSnapshot>,
+        projectiles: Vec<ProjectileSnapshot>,
     },
     /// Authoritative detonation. Clients use this only for presentation.
     Explosion {
@@ -171,11 +169,12 @@ pub enum ServerMessage {
         position: Vec3,
         radius: f32,
     },
-    /// Server package lifecycle and authoritative weapon cadence, sent reliably.
+    /// Server package lifecycle and authored item tables, sent reliably.
     Packages {
         revision: u64,
         packages: Vec<PackageStatus>,
-        bow_shots_per_second: u32,
+        /// Launcher items merged across loaded launcher packages.
+        launchers: Vec<LauncherInfo>,
         /// Merged melee weapon table across loaded melee packages.
         melee_weapons: Vec<MeleeWeaponInfo>,
         /// Files shipped by loaded packages under `assets/`, for client download.
@@ -243,6 +242,19 @@ pub struct MeleeWeaponInfo {
     pub model: Option<String>,
 }
 
+/// One authored launcher item as clients need it: display name, authored power
+/// preset labels, and the firing rate for held-button repeat pacing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LauncherInfo {
+    pub item: u32,
+    /// Package that authored this launcher; namespaces its asset paths.
+    pub package: String,
+    pub name: String,
+    /// Display labels for power presets 0..N the client cycles through.
+    pub powers: Vec<String>,
+    pub shots_per_second: u32,
+}
+
 /// One file a loaded package ships under its `assets/` directory. `hash`
 /// versions the content so clients can cache by content, not name.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,7 +273,7 @@ pub struct PhysicsBodySnapshot {
     pub material: u8,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct ArrowSnapshot {
+pub struct ProjectileSnapshot {
     pub id: u32,
     pub position: Vec3,
     pub velocity: Vec3,
@@ -418,6 +430,31 @@ mod tests {
         assert!(decode::<ClientMessage>(&bytes, bytes.len() - 1).is_err());
         bytes.push(0);
         assert!(decode::<ClientMessage>(&bytes, MAX_FRAME).is_err());
+    }
+    #[test]
+    fn fire_launcher_round_trips_item_aim_and_preset() {
+        let bytes = encode(
+            &ClientMessage::FireLauncher {
+                request: 1,
+                item: 6,
+                yaw: 0.25,
+                pitch: -1.2,
+                power: 3,
+            },
+            MAX_FRAME,
+        )
+        .unwrap();
+        let ClientMessage::FireLauncher {
+            request,
+            item,
+            pitch,
+            power,
+            ..
+        } = decode(&bytes, MAX_FRAME).unwrap()
+        else {
+            panic!("wrong message")
+        };
+        assert_eq!((request, item, pitch, power), (1, 6, -1.2, 3));
     }
     #[test]
     fn bounded_physics_snapshot_round_trips_in_one_reliable_frame() {

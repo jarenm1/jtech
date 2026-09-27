@@ -1,14 +1,14 @@
-//! Bounded presentation of server arrows and detonations. No local terrain changes.
+//! Bounded presentation of server projectiles and detonations. No local terrain changes.
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Instant,
 };
 
 use bevy::prelude::*;
-use protocol::{ArrowSnapshot, MAX_ARROWS};
+use protocol::{MAX_PROJECTILES, ProjectileSnapshot};
 
 const SNAPSHOT_SECONDS: f32 = 0.05;
-const ARROW_TIMEOUT: f32 = 1.0;
+const PROJECTILE_TIMEOUT: f32 = 1.0;
 const BLAST_SECONDS: f32 = 0.45;
 const MAX_BLASTS: usize = 32;
 const FADE_STEPS: usize = 16;
@@ -23,14 +23,14 @@ impl Plugin for ProjectilesPlugin {
     }
 }
 
-struct ArrowVisual {
+struct ProjectileVisual {
     entity: Entity,
     previous: Vec3,
     current: Vec3,
     rotation: Quat,
     received: Instant,
 }
-impl ArrowVisual {
+impl ProjectileVisual {
     fn position(&self, now: Instant) -> Vec3 {
         self.previous.lerp(
             self.current,
@@ -47,7 +47,7 @@ struct BlastVisual {
 
 #[derive(Resource, Default)]
 pub struct Projectiles {
-    arrows: HashMap<u32, ArrowVisual>,
+    projectiles: HashMap<u32, ProjectileVisual>,
     tick: Option<u64>,
     blasts: VecDeque<BlastVisual>,
     seen: HashSet<u32>,
@@ -83,7 +83,7 @@ fn setup(
             unlit: true,
             ..default()
         }),
-        // Shared fade palette: resource counts are independent of arrows fired.
+        // Shared fade palette: resource counts are independent of projectiles fired.
         blast_materials: (0..FADE_STEPS)
             .map(|step| {
                 let life = step as f32 / (FADE_STEPS - 1) as f32;
@@ -109,8 +109,8 @@ fn orientation(velocity: Vec3) -> Quat {
 
 impl Projectiles {
     pub fn clear(&mut self, commands: &mut Commands) {
-        for (_, arrow) in self.arrows.drain() {
-            commands.entity(arrow.entity).despawn();
+        for (_, projectile) in self.projectiles.drain() {
+            commands.entity(projectile.entity).despawn();
         }
         for blast in self.blasts.drain(..) {
             commands.entity(blast.entity).despawn();
@@ -123,7 +123,7 @@ impl Projectiles {
     pub fn receive(
         &mut self,
         tick: u64,
-        arrows: &[ArrowSnapshot],
+        projectiles: &[ProjectileSnapshot],
         commands: &mut Commands,
         assets: &ProjectileAssets,
         now: Instant,
@@ -132,31 +132,31 @@ impl Projectiles {
             return;
         }
         self.tick = Some(tick);
-        let valid: Vec<_> = arrows
+        let valid: Vec<_> = projectiles
             .iter()
-            .take(MAX_ARROWS)
-            .filter(|arrow| {
-                arrow.position.is_finite()
-                    && arrow.velocity.is_finite()
-                    && !self.seen.contains(&arrow.id)
+            .take(MAX_PROJECTILES)
+            .filter(|projectile| {
+                projectile.position.is_finite()
+                    && projectile.velocity.is_finite()
+                    && !self.seen.contains(&projectile.id)
             })
             .collect();
-        let ids: HashSet<_> = valid.iter().map(|arrow| arrow.id).collect();
-        self.arrows.retain(|id, arrow| {
+        let ids: HashSet<_> = valid.iter().map(|projectile| projectile.id).collect();
+        self.projectiles.retain(|id, projectile| {
             if ids.contains(id) {
                 true
             } else {
-                commands.entity(arrow.entity).despawn();
+                commands.entity(projectile.entity).despawn();
                 false
             }
         });
-        for arrow in valid {
-            let rotation = orientation(arrow.velocity);
-            self.arrows
-                .entry(arrow.id)
+        for projectile in valid {
+            let rotation = orientation(projectile.velocity);
+            self.projectiles
+                .entry(projectile.id)
                 .and_modify(|visual| {
                     visual.previous = visual.position(now);
-                    visual.current = arrow.position;
+                    visual.current = projectile.position;
                     visual.rotation = rotation;
                     visual.received = now;
                 })
@@ -165,7 +165,7 @@ impl Projectiles {
                         .spawn((
                             Mesh3d(assets.shaft.clone()),
                             MeshMaterial3d(assets.shaft_material.clone()),
-                            Transform::from_translation(arrow.position).with_rotation(rotation),
+                            Transform::from_translation(projectile.position).with_rotation(rotation),
                         ))
                         .with_children(|parent| {
                             parent.spawn((
@@ -175,10 +175,10 @@ impl Projectiles {
                             ));
                         })
                         .id();
-                    ArrowVisual {
+                    ProjectileVisual {
                         entity,
-                        previous: arrow.position,
-                        current: arrow.position,
+                        previous: projectile.position,
+                        current: projectile.position,
                         rotation,
                         received: now,
                     }
@@ -203,8 +203,8 @@ impl Projectiles {
         if self.recent.len() > RECENT_EXPLOSIONS {
             self.seen.remove(&self.recent.pop_front().unwrap());
         }
-        if let Some(arrow) = self.arrows.remove(&id) {
-            commands.entity(arrow.entity).despawn();
+        if let Some(projectile) = self.projectiles.remove(&id) {
+            commands.entity(projectile.entity).despawn();
         }
         if self.blasts.len() == MAX_BLASTS {
             commands
@@ -226,11 +226,11 @@ impl Projectiles {
     }
 
     fn expire(&mut self, commands: &mut Commands, now: Instant) {
-        self.arrows.retain(|_, arrow| {
-            if now.duration_since(arrow.received).as_secs_f32() < ARROW_TIMEOUT {
+        self.projectiles.retain(|_, projectile| {
+            if now.duration_since(projectile.received).as_secs_f32() < PROJECTILE_TIMEOUT {
                 true
             } else {
-                commands.entity(arrow.entity).despawn();
+                commands.entity(projectile.entity).despawn();
                 false
             }
         });
@@ -258,10 +258,10 @@ fn present(
     }
     let now = Instant::now();
     projectiles.expire(&mut commands, now);
-    for arrow in projectiles.arrows.values() {
-        if let Ok((mut transform, _)) = visuals.get_mut(arrow.entity) {
-            transform.translation = arrow.position(now);
-            transform.rotation = arrow.rotation;
+    for projectile in projectiles.projectiles.values() {
+        if let Ok((mut transform, _)) = visuals.get_mut(projectile.entity) {
+            transform.translation = projectile.position(now);
+            transform.rotation = projectile.rotation;
         }
     }
     for blast in &projectiles.blasts {
@@ -298,33 +298,33 @@ mod tests {
         let mut state = Projectiles::default();
         let assets = assets();
         let now = Instant::now();
-        let mut arrow = ArrowSnapshot {
+        let mut projectile = ProjectileSnapshot {
             id: 7,
             position: Vec3::ZERO,
             velocity: Vec3::X * 36.0,
         };
         state.receive(
             1,
-            &[arrow],
+            &[projectile],
             &mut Commands::new(&mut queue, &world),
             &assets,
             now,
         );
         queue.apply(&mut world);
-        let entity = state.arrows[&7].entity;
+        let entity = state.projectiles[&7].entity;
         assert_eq!(world.entities().len(), 2); // Shaft and linked tip.
-        assert!((state.arrows[&7].rotation * Vec3::Z - Vec3::X).length() < 0.001);
-        arrow.position = Vec3::X * 2.0;
+        assert!((state.projectiles[&7].rotation * Vec3::Z - Vec3::X).length() < 0.001);
+        projectile.position = Vec3::X * 2.0;
         state.receive(
             2,
-            &[arrow],
+            &[projectile],
             &mut Commands::new(&mut queue, &world),
             &assets,
             now,
         );
-        assert!((state.arrows[&7].position(now + Duration::from_millis(25)).x - 1.0).abs() < 0.001);
+        assert!((state.projectiles[&7].position(now + Duration::from_millis(25)).x - 1.0).abs() < 0.001);
         state.receive(1, &[], &mut Commands::new(&mut queue, &world), &assets, now);
-        assert_eq!(state.arrows[&7].entity, entity);
+        assert_eq!(state.projectiles[&7].entity, entity);
         state.receive(3, &[], &mut Commands::new(&mut queue, &world), &assets, now);
         queue.apply(&mut world);
         assert_eq!(world.entities().len(), 0);
@@ -337,14 +337,14 @@ mod tests {
         let mut state = Projectiles::default();
         let assets = assets();
         let now = Instant::now();
-        let arrow = ArrowSnapshot {
+        let projectile = ProjectileSnapshot {
             id: 7,
             position: Vec3::ZERO,
             velocity: Vec3::Z,
         };
         state.receive(
             1,
-            &[arrow],
+            &[projectile],
             &mut Commands::new(&mut queue, &world),
             &assets,
             now,
@@ -361,14 +361,14 @@ mod tests {
         }
         state.receive(
             2,
-            &[arrow],
+            &[projectile],
             &mut Commands::new(&mut queue, &world),
             &assets,
             now,
         );
         queue.apply(&mut world);
         assert_eq!(world.entities().len(), 1);
-        assert!(state.arrows.is_empty());
+        assert!(state.projectiles.is_empty());
         for id in 8..300 {
             state.explode(
                 id,
@@ -391,13 +391,13 @@ mod tests {
         state.clear(&mut Commands::new(&mut queue, &world));
         state.receive(
             0,
-            &[arrow],
+            &[projectile],
             &mut Commands::new(&mut queue, &world),
             &assets,
             now,
         );
         queue.apply(&mut world);
-        assert_eq!(state.arrows.len(), 1);
+        assert_eq!(state.projectiles.len(), 1);
         state.expire(
             &mut Commands::new(&mut queue, &world),
             now + Duration::from_secs(2),
@@ -415,7 +415,7 @@ mod tests {
         let now = Instant::now();
         state.receive(
             9,
-            &[ArrowSnapshot {
+            &[ProjectileSnapshot {
                 id: 1,
                 position: Vec3::ZERO,
                 velocity: Vec3::Z,
@@ -441,7 +441,7 @@ mod tests {
         app.update();
         assert_eq!(app.world().entities().len(), 0);
         let state = app.world().resource::<Projectiles>();
-        assert!(state.arrows.is_empty() && state.blasts.is_empty() && state.seen.is_empty());
+        assert!(state.projectiles.is_empty() && state.blasts.is_empty() && state.seen.is_empty());
         assert_eq!(state.tick, None);
     }
 
@@ -452,24 +452,24 @@ mod tests {
         let mut state = Projectiles::default();
         let assets = assets();
         let now = Instant::now();
-        let mut arrows: Vec<_> = (0..MAX_ARROWS as u32 + 4)
-            .map(|id| ArrowSnapshot {
+        let mut projectiles: Vec<_> = (0..MAX_PROJECTILES as u32 + 4)
+            .map(|id| ProjectileSnapshot {
                 id,
                 position: Vec3::ZERO,
                 velocity: Vec3::ZERO,
             })
             .collect();
-        arrows[0].position.x = f32::NAN;
+        projectiles[0].position.x = f32::NAN;
         state.receive(
             0,
-            &arrows,
+            &projectiles,
             &mut Commands::new(&mut queue, &world),
             &assets,
             now,
         );
         queue.apply(&mut world);
-        assert_eq!(state.arrows.len(), MAX_ARROWS - 1);
-        assert_eq!(world.entities().len(), 2 * (MAX_ARROWS as u32 - 1));
+        assert_eq!(state.projectiles.len(), MAX_PROJECTILES - 1);
+        assert_eq!(world.entities().len(), 2 * (MAX_PROJECTILES as u32 - 1));
         state.explode(
             99,
             Vec3::ZERO,

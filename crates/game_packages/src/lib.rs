@@ -4,9 +4,10 @@
 //! Every subdirectory of the packages root (except the startup-only terrain
 //! package) is a live-reloadable package slot. Each `server.scm` declares a
 //! `package-kind`; the host compiles it into the matching native policy and
-//! merges contributions into shared views the simulation reads. Two packages
-//! may both author melee weapons: their item ids merge into one table, and a
-//! conflicting id rejects the later package in sorted order.
+//! merges contributions into shared views the simulation reads. Item ids are
+//! one namespace across every package: launchers and melee weapons claim ids
+//! from the same table, and a conflicting id rejects the later package in
+//! sorted order.
 mod budget;
 mod terrain;
 
@@ -15,7 +16,7 @@ pub use terrain::{TERRAIN_PACKAGE, load_terrain};
 use budget::Budget;
 use gameplay::combat::MeleeSpec;
 use parking_lot::Mutex;
-use protocol::{BowPower, PackageState, PackageStatus};
+use protocol::{FIRST_PACKAGE_ITEM, PackageState, PackageStatus};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
@@ -26,17 +27,17 @@ use std::{
 };
 use steel::{SteelVal, steel_vm::engine::Engine};
 
-/// Directory name of the bow package; also the id clients display for it.
-pub const BOW_PACKAGE: &str = "explosive-bow";
+/// Directory name of the explosive-bow package; also the id clients display.
+pub const EXPLOSIVE_BOW_PACKAGE: &str = "explosive-bow";
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-const CALLBACK_BUDGET: Duration = Duration::from_millis(20);
 const LOAD_BUDGET: Duration = Duration::from_secs(5);
 const API: &str = "
 (define (projectile speed gravity travel lifetime) (list speed gravity travel lifetime))
 (define (explosion radius energy player-speed absorbed pulse)
   (list radius energy player-speed absorbed pulse))
+(define (launcher-power label projectile explosion) (list label projectile explosion))
 (define (melee-weapon id name range damage cooldown-ticks knockback . model)
   (list id name range damage cooldown-ticks knockback model))
 ";
@@ -79,6 +80,16 @@ pub struct BlastSpec {
     pub load_window: f32,
 }
 
+/// One authored power preset: the client-cycled label plus the projectile and
+/// blast the server applies when a shot fired at this preset impacts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PowerSpec {
+    pub label: String,
+    pub projectile: ProjectileSpec,
+    pub blast: BlastSpec,
+}
+
+
 struct Vm {
     engine: Engine,
     budget: Budget,
@@ -107,13 +118,6 @@ impl Vm {
         }
     }
 
-    fn callback(&mut self, name: &str, power: BowPower) -> Result<SteelVal, String> {
-        self.run(CALLBACK_BUDGET, |engine| {
-            engine
-                .call_function_by_name_with_args(name, vec![SteelVal::IntV(power as isize)])
-                .map_err(|error| diagnostic(engine, error))
-        })
-    }
 }
 
 fn diagnostic(engine: &Engine, error: steel::SteelErr) -> String {
@@ -125,16 +129,13 @@ fn diagnostic(engine: &Engine, error: steel::SteelErr) -> String {
 /// read validated native values.
 #[derive(Clone)]
 enum Package {
-    Bow(Arc<BowPackage>),
+    Launcher(Arc<LauncherPackage>),
     Melee(Arc<MeleePackage>),
 }
 
 impl Package {
     fn compile(source: String, path: PathBuf, generation: u64) -> Result<Self, String> {
-        let package_dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+        let package_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let mut vm = Vm::new()?;
         vm.run(LOAD_BUDGET, |engine| {
             engine.run(API).map_err(|error| diagnostic(engine, error))?;
@@ -158,8 +159,9 @@ impl Package {
             return Err("package-kind must be a string".into());
         };
         match kind.as_str() {
-            "bow" => Ok(Self::Bow(Arc::new(BowPackage::from_vm(
-                &mut vm, generation,
+            "launcher" => Ok(Self::Launcher(Arc::new(LauncherPackage::from_vm(
+                &mut vm,
+                generation,
             )?))),
             "melee" => Ok(Self::Melee(Arc::new(MeleePackage::from_vm(
                 &mut vm,
@@ -172,30 +174,65 @@ impl Package {
 
     fn generation(&self) -> u64 {
         match self {
-            Self::Bow(package) => package.generation,
+            Self::Launcher(package) => package.generation,
             Self::Melee(package) => package.generation,
+        }
+    }
+
+    /// Item ids this package claims, for the shared-namespace conflict check.
+    fn claimed_items(&self) -> Vec<(u32, &str)> {
+        match self {
+            Self::Launcher(package) => vec![(package.item, package.name.as_str())],
+            Self::Melee(package) => package
+                .weapons
+                .iter()
+                .map(|weapon| (weapon.id, weapon.name.as_str()))
+                .collect(),
         }
     }
 }
 
-/// Immutable policy for the four network power presets.
-pub struct BowPackage {
+/// Immutable launcher policy: the equipment item it claims, the authored power
+/// presets a client cycles, and the cadence the server admits shots at.
+pub struct LauncherPackage {
     generation: u64,
-    shots_per_second: u32,
-    projectiles: [ProjectileSpec; 4],
-    blasts: [BlastSpec; 4],
+    /// Claimed equipment item id; unique across every loaded package.
+    pub item: u32,
+    /// Display name replicated to clients.
+    pub name: String,
+    pub shots_per_second: u32,
+    powers: Vec<PowerSpec>,
 }
 
-impl BowPackage {
-    /// Compile a standalone bow package; `package-kind` must be `"bow"`.
+/// Most presets a launcher may author; bound keeps `power: u8` sane.
+const MAX_POWERS: usize = 8;
+
+impl LauncherPackage {
+    /// Compile a standalone launcher package; `package-kind` must be `"launcher"`.
     pub fn compile(source: String, path: PathBuf, generation: u64) -> Result<Self, String> {
         match Package::compile(source, path, generation)? {
-            Package::Bow(package) => Ok((*package).clone()),
-            _ => unreachable!("kind dispatch returned a non-bow package"),
+            Package::Launcher(package) => Ok((*package).clone()),
+            _ => unreachable!("kind dispatch returned a non-launcher package"),
         }
     }
 
     fn from_vm(vm: &mut Vm, generation: u64) -> Result<Self, String> {
+        let item = vm
+            .engine
+            .extract_value("launcher-item")
+            .map_err(|e| e.to_string())?;
+        let item = integer(&item, "launcher-item")?;
+        let item = u32::try_from(item)
+            .ok()
+            .filter(|item| *item >= FIRST_PACKAGE_ITEM)
+            .ok_or_else(|| {
+                format!("launcher-item must be an integer in {FIRST_PACKAGE_ITEM}..={}", u32::MAX)
+            })?;
+        let name = vm
+            .engine
+            .extract_value("launcher-name")
+            .map_err(|_| "launcher-name must be a string".to_string())?;
+        let name = label(&name, "launcher-name")?;
         let rate = vm
             .engine
             .extract_value("shots-per-second")
@@ -203,43 +240,89 @@ impl BowPackage {
         let SteelVal::IntV(rate @ 1..=60) = rate else {
             return Err("shots-per-second must be an integer in 1..=60".into());
         };
-        let projectiles = four(BowPower::ALL.map(|power| {
-            vm.callback("projectile-for-power", power)
-                .and_then(projectile_spec)
-        }))?;
-        let blasts = four(
-            BowPower::ALL.map(|power| vm.callback("blast-for-power", power).and_then(blast_spec)),
-        )?;
+        let powers = vm
+            .engine
+            .extract_value("powers")
+            .map_err(|_| "powers must be a list of launcher-power values".to_string())?;
+        let SteelVal::ListV(entries) = powers else {
+            return Err("powers must be a list of launcher-power values".into());
+        };
+        if entries.is_empty() || entries.len() > MAX_POWERS {
+            return Err(format!("powers must declare 1..={MAX_POWERS} presets"));
+        }
+        let powers = entries
+            .iter()
+            .map(|entry| power_spec(entry.clone()))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             generation,
+            item,
+            name,
             shots_per_second: rate as u32,
-            projectiles,
-            blasts,
+            powers,
         })
     }
 
-    pub fn projectile(&self, power: BowPower) -> ProjectileSpec {
-        self.projectiles[power as usize]
+    /// Authored presets in client cycling order; `power` indexes this slice.
+    pub fn powers(&self) -> &[PowerSpec] {
+        &self.powers
     }
-    pub fn impact(&self, power: BowPower) -> BlastSpec {
-        self.blasts[power as usize]
+
+    /// Start one shot at the given preset; `power` must index `powers()`.
+    pub fn shot(self: &Arc<Self>, power: u8) -> Result<Shot, String> {
+        let spec = self
+            .powers
+            .get(usize::from(power))
+            .ok_or_else(|| format!("power preset {power} out of range"))?;
+        Ok(Shot {
+            projectile: spec.projectile,
+            blast: spec.blast,
+            power,
+            package: self.clone(),
+        })
     }
 }
 
-impl Clone for BowPackage {
+impl Clone for LauncherPackage {
     fn clone(&self) -> Self {
         Self {
             generation: self.generation,
+            item: self.item,
+            name: self.name.clone(),
             shots_per_second: self.shots_per_second,
-            projectiles: self.projectiles,
-            blasts: self.blasts,
+            powers: self.powers.clone(),
         }
     }
 }
 
-fn four<T>(values: [Result<T, String>; 4]) -> Result<[T; 4], String> {
-    let [a, b, c, d] = values;
-    Ok([a?, b?, c?, d?])
+/// `(launcher-power label projectile explosion)` — one client-selectable preset.
+fn power_spec(value: SteelVal) -> Result<PowerSpec, String> {
+    let SteelVal::ListV(fields) = value else {
+        return Err("each power must be a launcher-power value".into());
+    };
+    if fields.len() != 3 {
+        return Err("launcher-power takes label, projectile, explosion".into());
+    }
+    let label = label(&fields[0], "power label")?;
+    let projectile = projectile_spec(fields[1].clone())?;
+    let blast = blast_spec(fields[2].clone())?;
+    Ok(PowerSpec {
+        label,
+        projectile,
+        blast,
+    })
+}
+
+/// Bounded display text: strip controls, cap length, reject empties.
+fn label(value: &SteelVal, name: &str) -> Result<String, String> {
+    let SteelVal::StringV(text) = value else {
+        return Err(format!("{name} must be a string"));
+    };
+    let text: String = text.chars().filter(|c| !c.is_control()).take(32).collect();
+    if text.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    Ok(text)
 }
 
 fn projectile_spec(value: SteelVal) -> Result<ProjectileSpec, String> {
@@ -279,8 +362,8 @@ fn blast_spec(value: SteelVal) -> Result<BlastSpec, String> {
 /// A melee weapon one package contributes to the shared item table.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeleeWeapon {
-    /// Item id; must exceed `protocol::EXPLOSIVE_BOW_ITEM` so it cannot shadow
-    /// hands, block materials, or the bow.
+    /// Item id; must be at or above `protocol::FIRST_PACKAGE_ITEM` so it cannot
+    /// shadow hands or block materials.
     pub id: u32,
     /// Owning package id, assigned when the weapon merges into the table.
     pub package: String,
@@ -351,25 +434,15 @@ fn melee_weapon(value: SteelVal, package_dir: &Path) -> Result<MeleeWeapon, Stri
     let id = integer(&fields[0], "weapon id")?;
     let id = u32::try_from(id)
         .ok()
-        .filter(|id| *id > protocol::EXPLOSIVE_BOW_ITEM)
+        .filter(|id| *id >= protocol::FIRST_PACKAGE_ITEM)
         .ok_or_else(|| {
             format!(
                 "weapon id must be an integer in {}..={}",
-                protocol::EXPLOSIVE_BOW_ITEM + 1,
+                protocol::FIRST_PACKAGE_ITEM,
                 u32::MAX
             )
         })?;
-    let SteelVal::StringV(name) = &fields[1] else {
-        return Err("weapon name must be a string".into());
-    };
-    let name: String = name
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(32)
-        .collect();
-    if name.is_empty() {
-        return Err("weapon name must not be empty".into());
-    }
+    let name = label(&fields[1], "weapon name")?;
     let range = number(&fields[2], "weapon range")?;
     let damage = integer(&fields[3], "weapon damage")?;
     let cooldown = integer(&fields[4], "weapon cooldown ticks")?;
@@ -507,7 +580,7 @@ pub struct MeleeTable {
 
 impl MeleeTable {
     /// Authored spec for a registered weapon item; `None` for hands, blocks,
-    /// the bow, and unknown ids.
+    /// launchers, and unknown ids.
     pub fn spec(&self, item: u32) -> Option<MeleeSpec> {
         self.weapons.get(&item).map(|weapon| weapon.spec)
     }
@@ -532,16 +605,70 @@ impl MeleeTable {
     }
 }
 
+/// One launcher item merged into the shared table: the claiming package's id
+/// plus the arc shots pin so in-flight projectiles keep their generation.
+#[derive(Clone)]
+pub struct LauncherEntry {
+    /// Package directory id that authored the launcher.
+    pub package: String,
+    pub launcher: Arc<LauncherPackage>,
+}
+
+/// Merged launcher view across every loaded launcher package. Item ids share
+/// the melee namespace: the host rejects whichever package claims an occupied
+/// id second in sorted order.
+#[derive(Clone, Default)]
+pub struct LauncherTable {
+    launchers: Arc<BTreeMap<u32, LauncherEntry>>,
+}
+
+impl LauncherTable {
+    /// Authored package for a launcher item; `None` for non-launcher items.
+    pub fn get(&self, item: u32) -> Option<&Arc<LauncherPackage>> {
+        self.launchers.get(&item).map(|entry| &entry.launcher)
+    }
+
+    /// Every registered launcher, item-sorted, for replication to clients.
+    pub fn launchers(&self) -> impl Iterator<Item = &LauncherEntry> {
+        self.launchers.values()
+    }
+
+    /// Start one shot from the item's package at the given preset.
+    pub fn shot(&self, item: u32, power: u8) -> Result<Shot, String> {
+        self.get(item)
+            .ok_or_else(|| format!("no launcher package claims item {item}"))?
+            .shot(power)
+    }
+
+    /// Launcher items are equipment; everything else stacks.
+    pub fn kind(&self, item: u32) -> protocol::ItemKind {
+        if self.launchers.contains_key(&item) {
+            protocol::ItemKind::Equipment
+        } else {
+            protocol::ItemKind::Stack
+        }
+    }
+
+    /// item -> authored firing rate, for change detection across reloads.
+    fn rates(&self) -> BTreeMap<u32, u32> {
+        self.launchers
+            .iter()
+            .map(|(&item, entry)| (item, entry.launcher.shots_per_second))
+            .collect()
+    }
+}
+
+/// An admitted shot: the firing preset's specs plus the package generation to
+/// apply at impact, regardless of later reloads.
 pub struct Shot {
     pub projectile: ProjectileSpec,
-    pub power: BowPower,
-    package: Arc<BowPackage>,
+    pub blast: BlastSpec,
+    /// Index into the firing package's `powers()` table.
+    pub power: u8,
+    package: Arc<LauncherPackage>,
 }
 
 impl Shot {
-    pub fn impact(&self) -> BlastSpec {
-        self.package.impact(self.power)
-    }
     pub fn generation(&self) -> u64 {
         self.package.generation
     }
@@ -655,7 +782,7 @@ pub struct PackageHost {
     slots: BTreeMap<String, PackageSlot>,
     next_poll: Instant,
     revision: u64,
-    active_bow: Option<Arc<BowPackage>>,
+    launchers: LauncherTable,
     melee: MeleeTable,
     /// (package, path) -> content fingerprint for every file under `assets/`.
     assets: BTreeMap<(String, String), AssetEntry>,
@@ -687,8 +814,8 @@ impl PackageHost {
             slots: BTreeMap::new(),
             next_poll: Instant::now() + POLL_INTERVAL,
             revision: 0,
+            launchers: LauncherTable::default(),
             melee: MeleeTable::default(),
-            active_bow: None,
             assets: BTreeMap::new(),
         };
         for id in discover(directory) {
@@ -715,8 +842,9 @@ impl PackageHost {
     pub fn revision(&self) -> u64 {
         self.revision
     }
-    pub fn shots_per_second(&self) -> u32 {
-        self.active_bow.as_ref().map_or(0, |p| p.shots_per_second)
+    /// Merged launcher table across loaded launcher packages.
+    pub fn launcher_table(&self) -> LauncherTable {
+        self.launchers.clone()
     }
     /// Merged melee weapon table across loaded melee packages.
     pub fn melee_table(&self) -> MeleeTable {
@@ -803,23 +931,11 @@ impl PackageHost {
         }
     }
 
-    pub fn fire(&self, power: BowPower) -> Result<Shot, String> {
-        let package = self
-            .active_bow
-            .clone()
-            .ok_or_else(|| "no bow package is loaded".to_string())?;
-        Ok(Shot {
-            projectile: package.projectile(power),
-            power,
-            package,
-        })
-    }
-
-    /// Call before admitting simulation commands. Returns true when the active
-    /// bow firing rate changed, so callers can reset deadlines expressed in
-    /// rate units.
+    /// Call before admitting simulation commands. Returns true when any
+    /// launcher firing rate changed, so callers can reset deadlines expressed
+    /// in rate units.
     pub fn poll(&mut self) -> bool {
-        let old_rate = self.shots_per_second();
+        let old_rates = self.launchers.rates();
         let mut ready = Vec::new();
         for (id, slot) in &mut self.slots {
             let result = slot
@@ -893,7 +1009,7 @@ impl PackageHost {
         if deadline_hit {
             self.revision += 1;
         }
-        old_rate != self.shots_per_second()
+        old_rates != self.launchers.rates()
     }
 
     fn install_slot(&mut self, slot: PackageSlot, result: LoadResult) {
@@ -924,54 +1040,48 @@ impl PackageHost {
         self.rebuild_views();
     }
 
-    /// Item ids are a shared namespace: a melee package may not claim an id an
-    /// already-loaded package owns, and only one bow package may be active.
-    /// Sorted slot order makes the winner deterministic; the loser reports an
-    /// error until its ids change or the winner unloads.
+    /// Item ids are a shared namespace across every kind: a package may not
+    /// claim an id an already-loaded package owns. Sorted slot order makes the
+    /// winner deterministic; the loser reports an error until its ids change
+    /// or the winner unloads.
     fn check_conflicts(&self, id: &str, package: &Package) -> Result<(), String> {
-        match package {
-            Package::Bow(_) => self
-                .slots
-                .iter()
-                .find(|(other, slot)| {
-                    *other != id && matches!(slot.active, Some(Package::Bow(_)))
-                })
-                .map_or(Ok(()), |(other, _)| {
-                    Err(format!("bow already provided by package {other}"))
-                }),
-            Package::Melee(melee) => {
-                for (other, slot) in &self.slots {
-                    if *other == id {
-                        continue;
-                    }
-                    let Some(Package::Melee(active)) = &slot.active else {
-                        continue;
-                    };
-                    for weapon in &melee.weapons {
-                        if let Some(claimed) = active
-                            .weapons
-                            .iter()
-                            .find(|claimed| claimed.id == weapon.id)
-                        {
-                            return Err(format!(
-                                "item id {} ({}) already provided by package {other} ({})",
-                                weapon.id, weapon.name, claimed.name
-                            ));
-                        }
-                    }
+        for (item, name) in package.claimed_items() {
+            for (other, slot) in &self.slots {
+                if *other == id {
+                    continue;
                 }
-                Ok(())
+                let Some(active) = &slot.active else {
+                    continue;
+                };
+                if let Some((_, claimed)) = active
+                    .claimed_items()
+                    .into_iter()
+                    .find(|(claimed_id, _)| *claimed_id == item)
+                {
+                    return Err(format!(
+                        "item id {item} ({name}) already provided by package {other} ({claimed})"
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     fn rebuild_views(&mut self) {
-        self.active_bow = None;
+        let mut launchers = BTreeMap::new();
         let mut weapons = HashMap::new();
         let mut spawn_items = Vec::new();
         for slot in self.slots.values() {
             match &slot.active {
-                Some(Package::Bow(package)) => self.active_bow = Some(package.clone()),
+                Some(Package::Launcher(package)) => {
+                    launchers.insert(
+                        package.item,
+                        LauncherEntry {
+                            package: slot.status.id.clone(),
+                            launcher: package.clone(),
+                        },
+                    );
+                }
                 Some(Package::Melee(package)) => {
                     for weapon in &package.weapons {
                         weapons.insert(
@@ -987,6 +1097,9 @@ impl PackageHost {
                 None => {}
             }
         }
+        self.launchers = LauncherTable {
+            launchers: Arc::new(launchers),
+        };
         self.melee = MeleeTable {
             weapons: Arc::new(weapons),
             spawn_items: Arc::new(spawn_items),

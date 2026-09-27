@@ -6,7 +6,7 @@ impl Simulation {
     pub(super) fn poll_packages(&mut self) {
         if self.packages.poll() {
             for player in self.players.values_mut() {
-                player.next_bow_time = 0;
+                player.next_launch.clear();
             }
         }
     }
@@ -32,7 +32,27 @@ impl Simulation {
         let message = ServerMessage::Packages {
             revision,
             packages,
-            bow_shots_per_second: self.packages.shots_per_second(),
+            launchers: {
+                let mut launchers: Vec<_> = self
+                    .packages
+                    .launcher_table()
+                    .launchers()
+                    .map(|entry| protocol::LauncherInfo {
+                        item: entry.launcher.item,
+                        package: entry.package.clone(),
+                        name: entry.launcher.name.clone(),
+                        powers: entry
+                            .launcher
+                            .powers()
+                            .iter()
+                            .map(|power| power.label.clone())
+                            .collect(),
+                        shots_per_second: entry.launcher.shots_per_second,
+                    })
+                    .collect();
+                launchers.sort_by_key(|launcher| launcher.item);
+                launchers
+            },
             melee_weapons: {
                 let mut weapons: Vec<_> = self
                     .packages
@@ -136,20 +156,28 @@ impl Simulation {
 }
 
 #[cfg(test)]
-pub(super) fn test_blast(power: protocol::BowPower) -> game_packages::BlastSpec {
-    test_package().impact(power)
+pub(super) fn test_blast(power: u8) -> game_packages::BlastSpec {
+    test_package().powers()[usize::from(power)].blast
 }
 
 #[cfg(test)]
-pub(super) fn test_package() -> &'static game_packages::BowPackage {
-    static PACKAGE: std::sync::OnceLock<game_packages::BowPackage> = std::sync::OnceLock::new();
-    PACKAGE.get_or_init(|| {
-        game_packages::BowPackage::compile(
-            include_str!("../../../packages/explosive-bow/server.scm").to_owned(),
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../packages/explosive-bow/server.scm"),
-            1,
-        )
-        .unwrap()
-    })
+pub(super) fn test_shot(power: u8) -> game_packages::Shot {
+    test_package().shot(power).unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn test_package() -> std::sync::Arc<game_packages::LauncherPackage> {
+    static PACKAGE: std::sync::LazyLock<std::sync::Arc<game_packages::LauncherPackage>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(
+                game_packages::LauncherPackage::compile(
+                    include_str!("../../../packages/explosive-bow/server.scm").to_owned(),
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../packages/explosive-bow/server.scm"),
+                    1,
+                )
+                .unwrap(),
+            )
+        });
+    PACKAGE.clone()
 }

@@ -6,18 +6,19 @@ mod actors;
 mod blast_jump_tests;
 #[cfg(test)]
 mod bombardment_tests;
-mod bow;
-mod bow_server;
+mod detonation;
 mod brains;
 mod explosion;
 mod health;
 mod items;
+mod launcher;
 mod material_damage;
 #[cfg(test)]
 mod noclip_tests;
 mod packages;
 mod physics_slice;
 mod streaming;
+mod projectile;
 mod terrain_stream;
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
@@ -186,10 +187,10 @@ impl Plugin for SimulationPlugin {
                 journal_blocks: 0,
                 damage: HashMap::new(),
                 strikes: VecDeque::new(),
-                arrows: Vec::new(),
+                projectiles: Vec::new(),
                 detonations: VecDeque::new(),
-                next_arrow: 1,
-                arrow_revision: 0,
+                next_projectile: 1,
+                projectile_revision: 0,
                 drops: VecDeque::new(),
                 next_drop: 1,
                 drop_revision: 0,
@@ -259,9 +260,10 @@ struct Player {
     highest_request: u64,
     physics_revision: Option<u64>,
     body_push_velocity: Vec3,
-    // Deadline in 1/(60 * bow shots per second) seconds for fractional-tick cadence.
-    next_bow_time: u64,
-    arrow_revision: Option<u64>,
+    // Per launcher item, deadline in 1/(60 * shots-per-second) seconds for
+    // fractional-tick cadence.
+    next_launch: HashMap<u32, u64>,
+    projectile_revision: Option<u64>,
     package_revision: Option<u64>,
     /// Fixed tick when the next melee swing is allowed.
     attack_ready: u64,
@@ -299,8 +301,8 @@ impl Player {
             highest_request: 0,
             physics_revision: None,
             body_push_velocity: Vec3::ZERO,
-            next_bow_time: 0,
-            arrow_revision: None,
+            next_launch: HashMap::new(),
+            projectile_revision: None,
             package_revision: None,
             inventory: Inventory::default(),
             attack_ready: 0,
@@ -352,7 +354,7 @@ pub struct SimulationMetrics {
     pub snapshot_errors: u64,
     pub destroyed_blocks: u64,
     pub rejected_contacts: u64,
-    pub bow_shots: u64,
+    pub launches: u64,
     pub explosions: u64,
 }
 #[derive(Resource)]
@@ -371,10 +373,10 @@ pub struct Simulation {
     /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
     damage: HashMap<IVec3, DamageState>,
     strikes: VecDeque<QueuedStrike>,
-    arrows: Vec<bow::Arrow>,
+    projectiles: Vec<projectile::Projectile>,
     detonations: VecDeque<(u32, Vec3, game_packages::BlastSpec, Option<SimEntity>)>,
-    next_arrow: u32,
-    arrow_revision: u64,
+    next_projectile: u32,
+    projectile_revision: u64,
     drops: VecDeque<items::Drop>,
     next_drop: u32,
     drop_revision: u64,
@@ -440,10 +442,10 @@ impl Simulation {
             self.strikes.len()
         );
         eprintln!(
-            "bow shots={} explosions={} flying={} pending_blasts={}",
-            self.metrics.bow_shots,
+            "launches={} explosions={} flying={} pending_blasts={}",
+            self.metrics.launches,
             self.metrics.explosions,
-            self.arrows.len(),
+            self.projectiles.len(),
             self.detonations.len()
         );
         if let Some(p) = &self.physics {
@@ -1284,12 +1286,13 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 target,
                 expected_revision,
             } => sim.edit(&mut world, id, request, target, 0, expected_revision, true),
-            ClientMessage::FireBow {
+            ClientMessage::FireLauncher {
                 request,
+                item,
                 yaw,
                 pitch,
                 power,
-            } => sim.fire_bow(&world, id, request, yaw, pitch, power),
+            } => sim.fire_launcher(&world, id, request, item, yaw, pitch, power),
             ClientMessage::Resync { coord } => {
                 if let Some(player) = sim.players.get_mut(&id) {
                     // Baseline transmission has a bounded per-tick batch. Retain
@@ -1311,7 +1314,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     }
     sim.finish_respawns(&world);
     sim.drain_strikes(&mut world);
-    sim.advance_bow(&mut world);
+    sim.advance_launchers(&mut world);
     sim.replicate_packages();
     sim.advance_physics(&mut world);
     sim.advance_drops(&world);
