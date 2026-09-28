@@ -1,6 +1,6 @@
 # Local environment
 .direnv/
-.envrc
+.envrc.local
 .env
 .env.*
 !.env.example
