@@ -12,13 +12,15 @@ agent work happens in a dedicated jj workspace under `~/workspaces/`.
    - Result is `/home/jaren/jtech` → you are in `default`. Create a workspace
      (step 2) before any write, build, or test.
    - Result is a path under `~/workspaces/` → continue there.
-2. Create one workspace per task:
+2. Create one workspace per task, based on `main@origin`:
    ```sh
-   jj workspace add ~/workspaces/<slug>
+   jj git fetch
+   jj workspace add ~/workspaces/<slug> -r main@origin
    ```
-   `<slug>` = short task name, e.g. `terrain-chunking`. The new working-copy
-   commit is based on the tip of `default`'s described history; pass `-r` to
-   base on something else.
+   `<slug>` = short task name, e.g. `terrain-chunking`. Never base on
+   `default`'s tip — it carries the human's unmerged work and produces
+   unmergeable PRs. If a task needs code not yet on `main`, tell the human
+   to land it first instead of basing on it.
 3. Keep every write inside `~/workspaces/<slug>`: `cwd`, file paths, temp
    files, build outputs. Reads of `/home/jaren/jtech` are fine; writes are
    not. Nothing enforces this but convention — check `jj root` before edits.
@@ -58,9 +60,11 @@ agent work happens in a dedicated jj workspace under `~/workspaces/`.
   ```
   If the parent env is unknown or the allow isn't in place, use
   `nix develop ~/workspaces/<slug> -c <cmd>` instead — no `allow` needed.
-- `CARGO_TARGET_DIR` is shared (`~/workspaces/.cargo-target`): the bevy dep
-  graph compiles once across all workspaces. A cargo run may block on another
-  agent's build lock — wait for it; don't override the variable.
+- `CARGO_TARGET_DIR` is per-workspace (`<ws>/target`): cargo keys path-dep
+  artifacts by crate name, not workspace directory — a shared target dir lets
+  divergent sibling workspaces poison each other's build artifacts (observed:
+  phantom stale-API compile errors). Cold builds are the price of isolation;
+  never point two workspaces at the same target dir.
 - Minimum gate before reporting done: `cargo check -p <touched crates>` (whole
   workspace when crate boundaries are unclear) plus `cargo test -p` for
   touched crates with tests. The compile gate is the agent's; gameplay/
@@ -80,3 +84,52 @@ jj workspace add ~/workspaces/review-<slug> -r <change-id>
 After the human returns findings, resume in the same workspace and
 `jj squash` fixes into the relevant commit. Leave the workspace in place when
 reporting done — the human runs `jj workspace forget <slug>` after review.
+
+### Pull requests (optional review layer)
+
+The human may ask for a GitHub PR instead of an in-workspace handoff. Then:
+
+```sh
+jj bookmark create <slug>                     # once, on your tip change
+jj git push --bookmark <slug> --allow-new
+gh pr create --head <slug> --base main --title "<type>: <what>" \
+    --body-file pr-body.md                    # body follows the template
+```
+
+Rebase flow (linear history — repo enforces rebase-only merges, no merge or
+squash commits):
+
+```sh
+jj git fetch
+jj rebase -b <slug> -d main@origin   # keep the branch on fresh main
+jj git push --bookmark <slug>
+```
+
+- Follow `.github/pull_request_template.md` exactly. Automated checks must
+  list the real commands run and their results — never claim checks you
+  didn't run. Manual-verification steps must be concrete enough to execute
+  blind (binary, flags, expected behavior).
+- After `jj squash` fixes, `jj git push --bookmark <slug>` again; jj
+  force-pushes rewritten commits automatically. Never `--force` yourself,
+  never merge or close the PR — the human owns the merge.
+- `gh` runs under the human's account; the PR is public-facing. Don't push
+  scratch or half-failed work — push once the local gate above passes.
+
+#### Visual evidence
+
+Gameplay-affecting diffs SHOULD have evidence. What works today, cheapest
+first:
+
+- **Headless asserts** — `cargo run -p server --bin smoke` already runs a
+  scripted client in-process; add assertions and paste the output. Preferred
+  for logic; not visual.
+- **Screenshots** — run the client on the host display
+  (`DISPLAY=:0`/`WAYLAND_DISPLAY=wayland-1` are set in this environment),
+  capture with `grim` (wayland) or `import -window root`, and link the file.
+- **Clips** — `ffmpeg -f x11grab` / `wl-screenrec` can record the running
+  client window. Works, but flaky under load; budget a few retries.
+
+Video cannot be embedded in a PR body via `gh` alone — playable embeds
+require an upload through the github.com web UI, which agents lack. Link
+files from the repo wiki (`git push` to `<repo>.wiki.git`), a release
+asset, or an artifacts host instead; image links render inline.
