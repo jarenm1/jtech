@@ -21,7 +21,7 @@ use physics::{
     look_direction,
 };
 use protocol::ActorSnapshot;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use voxel_world::VoxelWorld;
 
 /// Fixed ticks a dead actor waits before respawning at its spawn point.
@@ -140,7 +140,8 @@ pub enum SimEntity {
     Actor(u32),
 }
 
-/// Per-tick attribution event pushed onto `Simulation::events`.
+/// Per-tick attribution event pushed onto `Simulation::events`. The backlog is
+/// bounded at `MAX_QUEUED_EVENTS`; when full, the oldest events drop first.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SimEvent {
     DamageDealt {
@@ -154,7 +155,16 @@ pub enum SimEvent {
         id: u32,
         killer: Option<SimEntity>,
     },
+    /// A player reached zero health; `killer` is who landed the final hit.
+    PlayerDied {
+        id: u64,
+        killer: Option<SimEntity>,
+    },
 }
+
+/// Backlog bound for undrained `SimEvent`s so a consumer that never calls
+/// `drain_events` cannot grow memory; the most recent events are kept.
+pub(super) const MAX_QUEUED_EVENTS: usize = 4096;
 
 /// One nearby entity as a policy sees it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -349,6 +359,38 @@ impl Simulation {
         true
     }
 
+    /// Push one event onto the bounded backlog, dropping the oldest when full.
+    pub(super) fn push_event(&mut self, event: SimEvent) {
+        push_event(&mut self.events, event);
+    }
+
+    /// Apply player damage with event attribution: `DamageDealt` for every
+    /// landed hit, plus `PlayerDied` when this hit depleted the victim.
+    /// Returns the points lost, like `damage_player`.
+    pub(super) fn damage_player_event(
+        &mut self,
+        source: SimEntity,
+        target: u64,
+        damage: u16,
+    ) -> Option<u16> {
+        let amount = self.damage_player(target, damage)?;
+        // A hit on an already-dead player loses nothing and is not a new kill.
+        let killed = amount > 0 && self.players[&target].health.is_depleted();
+        self.push_event(SimEvent::DamageDealt {
+            source,
+            target: SimEntity::Player(target),
+            amount,
+            killed,
+        });
+        if killed {
+            self.push_event(SimEvent::PlayerDied {
+                id: target,
+                killer: Some(source),
+            });
+        }
+        Some(amount)
+    }
+
     /// One actor's policy view for tests, trainers and inspection tools.
     pub fn observe(&self, id: u32, world: &VoxelWorld) -> Option<ActorObservation> {
         let actor = self.actors.get(&id)?;
@@ -490,17 +532,23 @@ impl Simulation {
                     if actor.health.is_depleted() {
                         actor.respawn_at = Some(self.tick + ACTOR_RESPAWN_TICKS);
                     }
-                    self.events.push(SimEvent::DamageDealt {
-                        source: SimEntity::Player(id),
-                        target: SimEntity::Actor(actor_id),
-                        amount,
-                        killed: actor.health.is_depleted(),
-                    });
+                    push_event(
+                        &mut self.events,
+                        SimEvent::DamageDealt {
+                            source: SimEntity::Player(id),
+                            target: SimEntity::Actor(actor_id),
+                            amount,
+                            killed: actor.health.is_depleted(),
+                        },
+                    );
                     if !was_depleted && actor.health.is_depleted() {
-                        self.events.push(SimEvent::ActorDied {
-                            id: actor_id,
-                            killer: Some(SimEntity::Player(id)),
-                        });
+                        push_event(
+                            &mut self.events,
+                            SimEvent::ActorDied {
+                                id: actor_id,
+                                killer: Some(SimEntity::Player(id)),
+                            },
+                        );
                     }
                 }
             } else {
@@ -508,7 +556,7 @@ impl Simulation {
                 if let Some(victim) = self.players.get_mut(&hit.target) {
                     apply_player_impulse(&mut victim.state, hit.impulse);
                 }
-                self.damage_player(hit.target, hit.damage);
+                self.damage_player_event(SimEntity::Player(id), hit.target, hit.damage);
             }
         }
     }
@@ -557,34 +605,30 @@ impl Simulation {
                 if victim.health.is_depleted() {
                     victim.respawn_at = Some(self.tick + ACTOR_RESPAWN_TICKS);
                 }
-                self.events.push(SimEvent::DamageDealt {
-                    source: SimEntity::Actor(id),
-                    target: SimEntity::Actor(target_id),
-                    amount,
-                    killed: victim.health.is_depleted(),
-                });
+                push_event(
+                    &mut self.events,
+                    SimEvent::DamageDealt {
+                        source: SimEntity::Actor(id),
+                        target: SimEntity::Actor(target_id),
+                        amount,
+                        killed: victim.health.is_depleted(),
+                    },
+                );
                 if !was_depleted && victim.health.is_depleted() {
-                    self.events.push(SimEvent::ActorDied {
-                        id: target_id,
-                        killer: Some(SimEntity::Actor(id)),
-                    });
+                    push_event(
+                        &mut self.events,
+                        SimEvent::ActorDied {
+                            id: target_id,
+                            killer: Some(SimEntity::Actor(id)),
+                        },
+                    );
                 }
             }
         } else {
             if let Some(victim) = self.players.get_mut(&hit.target) {
                 apply_player_impulse(&mut victim.state, hit.impulse);
             }
-            if let Some(amount) = self.damage_player(hit.target, hit.damage) {
-                self.events.push(SimEvent::DamageDealt {
-                    source: SimEntity::Actor(id),
-                    target: SimEntity::Player(hit.target),
-                    amount,
-                    killed: self
-                        .players
-                        .get(&hit.target)
-                        .is_some_and(|victim| victim.health.is_depleted()),
-                });
-            }
+            self.damage_player_event(SimEntity::Actor(id), hit.target, hit.damage);
         }
     }
 
@@ -618,3 +662,12 @@ impl Simulation {
 
 /// Deterministic order so brains and events see a stable actor sequence.
 pub(super) type ActorMap = BTreeMap<u32, Actor>;
+
+/// Bounded push: a full backlog drops the oldest event first. A free function
+/// so hit resolution can push while holding an `actors` entry borrow.
+fn push_event(events: &mut VecDeque<SimEvent>, event: SimEvent) {
+    if events.len() == MAX_QUEUED_EVENTS {
+        events.pop_front();
+    }
+    events.push_back(event);
+}

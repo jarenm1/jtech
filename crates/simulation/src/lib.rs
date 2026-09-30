@@ -207,7 +207,7 @@ impl Plugin for SimulationPlugin {
                 spawn_chunks,
                 actors: BTreeMap::new(),
                 next_actor: 1,
-                events: Vec::new(),
+                events: VecDeque::new(),
             })
             .add_systems(Update, advance);
         // The training dummy shares the player spawn volume so it is always
@@ -372,7 +372,7 @@ pub struct Simulation {
     damage: HashMap<IVec3, DamageState>,
     strikes: VecDeque<QueuedStrike>,
     arrows: Vec<bow::Arrow>,
-    detonations: VecDeque<(u32, Vec3, game_packages::BlastSpec)>,
+    detonations: VecDeque<(u32, Vec3, game_packages::BlastSpec, Option<SimEntity>)>,
     next_arrow: u32,
     arrow_revision: u64,
     drops: VecDeque<items::Drop>,
@@ -387,7 +387,9 @@ pub struct Simulation {
     spawn_chunks: HashSet<IVec3>,
     actors: actors::ActorMap,
     next_actor: u32,
-    events: Vec<SimEvent>,
+    /// Backlog of per-tick attribution events for `drain_events`; bounded
+    /// oldest-first so an undraining consumer cannot grow memory.
+    events: VecDeque<SimEvent>,
 }
 impl Simulation {
     pub fn player_count(&self) -> usize {
@@ -967,9 +969,12 @@ impl Simulation {
         }
         self.physics = Some(physics);
     }
-    /// Take the per-tick event stream, leaving an empty buffer.
+    /// Take the buffered event stream, leaving an empty backlog.
+    /// Events persist until drained (never cleared per tick); when the backlog
+    /// reaches `MAX_QUEUED_EVENTS` the oldest events drop so the most recent
+    /// history is always retained for a consumer that drains late or never.
     pub fn drain_events(&mut self) -> Vec<SimEvent> {
-        std::mem::take(&mut self.events)
+        std::mem::take(&mut self.events).into()
     }
 }
 fn validate_player_edit(
@@ -2089,4 +2094,95 @@ mod tests {
         );
         put_resources(&mut app, world, sim);
     }
+
+    #[test]
+    fn event_backlog_stays_bounded_and_keeps_newest_events() {
+        let mut app = headless_app(1);
+        let (world, mut sim) = take_resources(&mut app);
+        for index in 0..(actors::MAX_QUEUED_EVENTS + 7) {
+            sim.push_event(SimEvent::DamageDealt {
+                source: SimEntity::Actor(1),
+                target: SimEntity::Player(index as u64),
+                amount: 1,
+                killed: false,
+            });
+        }
+        assert_eq!(sim.events.len(), actors::MAX_QUEUED_EVENTS);
+        // Real ticks with nothing to drain must not clear or overflow it.
+        put_resources(&mut app, world, sim);
+        for _ in 0..5 {
+            app.update();
+        }
+        let mut sim = app.world_mut().resource_mut::<Simulation>();
+        assert_eq!(sim.events.len(), actors::MAX_QUEUED_EVENTS);
+        let drained = sim.drain_events();
+        // Oldest seven events were dropped; the backlog holds 7..=4102.
+        assert_eq!(drained.len(), actors::MAX_QUEUED_EVENTS);
+        let expected = |index: u64| SimEvent::DamageDealt {
+            source: SimEntity::Actor(1),
+            target: SimEntity::Player(index),
+            amount: 1,
+            killed: false,
+        };
+        assert_eq!(drained[0], expected(7));
+        assert_eq!(
+            drained[actors::MAX_QUEUED_EVENTS - 1],
+            expected(actors::MAX_QUEUED_EVENTS as u64 + 6)
+        );
+        assert!(sim.events.is_empty());
+    }
+
+    #[test]
+    fn player_melee_kill_emits_damage_and_player_death_with_player_attribution() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set_block(IVec3::new(x, 0, z), voxel_world::STONE).unwrap();
+            }
+        }
+        let mut attacker = Player::new();
+        attacker.state.position = Vec3::new(2.5, 1.0, 3.5);
+        attacker.input.yaw = 0.0; // -Z faces the victim
+        attacker.input.attack = true;
+        sim.players.insert(1, attacker);
+        let mut victim = Player::new();
+        victim.state.position = Vec3::new(2.5, 1.0, 0.5);
+        sim.players.insert(2, victim);
+
+        sim.tick = 100;
+        loop {
+            sim.resolve_attacks(&world);
+            if sim.player_health(2).unwrap().is_depleted() {
+                break;
+            }
+            sim.tick += u64::from(gameplay::combat::MELEE_HANDS.cooldown_ticks);
+        }
+        let events = sim.drain_events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SimEvent::DamageDealt {
+                    source: SimEntity::Player(1),
+                    target: SimEntity::Player(2),
+                    killed: true,
+                    ..
+                }
+            )),
+            "no player-attributed kill damage in {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SimEvent::PlayerDied {
+                    id: 2,
+                    killer: Some(SimEntity::Player(1)),
+                }
+            )),
+            "no player death event in {events:?}"
+        );
+        put_resources(&mut app, world, sim);
+    }
+
 }

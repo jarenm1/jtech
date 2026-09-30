@@ -9,6 +9,9 @@ use voxel_world::VoxelWorld;
 pub(super) struct Arrow {
     pub snapshot: ArrowSnapshot,
     pub shot: Shot,
+    /// Player id that fired the arrow; kept on queued detonations for event
+    /// attribution.
+    pub shooter: Option<u64>,
     age: u32,
     traveled: f32,
     pending_steps: u32,
@@ -37,6 +40,7 @@ impl Arrow {
                 velocity: direction * shot.projectile.speed,
             },
             shot,
+            shooter: None,
             age: 0,
             traveled: 0.0,
             pending_steps: 0,
