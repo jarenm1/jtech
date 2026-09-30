@@ -52,8 +52,8 @@ agent work happens in a dedicated jj workspace under `~/workspaces/`.
 
 ### Environment and verification
 
-- `.envrc` is tracked (`use flake` + shared `CARGO_TARGET_DIR`). Agent shells
-  are not direnv-hooked, so run cargo/build/test through direnv:
+- `.envrc` is tracked (`use flake` + per-workspace `CARGO_TARGET_DIR`). Agent
+  shells are not direnv-hooked, so run cargo/build/test through direnv:
   ```sh
   direnv allow ~/workspaces/<slug>   # once per workspace
   direnv exec ~/workspaces/<slug> cargo check -p <crate>
@@ -91,10 +91,14 @@ The human may ask for a GitHub PR instead of an in-workspace handoff. Then:
 
 ```sh
 jj bookmark create <slug>                     # once, on your tip change
-jj git push --bookmark <slug> --allow-new
+jj git push --bookmark <slug>
 gh pr create --head <slug> --base main --title "<type>: <what>" \
-    --body-file pr-body.md                    # body follows the template
+    --body-file /tmp/pr-body.md               # body follows the template
 ```
+
+Keep the body file outside the repo (`/tmp/` or `~`) — jj snapshots every
+command, so a `pr-body.md` written inside the workspace lands in the commit
+and gets pushed.
 
 Rebase flow (linear history — repo enforces rebase-only merges, no merge or
 squash commits):
