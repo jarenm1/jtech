@@ -28,7 +28,7 @@ game packages later.
 | `spawn_actor_kind(kind, position)` | Spawn a species instance |
 | `set_actor_intent(id, intent)` | Drive an actor externally (trainers, tests) |
 | `observe(id, &world)` | Flat `ActorObservation` — the policy's view |
-| `drain_events()` | Per-tick `SimEvent`s with attacker/victim attribution |
+| `drain_events()` | `SimEvent`s (damage + deaths) with attacker/victim attribution — bounded backlog, oldest drop past 4096 undrained |
 | `ActorKind::{dummy, titan, decoy}` | Built-in species tables |
 
 `ActorObservation` deliberately exposes only what a policy may see: own

@@ -76,6 +76,7 @@ fn simultaneous_remote_blasts_release_and_move_supported_terrain() {
                 id as u32,
                 base.as_vec3() + Vec3::new(6.5, 10.02, 6.5),
                 crate::packages::test_blast(protocol::BowPower::Standard),
+                None,
             ));
         }
         sim.advance_bow(world);
@@ -134,6 +135,7 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
                 id as u32,
                 cell.as_vec3() + Vec3::splat(0.5) - Vec3::X * 1.0,
                 crate::packages::test_blast(protocol::BowPower::Standard),
+                None,
             ));
         }
         sim.advance_bow(world);
@@ -151,6 +153,7 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
             2,
             initial[1].position + Vec3::Z * 2.75,
             crate::packages::test_blast(protocol::BowPower::Standard),
+            None,
         ));
         sim.advance_bow(world);
         assert_eq!(sim.detonations.len(), 1);
@@ -173,6 +176,7 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
             3,
             victim.position,
             crate::packages::test_blast(protocol::BowPower::Standard),
+            None,
         ));
         sim.advance_bow(world);
         assert_eq!(sim.metrics.destroyed_blocks, 1);
@@ -195,11 +199,13 @@ fn bombardment_retries_busy_bodies_and_preserves_impulses_through_compaction() {
             4,
             body.position,
             crate::packages::test_blast(protocol::BowPower::Standard),
+            None,
         ));
         sim.detonations.push_back((
             5,
             body.position,
             crate::packages::test_blast(protocol::BowPower::Standard),
+            None,
         ));
         sim.advance_bow(world);
         assert!(sim.physics.as_ref().unwrap().snapshots().is_empty());

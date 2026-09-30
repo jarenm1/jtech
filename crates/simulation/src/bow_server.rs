@@ -1,6 +1,7 @@
 //! Bow request admission, projectile replication, and authoritative blast transactions.
 use super::{
     Simulation,
+    actors::SimEntity,
     bow::{Arrow, Flight},
     explosion::{self, Target},
 };
@@ -71,12 +72,14 @@ impl Simulation {
                 return;
             }
         };
-        self.arrows.push(Arrow::from_shot(
+        let mut arrow = Arrow::from_shot(
             self.next_arrow,
             origin,
             look_direction(yaw, pitch),
             shot,
-        ));
+        );
+        arrow.shooter = Some(id);
+        self.arrows.push(arrow);
         self.next_arrow += 1;
         self.arrow_revision += 1;
         self.metrics.bow_shots += 1;
@@ -108,10 +111,12 @@ impl Simulation {
         for mut arrow in arrows {
             match arrow.tick(world, &bodies, ready) {
                 Flight::Flying => self.arrows.push(arrow),
-                Flight::Impact(position) => {
-                    self.detonations
-                        .push_back((arrow.snapshot.id, position, arrow.shot.impact()))
-                }
+                Flight::Impact(position) => self.detonations.push_back((
+                    arrow.snapshot.id,
+                    position,
+                    arrow.shot.impact(),
+                    arrow.shooter.map(SimEntity::Player),
+                )),
                 Flight::Expired => {}
             }
         }
@@ -147,7 +152,7 @@ impl Simulation {
         let mut physics = self.physics.take();
         // Bound voxel scans, transactions, and replication work per server tick.
         for _ in 0..2 {
-            let Some((id, position, blast)) = self.detonations.pop_front() else {
+            let Some((id, position, blast, source)) = self.detonations.pop_front() else {
                 break;
             };
             let bodies = physics
@@ -169,7 +174,11 @@ impl Simulation {
                     // and release loads are superseded by the crater.
                     Target::Grid(_) => {}
                     Target::Player(player_id) => {
-                        self.damage_player(player_id, load.player_damage);
+                        if let Some(source) = source {
+                            self.damage_player_event(source, player_id, load.player_damage);
+                        } else {
+                            self.damage_player(player_id, load.player_damage);
+                        }
                         if let Some(player) = self.players.get_mut(&player_id)
                             && !player.health.is_depleted()
                         {
@@ -326,6 +335,7 @@ mod tests {
                 id,
                 Vec3::splat(24.0),
                 crate::packages::test_blast(BowPower::Low),
+                None,
             ));
         }
         sim.advance_bow(&mut world);
@@ -334,7 +344,7 @@ mod tests {
         assert_eq!(
             sim.detonations
                 .iter()
-                .map(|(_, _, power)| *power)
+                .map(|(_, _, power, _)| *power)
                 .collect::<Vec<_>>(),
             BowPower::ALL.map(crate::packages::test_blast)
         );
@@ -391,11 +401,7 @@ mod tests {
         let center = player.state.position;
         sim.players.insert(1, player);
         for id in 0..3 {
-            sim.detonations.push_back((
-                id,
-                center,
-                crate::packages::test_blast(BowPower::Standard),
-            ));
+            sim.detonations.push_back((id, center, crate::packages::test_blast(BowPower::Standard), None));
         }
         sim.detonate_ready(&mut world);
         assert_eq!(sim.detonations.len(), 1);
@@ -447,7 +453,7 @@ mod tests {
         .unwrap()
         .player_damage;
         sim.detonations
-            .push_back((1, center, crate::packages::test_blast(BowPower::Standard)));
+            .push_back((1, center, crate::packages::test_blast(BowPower::Standard), None));
         sim.detonate_ready(&mut world);
         assert_eq!(sim.player_health(1).unwrap().current(), 100 - expected);
         assert_eq!(sim.player_health(2), sim.player_health(1));
@@ -481,6 +487,7 @@ mod tests {
             1,
             Vec3::splat(10.0),
             crate::packages::test_blast(BowPower::Standard),
+            None,
         ));
         sim.detonate_ready(&mut world);
         assert_eq!(sim.players[&1].state.velocity, Vec3::ZERO);
@@ -514,6 +521,7 @@ mod tests {
             1,
             Vec3::new(10.5, 10.0, 10.5),
             crate::packages::test_blast(BowPower::Standard),
+            None,
         ));
         sim.detonate_ready(&mut world);
         assert_eq!(sim.metrics.explosions, 1);
