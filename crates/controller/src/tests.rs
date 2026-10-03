@@ -323,7 +323,7 @@ fn sweep_lands_on_the_iso_surface_not_the_voxel_plane() {
         &mut position,
         1,
         -4.0,
-        &[],
+        &physics::BodyBroadphase::new(&[]),
         None,
         physics::CollisionShape::default(),
     );
