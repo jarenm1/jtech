@@ -9,7 +9,8 @@
 //! tick.
 use super::{Player, Simulation};
 use controller::{
-    CharacterBody, CharacterIntent, CharacterState, MovementProfile, step_character,
+    Cast, CharacterBody, CharacterIntent, CharacterState, MAX_SLOTS, Mode, MovementProfile,
+    StatusList, step_character,
 };
 use gameplay::{
     Health,
@@ -192,6 +193,16 @@ pub struct ActorObservation {
     pub melee_range: f32,
     pub nearest_player: Option<ObservedEntity>,
     pub nearest_actor: Option<ObservedEntity>,
+    /// Own locomotion/action mode.
+    pub mode: Mode,
+    /// Own active status effects.
+    pub statuses: StatusList,
+    /// Own remaining cooldown ticks per ability slot.
+    pub cooldowns: [u16; MAX_SLOTS],
+    /// Own in-progress cast, if any.
+    pub cast: Option<Cast>,
+    /// Whether the body is crouched.
+    pub crouching: bool,
 }
 
 /// A server character with no network session: motor state, tuning, health,
@@ -318,6 +329,11 @@ fn observation_of(
         melee_range: actor.kind.melee.range,
         nearest_player,
         nearest_actor,
+        mode: actor.state.mode,
+        statuses: actor.state.statuses,
+        cooldowns: actor.state.cooldowns,
+        cast: actor.state.cast,
+        crouching: actor.state.crouching,
     }
 }
 
