@@ -1556,6 +1556,20 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
         }
         low - SHELTER_MARGIN
     };
+    // The shelter value depends only on (x, z, column height), not y, so
+    // compute one value per column instead of rescanning the lattice for
+    // every voxel in the chunk.
+    let mut shelter_columns = [0.0f32; (CHUNK_SIZE * CHUNK_SIZE) as usize];
+    for local_z in 0..CHUNK_SIZE {
+        for local_x in 0..CHUNK_SIZE {
+            let idx = (local_z * CHUNK_SIZE + local_x) as usize;
+            shelter_columns[idx] = shelter(
+                i64::from(local_x),
+                i64::from(local_z),
+                columns[idx].raw_height,
+            );
+        }
+    }
     let mut chunk = Chunk {
         revision: 0,
         storage: Storage::Uniform(AIR),
@@ -1570,7 +1584,7 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
                     i64::from(world_y),
                     base_z + i64::from(local_z),
                     column.raw_height,
-                    shelter(local_x as i64, local_z as i64, column.raw_height),
+                    shelter_columns[(local_z * CHUNK_SIZE + local_x) as usize],
                     seed,
                 );
                 let material = if density <= 0 {
