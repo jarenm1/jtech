@@ -600,6 +600,8 @@ struct GrassPatch {
     /// Whether `stamp` reflects a real build; a fresh patch has an empty stamp
     /// but is dirty rather than "built over nothing".
     built: bool,
+    /// Whether the patch already sits in `GrassField::dirty`; dedupes entries.
+    queued: bool,
 }
 
 /// World-grid patches with throttled revision scans and async rebuilds.
@@ -608,10 +610,18 @@ struct GrassField {
     patches: HashMap<IVec2, GrassPatch>,
     /// In-flight and ready-but-unuploaded patch builds, one per patch at most.
     jobs: Vec<GrassJob>,
-    /// Scratch candidate list, `clear()`ed each frame; the allocation persists.
+    /// Persistent build queue, drained nearest-first a few patches per frame.
+    /// Range/LOD/ceiling and stamp scans push here; stale entries skip free.
     dirty: Vec<(f32, IVec2)>,
     checked_at: f32,
     scan_focus: Vec3,
+    /// Focus patch cell and ceiling band of the last range/LOD walk. Neither
+    /// membership nor tiers can change until the focus crosses a patch edge
+    /// or the ceiling band moves, so the candidate box is walked only then.
+    walked: Option<(IVec2, i32)>,
+    /// Blades across all live patches, kept current on remove/rebuild so the
+    /// stat no longer sums the whole field every frame.
+    total_blades: usize,
 }
 
 /// An in-flight patch build on the async compute pool, mirroring `MeshJob`:
@@ -966,34 +976,18 @@ fn update_grass(
     let focus_xz = Vec2::new(focus.0.x, focus.0.z);
     // A vertical band change must refresh even if XZ and revisions are stable.
     let ceiling = (focus.0.y.floor() as i32).div_euclid(8) * 8 + 16;
+    let size = GRASS_PATCH_SIZE as f32;
+    let focus_cell = (focus_xz / size).floor().as_ivec2();
     let GrassField {
         patches,
         jobs,
         dirty,
         checked_at,
         scan_focus,
+        walked,
+        total_blades,
     } = &mut *field;
 
-    // Drop out-of-range patches; their entities and mesh assets die with them.
-    patches.retain(|&coord, patch| {
-        if grass_patch_in_range(coord, focus_xz) {
-            return true;
-        }
-        if let Some((entity, handle)) = patch.draw.take() {
-            commands.entity(entity).despawn();
-            meshes.remove(handle.id());
-        }
-        false
-    });
-    // Walking ~800 patch stamps per frame is too expensive; re-scan on a
-    // short interval, and early after a 4 m move. Range/LOD/ceiling checks
-    // stay per-frame, so updates never depend on stale timestamps.
-    let scan = time.elapsed_secs() - *checked_at >= GRASS_STAMP_SCAN_INTERVAL
-        || focus.0.distance(*scan_focus) >= GRASS_STAMP_SCAN_STEP;
-    if scan {
-        *checked_at = time.elapsed_secs();
-        *scan_focus = focus.0;
-    }
     // Collect finished builds, discarding any whose snapshot the live world
     // has since invalidated (revision change, or a ceiling/LOD band shift).
     for job in jobs.iter_mut() {
@@ -1008,12 +1002,18 @@ fn update_grass(
             i += 1;
             continue;
         };
-        let desired_lod = grass_lod(job.coord, focus_xz);
+        let coord = job.coord;
+        let desired_lod = grass_lod(coord, focus_xz);
         if job.lod != desired_lod
             || job.ceiling != ceiling
             || grass_stamp_dirty(&world, &data.stamp)
         {
             jobs.remove(i);
+            // The build was discarded, so the patch is no longer queued and
+            // the next scan/crossing can re-enqueue it.
+            if let Some(patch) = patches.get_mut(&coord) {
+                patch.queued = false;
+            }
             continue;
         }
         let mut job = jobs.remove(i);
@@ -1021,9 +1021,11 @@ fn update_grass(
         let Some(patch) = patches.get_mut(&job.coord) else {
             continue;
         };
+        *total_blades = *total_blades - patch.blades + data.blades;
         patch.stamp = data.stamp;
         patch.blades = data.blades;
         patch.built = true;
+        patch.queued = false;
         patch.ceiling = job.ceiling;
         patch.lod = job.lod;
         if let Some((entity, handle)) = patch.draw.take() {
@@ -1048,60 +1050,108 @@ fn update_grass(
         }
     }
 
-    // Gather dirty in-range patches, nearest first. `dirty` is reused scratch:
-    // clear() keeps the allocation, so an unchanged world allocates nothing.
-    dirty.clear();
-    let size = GRASS_PATCH_SIZE as f32;
-    let lo = ((focus_xz - Vec2::splat(GRASS_RADIUS)) / size)
-        .floor()
-        .as_ivec2()
-        - IVec2::ONE;
-    let hi = ((focus_xz + Vec2::splat(GRASS_RADIUS)) / size)
-        .floor()
-        .as_ivec2()
-        + IVec2::ONE;
-    for z in lo.y..=hi.y {
-        for x in lo.x..=hi.x {
-            let coord = IVec2::new(x, z);
-            if !grass_patch_in_range(coord, focus_xz) {
-                continue;
+    // Range and LOD re-evaluate only when the focus enters a new patch cell or
+    // the ceiling band moves; between crossings membership and tiers hold, so
+    // the ~1200-coordinate candidate box is walked at most once per crossing.
+    let crossed = *walked != Some((focus_cell, ceiling));
+    if crossed {
+        *walked = Some((focus_cell, ceiling));
+        // Drop out-of-range patches; their entities and mesh assets die with
+        // them. Stale queue entries for dropped coords skip free on drain.
+        patches.retain(|&coord, patch| {
+            if grass_patch_in_range(coord, focus_xz) {
+                return true;
             }
-            let lod = grass_lod(coord, focus_xz);
-            let patch = patches.entry(coord).or_insert_with(|| GrassPatch {
-                stamp: Vec::new(),
-                draw: None,
-                blades: 0,
-                built: false,
-                ceiling,
-                lod,
-            });
-            if !patch.built
-                || patch.ceiling != ceiling
-                || patch.lod != lod
-                || (scan && grass_stamp_dirty(&world, &patch.stamp))
-            {
+            if let Some((entity, handle)) = patch.draw.take() {
+                commands.entity(entity).despawn();
+                meshes.remove(handle.id());
+            }
+            *total_blades -= patch.blades;
+            false
+        });
+        let lo = ((focus_xz - Vec2::splat(GRASS_RADIUS)) / size)
+            .floor()
+            .as_ivec2()
+            - IVec2::ONE;
+        let hi = ((focus_xz + Vec2::splat(GRASS_RADIUS)) / size)
+            .floor()
+            .as_ivec2()
+            + IVec2::ONE;
+        for z in lo.y..=hi.y {
+            for x in lo.x..=hi.x {
+                let coord = IVec2::new(x, z);
+                if !grass_patch_in_range(coord, focus_xz) {
+                    continue;
+                }
+                let lod = grass_lod(coord, focus_xz);
+                let patch = patches.entry(coord).or_insert_with(|| GrassPatch {
+                    stamp: Vec::new(),
+                    draw: None,
+                    blades: 0,
+                    built: false,
+                    ceiling,
+                    lod,
+                    queued: false,
+                });
+                if patch.queued {
+                    continue;
+                }
+                if !patch.built || patch.ceiling != ceiling || patch.lod != lod {
+                    patch.queued = true;
+                    let center = (coord.as_vec2() + 0.5) * size;
+                    dirty.push((center.distance_squared(focus_xz), coord));
+                }
+            }
+        }
+    }
+
+    // Walking ~800 patch stamps per frame is too expensive; re-scan on a
+    // short interval, and early after a 4 m move. Stamp-dirty patches queue
+    // for rebuild; their entities stay drawn until the build lands.
+    let scan = time.elapsed_secs() - *checked_at >= GRASS_STAMP_SCAN_INTERVAL
+        || focus.0.distance(*scan_focus) >= GRASS_STAMP_SCAN_STEP;
+    if scan {
+        *checked_at = time.elapsed_secs();
+        *scan_focus = focus.0;
+        for (&coord, patch) in patches.iter_mut() {
+            if !patch.queued && grass_stamp_dirty(&world, &patch.stamp) {
+                patch.queued = true;
                 let center = (coord.as_vec2() + 0.5) * size;
                 dirty.push((center.distance_squared(focus_xz), coord));
             }
         }
     }
-    dirty.sort_unstable_by(|a, b| {
-        a.0.total_cmp(&b.0)
-            .then_with(|| a.1.x.cmp(&b.1.x))
-            .then_with(|| a.1.y.cmp(&b.1.y))
-    });
 
-    // Dispatch nearest-first, bounded by the per-frame build budget and the
-    // in-flight job cap. Patches left over stay dirty and retry next frame.
-    let builds = dirty
+    // Drain the build queue nearest-first. Entries for patches removed or
+    // already rebuilt since enqueueing are skipped at no extra cost.
+    if crossed || scan {
+        // Re-key to the live focus: priorities stamped at enqueue time drift
+        // as the focus moves, and only crossings/scan pushes can reorder.
+        for (priority, coord) in dirty.iter_mut() {
+            *priority = ((coord.as_vec2() + 0.5) * size).distance_squared(focus_xz);
+        }
+        dirty.sort_unstable_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.1.x.cmp(&b.1.x))
+                .then_with(|| a.1.y.cmp(&b.1.y))
+        });
+    }
+    let mut builds = dirty
         .len()
         .min(GRASS_BUILDS_PER_UPDATE + dirty.len() / GRASS_BUILDS_PER_DIRTY);
-    let mut dispatched = 0;
-    for index in 0..dirty.len() {
-        if dispatched >= builds || jobs.len() >= GRASS_MAX_JOBS {
+    let mut drained = 0;
+    while builds > 0 && drained < dirty.len() {
+        let coord = dirty[drained].1;
+        drained += 1;
+        let Some(patch) = patches.get_mut(&coord) else {
+            continue;
+        };
+        if !patch.queued {
+            continue;
+        }
+        if jobs.len() >= GRASS_MAX_JOBS {
             break;
         }
-        let coord = dirty[index].1;
         if jobs.iter().any(|job| job.coord == coord) {
             continue;
         }
@@ -1117,9 +1167,10 @@ fn update_grass(
             task,
             ready: None,
         });
-        dispatched += 1;
+        builds -= 1;
     }
-    stats.grass_blades = patches.values().map(|patch| patch.blades).sum();
+    dirty.drain(..drained);
+    stats.grass_blades = *total_blades;
 }
 
 fn distance(coord: IVec3, focus: Vec3) -> f32 {
