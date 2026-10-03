@@ -15,7 +15,7 @@ use gameplay::{
     Health,
     combat::{MeleeSpec, SwingTarget, resolve_swing},
 };
-use glam::{Vec2, Vec3};
+use glam::{IVec3, Vec2, Vec3};
 use physics::{
     CollisionShape, DynamicCollider, EYE_HEIGHT, FIXED_DT, PlayerState, apply_player_impulse,
     look_direction,
@@ -631,19 +631,16 @@ impl Simulation {
             self.damage_player_event(SimEntity::Actor(id), hit.target, hit.damage);
         }
     }
-
-    /// Actor snapshots visible to a player, filtered by chunk interest like
-    /// remote players so distant actors cost nothing.
-    pub(super) fn actor_snapshots(&self, viewer: &Player) -> Vec<ActorSnapshot> {
-        self.actors
-            .iter()
-            .filter(|(_, actor)| {
-                viewer.interest.contains(&voxel_world::chunk_coord(
-                    actor.state.motion.position.floor().as_ivec3(),
-                ))
-            })
-            .map(|(&id, actor)| actor.snapshot(id))
-            .collect()
+    /// All actor snapshots bucketed by their chunk coordinate, computed once
+    /// per snapshot tick. Recipients gather from the buckets covering their
+    /// interest set instead of rescanning every actor.
+    pub(super) fn actor_snapshot_buckets(&self) -> HashMap<IVec3, Vec<ActorSnapshot>> {
+        let mut buckets: HashMap<IVec3, Vec<ActorSnapshot>> = HashMap::new();
+        for (&id, actor) in &self.actors {
+            let chunk = voxel_world::chunk_coord(actor.state.motion.position.floor().as_ivec3());
+            buckets.entry(chunk).or_default().push(actor.snapshot(id));
+        }
+        buckets
     }
 }
 

@@ -28,7 +28,7 @@ use networking::ServerTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerState, look_direction, overlaps_block};
 use physics_slice::PhysicsSlice;
 use protocol::{
-    ClientMessage, EditRejection, InputPacket, PlayerSnapshot, ServerMessage, Snapshot,
+    ActorSnapshot, ClientMessage, EditRejection, InputPacket, PlayerSnapshot, ServerMessage, Snapshot,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -1452,26 +1452,50 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         }
     }
     if sim.tick.is_multiple_of(3) {
+        // Snapshot every entity once per tick, bucketed by the chunk its
+        // position occupies; each recipient then gathers only the buckets its
+        // interest set covers instead of rescanning all entities. The bucket
+        // map costs one allocation per occupied chunk rather than a filtered
+        // scan plus a Vec per recipient.
+        let mut player_buckets: HashMap<IVec3, Vec<PlayerSnapshot>> = HashMap::new();
+        for (&id, player) in &sim.players {
+            let chunk = chunk_coord(player.state.position.floor().as_ivec3());
+            player_buckets
+                .entry(chunk)
+                .or_default()
+                .push(player.snapshot(id));
+        }
+        let actor_buckets = sim.actor_snapshot_buckets();
+        // Scratch buffers are handed to each Snapshot, then reclaimed for the
+        // next recipient, so capacity persists across the whole loop.
+        let mut player_scratch: Vec<PlayerSnapshot> = Vec::new();
+        let mut actor_scratch: Vec<ActorSnapshot> = Vec::new();
         for id in ids {
             let Some(player) = sim.players.get(&id) else {
                 continue;
             };
-            let actors = sim.actor_snapshots(player);
-            let snapshot = Snapshot {
+            for coord in &player.interest {
+                if let Some(bucket) = player_buckets.get(coord) {
+                    player_scratch.extend(
+                        bucket
+                            .iter()
+                            .filter(|s| s.id != id)
+                            .cloned(),
+                    );
+                }
+                if let Some(bucket) = actor_buckets.get(coord) {
+                    actor_scratch.extend_from_slice(bucket);
+                }
+            }
+            // Bucketing scrambles the actor map's id order; sort to keep the
+            // emitted order identical to scanning the BTreeMap.
+            actor_scratch.sort_by_key(|s| s.id);
+            player_scratch.sort_by_key(|s| s.id);
+            let mut snapshot = Snapshot {
                 tick: sim.tick,
                 you: player.snapshot(id),
-                players: sim
-                    .players
-                    .iter()
-                    .filter(|(other_id, other)| {
-                        **other_id != id
-                            && player
-                                .interest
-                                .contains(&chunk_coord(other.state.position.floor().as_ivec3()))
-                    })
-                    .map(|(&id, p)| p.snapshot(id))
-                    .collect(),
-                actors,
+                players: std::mem::take(&mut player_scratch),
+                actors: std::mem::take(&mut actor_scratch),
             };
             if sim
                 .transport
@@ -1480,6 +1504,10 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             {
                 sim.metrics.snapshot_errors += 1;
             }
+            player_scratch = std::mem::take(&mut snapshot.players);
+            actor_scratch = std::mem::take(&mut snapshot.actors);
+            player_scratch.clear();
+            actor_scratch.clear();
         }
     }
     sim.tick_times
