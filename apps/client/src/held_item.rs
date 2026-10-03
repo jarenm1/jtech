@@ -40,28 +40,37 @@ pub(crate) fn update(
     mut transforms: Query<&mut Transform>,
 ) {
     let item = session.held_item();
-    let weapon = session
-        .packages
-        .melee_weapons
-        .iter()
-        .find(|weapon| weapon.item == item);
-    let model_uri = weapon
-        .and_then(|weapon| weapon.model.as_ref())
-        .and_then(|path| {
-            package_assets
-                .uri(&weapon.unwrap().package, path)
-                .zip(package_assets.bytes(&weapon.unwrap().package, path))
-                .map(|(uri, bytes)| (uri, bytes))
-        });
-    let model_file = model_uri.is_some();
 
     if item == 0 || session.transport.is_none() {
         if let Some(entity) = state.entity.take() {
             commands.entity(entity).despawn();
         }
         state.item = 0;
+        state.model_loaded = false;
         return;
     }
+
+    // Asset resolution (manifest scan, `is_file`, `fs::read`) only runs when
+    // the spawned entity is stale: new item, or its model finished resolving
+    // after we spawned the cube fallback. A loaded model skips the disk
+    // entirely — without this the GLB is reread every rendered frame.
+    let model_uri = if state.item != item || !state.model_loaded {
+        session
+            .packages
+            .melee_weapons
+            .iter()
+            .find(|weapon| weapon.item == item)
+            .and_then(|weapon| {
+                weapon.model.as_ref().and_then(|path| {
+                    package_assets
+                        .uri(&weapon.package, path)
+                        .and_then(|uri| package_assets.bytes(&weapon.package, path).map(|bytes| (uri, bytes)))
+                })
+            })
+    } else {
+        None
+    };
+    let model_file = model_uri.is_some();
 
     // Respawn when the item changes or its model finishes resolving.
     if state.item != item || (model_file && !state.model_loaded) {
