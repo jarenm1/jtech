@@ -3,7 +3,8 @@
 //! exposes them to Bevy through the `pkg://` asset source registered in main.
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use bevy::prelude::*;
@@ -263,6 +264,21 @@ struct Pending {
 pub struct PackageAssets {
     manifest: Vec<PackageAssetInfo>,
     pending: HashMap<(String, String), Pending>,
+    /// Manifest entries resolved to their local copy; `sync` rebuilds it and
+    /// `receive_chunk` patches it, so `uri`/`bytes` are hash lookups instead
+    /// of a manifest scan plus filesystem stat/read per call.
+    resolved: HashMap<String, HashMap<String, Resolved>>,
+}
+
+/// One manifest file's local state. `file` is content-addressed by the
+/// manifest hash, so cached `bytes` stay valid across manifest refreshes
+/// whenever the path matches.
+struct Resolved {
+    file: PathBuf,
+    exists: bool,
+    uri: Arc<str>,
+    /// Read once, then shared; `Mutex` keeps `bytes` a `&self` call.
+    bytes: Mutex<Option<Arc<[u8]>>>,
 }
 
 impl PackageAssets {
@@ -273,34 +289,30 @@ impl PackageAssets {
         std::env::temp_dir().join("voxel-package-assets")
     }
 
-    /// Content-addressed location of one manifest file under the cache root.
-    fn file_path(&self, package: &str, path: &str) -> Option<PathBuf> {
-        let info = self
-            .manifest
-            .iter()
-            .find(|info| info.package == package && info.path == path)?;
-        Some(
-            Self::cache_dir()
-                .join(&info.package)
-                .join(info.hash.to_string())
-                .join(&info.path),
-        )
+    fn resolved(&self, package: &str, path: &str) -> Option<&Resolved> {
+        self.resolved.get(package)?.get(path)
     }
 
     /// `pkg://` URI usable by `AssetServer`, present once the file is local.
-    pub fn uri(&self, package: &str, path: &str) -> Option<String> {
-        let file = self.file_path(package, path)?;
-        if !file.is_file() {
-            return None;
-        }
-        let relative = file.strip_prefix(Self::cache_dir()).ok()?;
-        Some(format!("pkg://{}", relative.to_string_lossy()))
+    pub fn uri(&self, package: &str, path: &str) -> Option<Arc<str>> {
+        let resolved = self.resolved(package, path)?;
+        resolved.exists.then(|| resolved.uri.clone())
     }
 
-    /// Local file bytes, present once the download has completed.
-    pub fn bytes(&self, package: &str, path: &str) -> Option<Vec<u8>> {
-        let file = self.file_path(package, path)?;
-        std::fs::read(file).ok()
+    /// Local file bytes, present once the download has completed. Reads the
+    /// file at most once per content version, then shares the cached copy.
+    pub fn bytes(&self, package: &str, path: &str) -> Option<Arc<[u8]>> {
+        let resolved = self.resolved(package, path)?;
+        if !resolved.exists {
+            return None;
+        }
+        let Ok(mut cached) = resolved.bytes.lock() else {
+            return None;
+        };
+        if cached.is_none() {
+            *cached = std::fs::read(&resolved.file).map(Arc::from).ok();
+        }
+        cached.clone()
     }
 
     /// Replace the manifest; returns requests for files not yet cached or
@@ -312,6 +324,33 @@ impl PackageAssets {
                 .iter()
                 .any(|info| &info.package == package && &info.path == path)
         });
+        // Resolve every manifest entry once: local path, on-disk presence and
+        // pkg:// URI, carrying cached bytes over when the content-addressed
+        // file is unchanged.
+        let mut resolved: HashMap<String, HashMap<String, Resolved>> = HashMap::new();
+        for info in &self.manifest {
+            let relative = Path::new(&info.package)
+                .join(info.hash.to_string())
+                .join(&info.path);
+            let file = Self::cache_dir().join(&relative);
+            let bytes = self
+                .resolved(&info.package, &info.path)
+                .filter(|old| old.file == file)
+                .and_then(|old| old.bytes.lock().ok().and_then(|b| b.clone()));
+            resolved
+                .entry(info.package.clone())
+                .or_default()
+                .insert(
+                    info.path.clone(),
+                    Resolved {
+                        exists: file.is_file(),
+                        file,
+                        uri: format!("pkg://{}", relative.to_string_lossy()).into(),
+                        bytes: Mutex::new(bytes),
+                    },
+                );
+        }
+        self.resolved = resolved;
         let missing: Vec<(String, String, u32)> = self
             .manifest
             .iter()
@@ -320,8 +359,8 @@ impl PackageAssets {
                     .pending
                     .contains_key(&(info.package.clone(), info.path.clone()))
                     && !self
-                        .file_path(&info.package, &info.path)
-                        .is_some_and(|path| path.is_file())
+                        .resolved(&info.package, &info.path)
+                        .is_some_and(|resolved| resolved.exists)
             })
             .map(|info| (info.package.clone(), info.path.clone(), info.size))
             .collect();
@@ -365,14 +404,24 @@ impl PackageAssets {
             return;
         }
         let pending = self.pending.remove(&key).unwrap();
-        let Some(file) = self.file_path(package, path) else {
+        let Some(resolved) = self
+            .resolved
+            .get_mut(package)
+            .and_then(|paths| paths.get_mut(path))
+        else {
             return;
         };
-        if let Some(dir) = file.parent() {
+        if let Some(dir) = resolved.file.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(error) = std::fs::write(&file, &pending.data) {
-            warn!("package asset {}: {error}", file.display());
+        match std::fs::write(&resolved.file, &pending.data) {
+            Ok(()) => {
+                resolved.exists = true;
+                if let Ok(mut cached) = resolved.bytes.lock() {
+                    *cached = Some(Arc::from(pending.data));
+                }
+            }
+            Err(error) => warn!("package asset {}: {error}", resolved.file.display()),
         }
     }
 }
