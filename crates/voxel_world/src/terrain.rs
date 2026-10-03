@@ -16,7 +16,10 @@ use crate::{
     WORLD_MAX_Y, WORLD_MIN_Y,
 };
 use glam::IVec3;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 /// Version of the Scheme authoring surface accepted by the loader.
 pub const TERRAIN_API_VERSION: u32 = 1;
@@ -1560,12 +1563,14 @@ fn boundary_chunk(coord: IVec3) -> Option<Chunk> {
         return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(STONE),
+            runs_cache: Mutex::new(None),
         });
     }
     if coord.y > crate::MAX_CHUNK_Y {
         return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(AIR),
+            runs_cache: Mutex::new(None),
         });
     }
     None
@@ -1582,6 +1587,7 @@ fn saturated_chunk(coord: IVec3, seed: u64, min_height: i32, max_height: i32) ->
         return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(AIR),
+            runs_cache: Mutex::new(None),
         });
     }
     // Uniform stone requires every voxel saturated solid (top_y at least two
@@ -1599,6 +1605,7 @@ fn saturated_chunk(coord: IVec3, seed: u64, min_height: i32, max_height: i32) ->
         return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(STONE),
+            runs_cache: Mutex::new(None),
         });
     }
     None
@@ -1662,6 +1669,7 @@ fn fill_chunk(
     let mut chunk = Chunk {
         revision: 0,
         storage: Storage::Uniform(AIR),
+        runs_cache: Mutex::new(None),
     };
     for local_y in 0..CHUNK_SIZE {
         let world_y = base_y + local_y;

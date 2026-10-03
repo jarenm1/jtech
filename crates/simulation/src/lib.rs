@@ -1097,7 +1097,7 @@ fn restore(world: &mut VoxelWorld, coord: IVec3, journal: Option<&Journal>) {
             let local = IVec3::new(cell % 32, cell / 1024, (cell / 32) % 32);
             world.set_voxel(coord * CHUNK_SIZE + local, voxel);
         }
-        let (material_runs, density_runs) = world.chunks[&coord].voxel_runs();
+        let (material_runs, density_runs) = world.chunks[&coord].cached_voxel_runs();
         world.insert(
             coord,
             Chunk::from_voxel_runs(journal.revision, &material_runs, &density_runs)
@@ -1419,7 +1419,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         });
         for coord in available {
             let chunk = &world.chunks[&coord];
-            let (material_runs, density_runs) = chunk.voxel_runs();
+            let (material_runs, density_runs) = chunk.cached_voxel_runs();
             let revision = chunk.revision;
             // Every resident chunk should already carry an entry; compute on
             // demand so a future eager install path cannot silently drop it.

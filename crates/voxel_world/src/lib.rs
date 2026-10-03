@@ -3,7 +3,7 @@ use bevy_ecs::prelude::Resource;
 use glam::{IVec3, Vec3};
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 pub mod terrain;
@@ -154,10 +154,25 @@ enum Storage {
         placed: Box<[u8]>,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Chunk {
     pub revision: u64,
     storage: Storage,
+    /// Shared output of [`Self::voxel_runs`] for the cached revision. Encoding
+    /// scans all [`CHUNK_VOLUME`] voxels, so senders reuse one result per
+    /// revision instead of re-encoding for each recipient.
+    runs_cache: Mutex<Option<(u64, Arc<Vec<(u16, u8)>>, Arc<Vec<(u16, i8)>>)>>,
+}
+impl Clone for Chunk {
+    fn clone(&self) -> Self {
+        // `Arc::make_mut` clones before mutating; a copied cache would just pin
+        // the stale buffers, so clones start uncached.
+        Self {
+            revision: self.revision,
+            storage: self.storage.clone(),
+            runs_cache: Mutex::new(None),
+        }
+    }
 }
 impl Chunk {
     fn material_at(&self, index: usize) -> u8 {
@@ -258,6 +273,7 @@ impl Chunk {
             }
             Storage::Smooth { .. } => {}
         }
+        *self.runs_cache.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
         self.set_material(index, voxel.material);
         if let Storage::Smooth {
             density, placed, ..
@@ -292,11 +308,13 @@ impl Chunk {
             return Ok(Self {
                 revision,
                 storage: Storage::Uniform(first),
+                runs_cache: Mutex::new(None),
             });
         }
         let mut chunk = Self {
             revision,
             storage: Storage::Dense(vec![0; CHUNK_VOLUME / 2].into_boxed_slice()),
+            runs_cache: Mutex::new(None),
         };
         let mut cursor = 0;
         for &(count, block) in runs {
@@ -380,6 +398,7 @@ impl Chunk {
             return Ok(Self {
                 revision,
                 storage: Storage::Uniform(first_material),
+                runs_cache: Mutex::new(None),
             });
         }
 
@@ -399,6 +418,7 @@ impl Chunk {
             return Ok(Self {
                 revision,
                 storage: Storage::Dense(materials.into_boxed_slice()),
+                runs_cache: Mutex::new(None),
             });
         }
 
@@ -431,6 +451,7 @@ impl Chunk {
                 density: density.into_boxed_slice(),
                 placed: placed.into_boxed_slice(),
             },
+            runs_cache: Mutex::new(None),
         })
     }
     /// Legacy material runs; placed voxels report their material with the
@@ -466,6 +487,22 @@ impl Chunk {
         }
         material_runs.push((material_count, material));
         density_runs.push((density_count, density));
+        (material_runs, density_runs)
+    }
+    /// [`Self::voxel_runs`] shared per revision: the first call after an edit
+    /// encodes, later calls clone the cached `Arc`s. Senders streaming one
+    /// chunk to many players should use this instead of `voxel_runs`.
+    pub fn cached_voxel_runs(&self) -> (Arc<Vec<(u16, u8)>>, Arc<Vec<(u16, i8)>>) {
+        let mut cache = self.runs_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((revision, material_runs, density_runs)) = &*cache {
+            if *revision == self.revision {
+                return (material_runs.clone(), density_runs.clone());
+            }
+        }
+        let (material_runs, density_runs) = self.voxel_runs();
+        let material_runs = Arc::new(material_runs);
+        let density_runs = Arc::new(density_runs);
+        *cache = Some((self.revision, material_runs.clone(), density_runs.clone()));
         (material_runs, density_runs)
     }
     pub fn is_empty(&self) -> bool {
