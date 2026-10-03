@@ -1,4 +1,6 @@
-use crate::{CharacterBody, CharacterIntent, CharacterState, MovementProfile, finite};
+use crate::{
+    CharacterBody, CharacterIntent, CharacterState, CollisionShape, MovementProfile, finite,
+};
 use glam::{Vec2, Vec3};
 use physics::DynamicCollider;
 use voxel_world::VoxelWorld;
@@ -14,6 +16,8 @@ struct Motor<'a> {
     dt: f32,
     /// Ground normal from the support probe; `Vec3::Y` when airborne.
     support: Vec3,
+    /// Effective collision shape for this tick; a crouch lowers the body.
+    shape: CollisionShape,
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -49,9 +53,11 @@ pub fn step_character(
         // Bounded catch-up prevents pathological caller timesteps and unbounded collision work.
         dt: dt.min(0.25),
         support: Vec3::Y,
+        shape: body.shape,
         attempted: Vec2::ZERO,
     };
     sanitize(&mut motor, character);
+    stance(&mut motor, character);
     contact(&mut motor, character);
     steer(&mut motor, character);
     gravity(&mut motor, character);
@@ -77,11 +83,35 @@ fn sanitize(motor: &mut Motor, character: &mut CharacterState) {
     state.external_velocity = physics::bounded_horizontal(state.external_velocity);
 }
 
+/// Update the crouch stance and the effective collision shape. Standing up
+/// requires clearance for the full-height body, so a low ceiling keeps the
+/// actor crouched until it can fit.
+fn stance(motor: &mut Motor, character: &mut CharacterState) {
+    let full = motor.body.shape;
+    if motor.input.crouch {
+        character.crouching = true;
+    } else if character.crouching
+        && physics::clearance(motor.world, character.motion.position, full, motor.bodies)
+    {
+        character.crouching = false;
+    }
+    motor.shape = if character.crouching {
+        CollisionShape::new(
+            full.half_width(),
+            full.half_depth(),
+            motor.profile.crouch_height.min(full.height()),
+        )
+        .unwrap_or(full)
+    } else {
+        full
+    };
+}
+
 /// Repair snapshot overlap, then refresh support with a shallow downward probe.
 fn contact(motor: &mut Motor, character: &mut CharacterState) {
     let grounded = {
         let state = &mut character.motion;
-        physics::separate_bodies(motor.world, state, motor.bodies, motor.body.shape);
+        physics::separate_bodies(motor.world, state, motor.bodies, motor.shape);
         let mut probe = state.position;
         state.velocity.y <= 0.0
             && physics::sweep_with_bodies(
@@ -91,7 +121,7 @@ fn contact(motor: &mut Motor, character: &mut CharacterState) {
                 -0.002,
                 motor.bodies,
                 None,
-                motor.body.shape,
+                motor.shape,
             )
     };
     character.motion.grounded = grounded;
@@ -100,7 +130,7 @@ fn contact(motor: &mut Motor, character: &mut CharacterState) {
         physics::support(
             motor.world,
             character.motion.position,
-            motor.body.shape,
+            motor.shape,
             motor.bodies,
         )
         .map(|support| support.normal)
@@ -132,6 +162,11 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
     let speed = motor.profile.speed
         * if motor.input.sprint {
             motor.profile.sprint_mult
+        } else {
+            1.0
+        }
+        * if character.crouching {
+            motor.profile.crouch_mult
         } else {
             1.0
         };
@@ -203,7 +238,7 @@ fn sweep_horizontal(motor: &mut Motor, character: &mut CharacterState) {
         dx,
         motor.bodies,
         None,
-        motor.body.shape,
+        motor.shape,
     ) && !try_step(motor, state, 0, dx)
     {
         state.velocity.x = 0.0;
@@ -217,7 +252,7 @@ fn sweep_horizontal(motor: &mut Motor, character: &mut CharacterState) {
         dz,
         motor.bodies,
         None,
-        motor.body.shape,
+        motor.shape,
     ) && !try_step(motor, state, 2, dz)
     {
         state.velocity.z = 0.0;
@@ -238,7 +273,7 @@ fn try_step(
         return false;
     }
     let lifted = state.position + Vec3::Y * motor.profile.step_height;
-    if !physics::clearance(motor.world, lifted, motor.body.shape, motor.bodies) {
+    if !physics::clearance(motor.world, lifted, motor.shape, motor.bodies) {
         return false;
     }
     let mut probe = lifted;
@@ -249,7 +284,7 @@ fn try_step(
         distance,
         motor.bodies,
         None,
-        motor.body.shape,
+        motor.shape,
     );
     if (probe[axis] - lifted[axis]).abs() < 1e-4 {
         return false;
@@ -261,7 +296,7 @@ fn try_step(
         -motor.profile.step_height,
         motor.bodies,
         None,
-        motor.body.shape,
+        motor.shape,
     );
     state.position = probe;
     true
@@ -285,7 +320,7 @@ fn sweep_vertical(motor: &mut Motor, character: &mut CharacterState) {
         fall,
         motor.bodies,
         None,
-        motor.body.shape,
+        motor.shape,
     ) {
         state.velocity.y = 0.0;
         state.grounded = !upward;
@@ -299,7 +334,7 @@ fn sweep_vertical(motor: &mut Motor, character: &mut CharacterState) {
                 -0.002,
                 motor.bodies,
                 None,
-                motor.body.shape,
+                motor.shape,
             );
     }
 }
