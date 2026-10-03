@@ -12,6 +12,8 @@ struct Motor<'a> {
     profile: &'a MovementProfile,
     input: CharacterIntent,
     dt: f32,
+    /// Ground normal from the support probe; `Vec3::Y` when airborne.
+    support: Vec3,
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -46,6 +48,7 @@ pub fn step_character(
         input,
         // Bounded catch-up prevents pathological caller timesteps and unbounded collision work.
         dt: dt.min(0.25),
+        support: Vec3::Y,
         attempted: Vec2::ZERO,
     };
     sanitize(&mut motor, character);
@@ -92,6 +95,19 @@ fn contact(motor: &mut Motor, character: &mut CharacterState) {
             )
     };
     character.motion.grounded = grounded;
+    // Ground normal drives the slope limit; airborne actors report flat.
+    motor.support = if grounded {
+        physics::support(
+            motor.world,
+            character.motion.position,
+            motor.body.shape,
+            motor.bodies,
+        )
+        .map(|support| support.normal)
+        .unwrap_or(Vec3::Y)
+    } else {
+        Vec3::Y
+    };
     // Coyote time: keep a jump available briefly after walking off an edge.
     character.coyote = if grounded {
         motor.profile.coyote_ticks
@@ -124,6 +140,17 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
     let previous = physics::bounded_horizontal(
         Vec2::new(state.velocity.x, state.velocity.z) - state.external_velocity,
     );
+    // Ground steeper than the walkable limit overrides control: the actor
+    // slides downhill, accumulating up to the profile speed.
+    if state.grounded && motor.support.y < motor.profile.max_slope_cos {
+        let downhill = (motor.support * motor.support.y - Vec3::Y).normalize_or_zero();
+        let slide = Vec2::new(downhill.x, downhill.z) * motor.profile.gravity * motor.dt;
+        let slid = (previous + slide).clamp_length_max(motor.profile.speed) + state.external_velocity;
+        motor.attempted = slid;
+        state.velocity.x = slid.x;
+        state.velocity.z = slid.y;
+        return;
+    }
     let rate = if target.length_squared() < previous.length_squared() {
         motor.profile.braking
     } else {
