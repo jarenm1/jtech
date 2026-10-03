@@ -18,8 +18,20 @@ pub struct ScatterWorld {
     species: Vec<ScatterSpeciesInfo>,
     /// Resolved model handles per species index, once downloaded.
     models: HashMap<u16, Primitives>,
+    /// Species still awaiting their model download and parse.
+    unresolved: HashSet<u16>,
     /// Species whose downloaded model failed to parse; never retried.
     failed: HashSet<u16>,
+    /// Chunks held until their species resolve: how many of the chunk's
+    /// species still lack a model.
+    pending_species: HashMap<IVec3, usize>,
+    /// Reverse index from an unresolved or failed species to the chunks
+    /// waiting on it, so one resolved model wakes only its dependents.
+    waiting_on: HashMap<u16, HashSet<IVec3>>,
+    /// Chunks whose species are all resolved; spawned on the next sync.
+    ready: Vec<IVec3>,
+    /// Last `PackageAssets` version checked against the unresolved species.
+    assets_version: u64,
     /// Instances per chunk, from the `Chunk` message.
     instances: HashMap<IVec3, Vec<ScatterInstance>>,
     /// Root entities per chunk, for eviction.
@@ -33,14 +45,69 @@ impl ScatterWorld {
         self.clear(commands);
         self.species = species;
         self.models.clear();
+        self.unresolved = (0..self.species.len() as u16).collect();
         self.failed.clear();
     }
 
     pub fn receive(&mut self, coord: IVec3, instances: Vec<ScatterInstance>) {
+        self.unwait(coord);
+        // A chunk re-received while spawned keeps its entities, so only fresh
+        // chunks enter the wait bookkeeping.
+        if self.entities.contains_key(&coord) {
+            self.instances.insert(coord, instances);
+            return;
+        }
+        let needed: HashSet<u16> = instances
+            .iter()
+            .map(|instance| instance.species)
+            .filter(|index| !self.models.contains_key(index))
+            .collect();
         self.instances.insert(coord, instances);
+        if needed.is_empty() {
+            self.ready.push(coord);
+        } else {
+            self.pending_species.insert(coord, needed.len());
+            for index in needed {
+                self.waiting_on.entry(index).or_default().insert(coord);
+            }
+        }
+    }
+
+    /// Drop a chunk's wait bookkeeping when its instance list is replaced or
+    /// the chunk is evicted.
+    fn unwait(&mut self, coord: IVec3) {
+        if self.pending_species.remove(&coord).is_none() {
+            return;
+        }
+        for chunks in self.waiting_on.values_mut() {
+            chunks.remove(&coord);
+        }
+        self.waiting_on.retain(|_, chunks| !chunks.is_empty());
+    }
+
+    /// Species `index` resolved: every chunk waiting on it sheds one pending
+    /// species and joins `ready` once none remain. A failed species never
+    /// wakes, so its dependents stay blocked forever - matching a `missing`
+    /// model in the old polling path.
+    fn wake(&mut self, index: u16) {
+        let Some(chunks) = self.waiting_on.remove(&index) else {
+            return;
+        };
+        for coord in chunks {
+            let Some(needs) = self.pending_species.get_mut(&coord) else {
+                continue;
+            };
+            *needs -= 1;
+            if *needs == 0 {
+                self.pending_species.remove(&coord);
+                self.ready.push(coord);
+            }
+        }
     }
 
     pub fn forget(&mut self, coord: IVec3, commands: &mut Commands) {
+        self.unwait(coord);
+        self.ready.retain(|queued| *queued != coord);
         self.instances.remove(&coord);
         if let Some(entities) = self.entities.remove(&coord) {
             for entity in entities {
@@ -56,6 +123,10 @@ impl ScatterWorld {
             }
         }
         self.instances.clear();
+        self.pending_species.clear();
+        self.waiting_on.clear();
+        self.ready.clear();
+        self.unresolved.clear();
     }
 
     /// Resident instance count, for metrics.
@@ -65,57 +136,61 @@ impl ScatterWorld {
 }
 
 /// Resolve newly downloaded models, then spawn any chunk whose species are all
-/// resident. Runs every frame; the work is bounded by pending downloads.
+/// resident. Cheap per frame: unresolved species are re-checked only when the
+/// package cache generation changes, and chunks spawn only when a chunk or
+/// species resolves, not by rescanning every instance.
 pub fn sync_scatter(
     mut commands: Commands,
     mut scatter: ResMut<ScatterWorld>,
     assets: Res<PackageAssets>,
     asset_server: Res<AssetServer>,
 ) {
-    let missing: Vec<(u16, String, String)> = scatter
-        .species
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            let index = *index as u16;
-            !scatter.models.contains_key(&index) && !scatter.failed.contains(&index)
-        })
-        .map(|(index, info)| (index as u16, info.package.clone(), info.model.clone()))
-        .collect();
-    for (index, package, model) in missing {
-        let Some(uri) = assets.uri(&package, &model) else {
-            continue;
-        };
-        let Some(bytes) = assets.bytes(&package, &model) else {
-            continue;
-        };
-        match package_assets::gltf_primitives(&asset_server, &uri, &bytes) {
-            Some(primitives) => {
-                scatter.models.insert(index, primitives);
+    if assets.version() != scatter.assets_version {
+        scatter.assets_version = assets.version();
+        let mut resolving = Vec::new();
+        for index in &scatter.unresolved {
+            let Some(info) = scatter.species.get(*index as usize) else {
+                continue;
+            };
+            if let (Some(uri), Some(bytes)) = (
+                assets.uri(&info.package, &info.model),
+                assets.bytes(&info.package, &info.model),
+            ) {
+                resolving.push((*index, uri, bytes));
             }
-            None => {
-                warn!("scatter species {index} model {model} is not a readable glTF");
-                scatter.failed.insert(index);
+        }
+        for (index, uri, bytes) in resolving {
+            match package_assets::gltf_primitives(&asset_server, &uri, &bytes) {
+                Some(primitives) => {
+                    scatter.models.insert(index, primitives);
+                    scatter.unresolved.remove(&index);
+                    scatter.wake(index);
+                }
+                None => {
+                    let model = scatter
+                        .species
+                        .get(index as usize)
+                        .map_or("unknown", |info| info.model.as_str());
+                    warn!("scatter species {index} model {model} is not a readable glTF");
+                    scatter.unresolved.remove(&index);
+                    scatter.failed.insert(index);
+                }
             }
         }
     }
 
-    let ready: Vec<IVec3> = scatter
-        .instances
-        .keys()
-        .copied()
-        .filter(|coord| !scatter.entities.contains_key(coord))
-        .filter(|coord| {
-            scatter.instances[coord]
-                .iter()
-                .all(|instance| scatter.models.contains_key(&instance.species))
-        })
-        .collect();
-    for coord in ready {
-        let instances = scatter.instances[&coord].clone();
+    for coord in std::mem::take(&mut scatter.ready) {
+        // A chunk re-received after spawning keeps its entities and must not
+        // spawn a second set.
+        if scatter.entities.contains_key(&coord) {
+            continue;
+        }
+        let Some(instances) = scatter.instances.get(&coord) else {
+            continue;
+        };
         let mut spawned = Vec::with_capacity(instances.len());
         for instance in instances {
-            let Some(primitives) = scatter.models.get(&instance.species).cloned() else {
+            let Some(primitives) = scatter.models.get(&instance.species) else {
                 continue;
             };
             let root = commands
@@ -132,7 +207,7 @@ pub fn sync_scatter(
             for (mesh, material) in primitives {
                 commands
                     .entity(root)
-                    .with_child((Mesh3d(mesh), MeshMaterial3d(material)));
+                    .with_child((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())));
             }
             spawned.push(root);
         }
