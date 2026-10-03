@@ -368,8 +368,21 @@ impl PhysicsSlice {
             .collect()
     }
 
-    pub fn player_colliders(&mut self, players: Vec<PlayerCollider>) {
-        self.players = players;
+    /// Whether the next `step` will reach the player-collider upload: the
+    /// submission cadence lands on it (tick increments inside `step`), the
+    /// backend is idle, and bodies exist to collide with. Lets callers skip
+    /// collider prep that a skipped or bodies-free step would discard.
+    pub fn can_prepare_submission(&self) -> bool {
+        !self.failed
+            && (self.tick + 1).is_multiple_of(3)
+            && !self.bodies.is_empty()
+            && !self.is_busy()
+    }
+
+    /// Replace the collider list in place so the backing Vec keeps its capacity.
+    pub fn set_player_colliders(&mut self, players: impl IntoIterator<Item = PlayerCollider>) {
+        self.players.clear();
+        self.players.extend(players);
     }
 
     pub fn dynamic_colliders(&self) -> Vec<physics::DynamicCollider> {
@@ -798,7 +811,7 @@ mod tests {
                 physics::FIXED_DT,
                 &slice.dynamic_colliders(),
             );
-            slice.player_colliders(vec![PlayerCollider {
+            slice.set_player_colliders([PlayerCollider {
                 position: player.position.to_array(),
                 id: 0,
                 velocity: [intended.velocity.x, player.velocity.y, intended.velocity.z],

@@ -931,21 +931,24 @@ impl Simulation {
                 break;
             }
         }
-        let mut players: Vec<_> = self.players.iter().collect();
-        players.sort_unstable_by_key(|(id, _)| **id);
-        physics.player_colliders(
-            players
-                .into_iter()
-                .filter(|(_, player)| !player.state.noclip && !player.health.is_depleted())
-                .enumerate()
-                .map(|(slot, (_, player))| gpu_physics::PlayerCollider {
-                    position: player.state.position.to_array(),
-                    id: slot as u32,
-                    velocity: player.body_push_velocity.to_array(),
-                    padding: 0,
-                })
-                .collect(),
-        );
+        // Collider prep is sorted and collected only when the upcoming step can
+        // actually consume it; off-cadence and busy ticks would discard the work.
+        if physics.can_prepare_submission() {
+            let mut players: Vec<_> = self.players.iter().collect();
+            players.sort_unstable_by_key(|(id, _)| **id);
+            physics.set_player_colliders(
+                players
+                    .into_iter()
+                    .filter(|(_, player)| !player.state.noclip && !player.health.is_depleted())
+                    .enumerate()
+                    .map(|(slot, (_, player))| gpu_physics::PlayerCollider {
+                        position: player.state.position.to_array(),
+                        id: slot as u32,
+                        velocity: player.body_push_velocity.to_array(),
+                        padding: 0,
+                    }),
+            );
+        }
         physics.step(world);
         if self.tick.is_multiple_of(3) {
             let revision = physics.revision;
