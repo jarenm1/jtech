@@ -253,6 +253,9 @@ fn quat(value: Option<&serde_json::Value>) -> Option<Quat> {
 
 use protocol::{ClientMessage, PackageAssetInfo};
 
+/// Largest file the server will send; bounds the receive buffer.
+const MAX_ASSET_BYTES: u32 = 16 * 1024 * 1024;
+
 /// One in-flight download; chunks arrive reliably and in order.
 struct Pending {
     total: u32,
@@ -262,8 +265,8 @@ struct Pending {
 
 #[derive(Resource, Default)]
 pub struct PackageAssets {
-    manifest: Vec<PackageAssetInfo>,
-    pending: HashMap<(String, String), Pending>,
+    /// package -> path -> in-flight download.
+    pending: HashMap<String, HashMap<String, Pending>>,
     /// Manifest entries resolved to their local copy; `sync` rebuilds it and
     /// `receive_chunk` patches it, so `uri`/`bytes` are hash lookups instead
     /// of a manifest scan plus filesystem stat/read per call.
@@ -318,17 +321,11 @@ impl PackageAssets {
     /// Replace the manifest; returns requests for files not yet cached or
     /// already in flight.
     pub fn sync(&mut self, manifest: Vec<PackageAssetInfo>) -> Vec<ClientMessage> {
-        self.manifest = manifest;
-        self.pending.retain(|(package, path), _| {
-            self.manifest
-                .iter()
-                .any(|info| &info.package == package && &info.path == path)
-        });
         // Resolve every manifest entry once: local path, on-disk presence and
         // pkg:// URI, carrying cached bytes over when the content-addressed
         // file is unchanged.
         let mut resolved: HashMap<String, HashMap<String, Resolved>> = HashMap::new();
-        for info in &self.manifest {
+        for info in &manifest {
             let relative = Path::new(&info.package)
                 .join(info.hash.to_string())
                 .join(&info.path);
@@ -351,33 +348,49 @@ impl PackageAssets {
                 );
         }
         self.resolved = resolved;
-        let missing: Vec<(String, String, u32)> = self
-            .manifest
-            .iter()
-            .filter(|info| {
-                !self
-                    .pending
-                    .contains_key(&(info.package.clone(), info.path.clone()))
-                    && !self
-                        .resolved(&info.package, &info.path)
-                        .is_some_and(|resolved| resolved.exists)
-            })
-            .map(|info| (info.package.clone(), info.path.clone(), info.size))
-            .collect();
-        missing
-            .into_iter()
-            .map(|(package, path, size)| {
-                self.pending.insert(
-                    (package.clone(), path.clone()),
+        let resolved_index = &self.resolved;
+        self.pending.retain(|package, paths| {
+            let Some(by_path) = resolved_index.get(package) else {
+                return false;
+            };
+            paths.retain(|path, _| by_path.contains_key(path));
+            !paths.is_empty()
+        });
+        let mut requests = Vec::new();
+        for info in &manifest {
+            if info.size > MAX_ASSET_BYTES {
+                continue;
+            }
+            if self
+                .pending
+                .get(&info.package)
+                .is_some_and(|paths| paths.contains_key(&info.path))
+            {
+                continue;
+            }
+            if self
+                .resolved(&info.package, &info.path)
+                .is_some_and(|resolved| resolved.exists)
+            {
+                continue;
+            }
+            self.pending
+                .entry(info.package.clone())
+                .or_default()
+                .insert(
+                    info.path.clone(),
                     Pending {
-                        total: size,
+                        total: info.size,
                         received: 0,
-                        data: Vec::new(),
+                        data: Vec::with_capacity(info.size as usize),
                     },
                 );
-                ClientMessage::AssetRequest { package, path }
-            })
-            .collect()
+            requests.push(ClientMessage::AssetRequest {
+                package: info.package.clone(),
+                path: info.path.clone(),
+            });
+        }
+        requests
     }
 
     /// Accumulate one chunk; writes the file when the transfer completes. A
@@ -390,12 +403,17 @@ impl PackageAssets {
         total: u32,
         data: &[u8],
     ) {
-        let key = (package.to_string(), path.to_string());
-        let Some(pending) = self.pending.get_mut(&key) else {
+        let Some(paths) = self.pending.get_mut(package) else {
+            return;
+        };
+        let Some(pending) = paths.get_mut(path) else {
             return;
         };
         if offset != pending.received || total != pending.total {
-            self.pending.remove(&key);
+            paths.remove(path);
+            if paths.is_empty() {
+                self.pending.remove(package);
+            }
             return;
         }
         pending.data.extend_from_slice(data);
@@ -403,7 +421,10 @@ impl PackageAssets {
         if pending.received < pending.total {
             return;
         }
-        let pending = self.pending.remove(&key).unwrap();
+        let pending = paths.remove(path).unwrap();
+        if paths.is_empty() {
+            self.pending.remove(package);
+        }
         let Some(resolved) = self
             .resolved
             .get_mut(package)
