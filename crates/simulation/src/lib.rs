@@ -199,6 +199,7 @@ impl Plugin for SimulationPlugin {
                 metrics: SimulationMetrics::default(),
                 tick_times: VecDeque::new(),
                 needed: HashSet::new(),
+                physics_needed: HashSet::new(),
                 physics,
                 terrain: self.terrain.lock().take().expect("plugin built once"),
                 scatter,
@@ -366,6 +367,8 @@ pub struct Simulation {
     pub metrics: SimulationMetrics,
     tick_times: VecDeque<u64>,
     needed: HashSet<IVec3>,
+    // Reused per tick so body-footprint residency keeps its capacity.
+    physics_needed: HashSet<IVec3>,
     physics: Option<PhysicsSlice>,
     /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
     damage: HashMap<IVec3, DamageState>,
@@ -1325,12 +1328,11 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         needed.extend(player.safety.iter().copied());
     }
     // Body collision residency is independent of visible/player interest.
-    let physics_needed = sim
-        .physics
-        .as_ref()
-        .map(PhysicsSlice::needed_chunks)
-        .unwrap_or_default();
-    needed.extend(physics_needed.iter().copied());
+    sim.physics_needed.clear();
+    if let Some(physics) = sim.physics.as_ref() {
+        physics.needed_chunks(&mut sim.physics_needed);
+    }
+    needed.extend(sim.physics_needed.iter().copied());
     // Keep spawn warm for reconnects without admitting actors over unloaded terrain.
     needed.extend(sim.spawn_chunks.iter().copied());
     for &coord in &needed {
@@ -1343,7 +1345,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         .collect();
     let missing = streaming::nearest_chunks(missing, streaming::CHUNKS_PER_TICK, |coord| {
         (
-            !physics_needed.contains(coord),
+            !sim.physics_needed.contains(coord),
             sim.players
                 .values()
                 .map(|p| {

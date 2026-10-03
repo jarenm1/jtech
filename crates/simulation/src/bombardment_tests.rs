@@ -1,5 +1,6 @@
 //! Authoritative blast/lifecycle integration without a network transport.
 use super::*;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use voxel_world::Chunk;
 
@@ -30,7 +31,9 @@ fn air(world: &mut VoxelWorld, coord: IVec3) {
 }
 
 fn load_halos(sim: &Simulation, world: &mut VoxelWorld) {
-    for coord in sim.physics.as_ref().unwrap().needed_chunks() {
+    let mut chunks = HashSet::new();
+    sim.physics.as_ref().unwrap().needed_chunks(&mut chunks);
+    for coord in chunks {
         air(world, coord);
     }
 }
@@ -246,14 +249,9 @@ fn playerless_streaming_loads_moving_halos_and_retires_remote_regions() {
             .unwrap()
             .release(source, 3, 0.0, Vec3::X * 12.0);
         assert_eq!(sim.players.len(), 0);
-        assert!(
-            sim.physics
-                .as_ref()
-                .unwrap()
-                .needed_chunks()
-                .iter()
-                .any(|coord| !world.chunks.contains_key(coord))
-        );
+        let mut chunks = HashSet::new();
+        sim.physics.as_ref().unwrap().needed_chunks(&mut chunks);
+        assert!(chunks.iter().any(|coord| !world.chunks.contains_key(coord)));
     });
     // Terrain halos stream asynchronously, and the GPU will not step a body until every
     // collision page is resident. Wait for the normal stream to load them before starting
@@ -262,10 +260,9 @@ fn playerless_streaming_loads_moving_halos_and_retires_remote_regions() {
     loop {
         app.update();
         let resident = with_sim(&mut app, |sim, world| {
-            sim.physics
-                .as_ref()
-                .unwrap()
-                .needed_chunks()
+            let mut chunks = HashSet::new();
+            sim.physics.as_ref().unwrap().needed_chunks(&mut chunks);
+            chunks
                 .iter()
                 .all(|coord| world.chunks.contains_key(coord))
         });
@@ -281,12 +278,9 @@ fn playerless_streaming_loads_moving_halos_and_retires_remote_regions() {
             complete(sim, world);
             let physics = sim.physics.as_ref().unwrap();
             if physics.completions > 0 {
-                assert!(
-                    physics
-                        .needed_chunks()
-                        .iter()
-                        .all(|coord| world.chunks.contains_key(coord))
-                );
+                let mut chunks = HashSet::new();
+                physics.needed_chunks(&mut chunks);
+                assert!(chunks.iter().all(|coord| world.chunks.contains_key(coord)));
                 crossed |= physics
                     .snapshots()
                     .iter()
@@ -304,7 +298,8 @@ fn playerless_streaming_loads_moving_halos_and_retires_remote_regions() {
     assert!(crossed, "body failed to cross the remote chunk boundary");
     let remote = with_sim(&mut app, |sim, world| {
         let physics = sim.physics.as_mut().unwrap();
-        let remote = physics.needed_chunks();
+        let mut remote = HashSet::new();
+        physics.needed_chunks(&mut remote);
         assert!(physics.resident_chunks() > 0);
         assert!(
             physics
@@ -344,8 +339,9 @@ fn playerless_streaming_loads_moving_halos_and_retires_remote_regions() {
         with_sim(&mut app, complete);
     }
     with_sim(&mut app, |sim, world| {
-        assert!(sim.physics.as_ref().unwrap().needed_chunks().is_empty());
-        assert_eq!(sim.physics.as_ref().unwrap().resident_chunks(), 0);
+        let mut chunks = HashSet::new();
+        sim.physics.as_ref().unwrap().needed_chunks(&mut chunks);
+        assert!(chunks.is_empty());
         assert!(remote.iter().all(|coord| !world.chunks.contains_key(coord)));
         assert!(
             remote
