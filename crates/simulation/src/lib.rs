@@ -1762,6 +1762,7 @@ mod tests {
                 ..Default::default()
             },
             yaw: 0.0,
+            ..Default::default()
         };
         let body = controller::CharacterBody::default();
         let profile = controller::MovementProfile::default();

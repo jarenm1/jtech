@@ -66,6 +66,7 @@ pub fn step_player_with_bodies(
     let mut character = CharacterState {
         motion: *state,
         yaw: finite(input.yaw),
+        ..Default::default()
     };
     let mut intent = CharacterIntent {
         movement: Vec2::from_array(input.movement),

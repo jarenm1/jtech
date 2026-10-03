@@ -111,12 +111,74 @@ impl MovementProfile {
     }
 }
 
+/// Exclusive locomotion/action mode. Ground and Air are derived from support;
+/// Cast, Dash and Blink are timed actions that lock input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Ground,
+    Air,
+    Cast,
+    Dash,
+    Blink,
+}
+
+/// Status effect kinds. Knockback stays physics-owned; these gate action and
+/// movement and are applied and cleared by the host's combat system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusKind {
+    Stun,
+    Sleep,
+    Root,
+    Slow,
+    Silence,
+    Knockup,
+    Taunt,
+    Fear,
+    Blind,
+}
+
+/// One active status effect; `remaining` counts down in fixed ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub kind: StatusKind,
+    pub remaining: u16,
+}
+
+/// Maximum simultaneously active statuses per character.
+pub const MAX_STATUSES: usize = 8;
+
+/// Bounded set of active statuses in application order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusList {
+    entries: [Option<Status>; MAX_STATUSES],
+}
+impl StatusList {
+    /// Active statuses in application order; `None` slots are free.
+    pub fn entries(&self) -> &[Option<Status>; MAX_STATUSES] {
+        &self.entries
+    }
+}
+
+/// Per-tick movement and action gates derived from active statuses and mode.
+/// Derived, not stored: the motor recomputes it from `CharacterState` each tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Constraints {
+    pub action_locked: bool,
+    pub movement_locked: bool,
+    pub cast_locked: bool,
+    pub speed_mult: f32,
+    pub turn_mult: f32,
+}
+
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.
 /// `motion.noclip` is reserved for the human debug adapter, not a policy action.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CharacterState {
     pub motion: physics::KinematicState,
     pub yaw: f32,
+    pub mode: Mode,
+    pub statuses: StatusList,
 }
 impl CharacterState {
     pub fn apply_impulse(&mut self, body: &CharacterBody, impulse: Vec3) {
