@@ -160,11 +160,9 @@ impl Plugin for SimulationPlugin {
             Update,
             observe_character_bodies.in_set(controller::ControllerSet::Intent),
         );
-        let mut world = VoxelWorld {
-            seed: self.config.seed,
-            generator: self.generator.clone(),
-            ..Default::default()
-        };
+        let mut world = VoxelWorld::default();
+        world.seed = self.config.seed;
+        world.generator = self.generator.clone();
         let spawn = terrain_stream::spawn_position(&self.generator, self.config.seed);
         let spawn_chunks = terrain_stream::local_chunks(spawn, 1);
         for &coord in &spawn_chunks {

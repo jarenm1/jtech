@@ -631,6 +631,11 @@ pub struct VoxelWorld {
     pub seed: u64,
     /// Compiled terrain graph shared by streaming generation.
     pub generator: Arc<TerrainGenerator>,
+    /// Monotonic count of voxel edits ([`Self::set_voxel`] and the brush
+    /// paths). Streaming [`Self::insert`]/[`Self::remove`] never bump it, so
+    /// caches of derived geometry can tell a player edit from a chunk load and
+    /// invalidate immediately instead of polling every chunk revision.
+    edits: u64,
 }
 pub struct WorldPlugin;
 impl Plugin for WorldPlugin {
@@ -649,6 +654,13 @@ impl VoxelWorld {
     }
     pub fn remove(&mut self, coord: IVec3) {
         self.chunks.remove(&coord);
+    }
+    /// Monotonic count of voxel edits applied to this world. Streaming chunk
+    /// loads and unloads do not bump it; only [`Self::set_voxel`] and the
+    /// brush edits do. Consumers compare it across frames to detect edits
+    /// without scanning chunk revisions.
+    pub fn edit_epoch(&self) -> u64 {
+        self.edits
     }
     pub fn ensure_chunk(&mut self, coord: IVec3) {
         self.chunks
@@ -686,6 +698,7 @@ impl VoxelWorld {
         let chunk = Arc::make_mut(chunk);
         chunk.set_voxel(i, voxel);
         chunk.revision = new;
+        self.edits = self.edits.wrapping_add(1);
         Some((old, new))
     }
     /// Signed density at a world voxel; `None` for unloaded chunks.
@@ -847,6 +860,9 @@ impl VoxelWorld {
                     }
                 }
             }
+        }
+        if !edits.is_empty() {
+            self.edits = self.edits.wrapping_add(1);
         }
         edits
     }
@@ -1092,6 +1108,30 @@ mod tests {
         assert!(world.raycast(origin, Vec3::ZERO, 4.0).is_none());
         world.remove(IVec3::NEG_X);
         assert!(world.raycast(origin, Vec3::NEG_X, 4.0).is_none());
+    }
+    #[test]
+    fn edit_epoch_tracks_voxel_edits_not_streaming() {
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, uniform(AIR));
+        world.insert(IVec3::X, uniform(AIR));
+        assert_eq!(world.edit_epoch(), 0);
+        // Streaming loads and unloads are not edits.
+        world.remove(IVec3::X);
+        world.insert(IVec3::X, uniform(AIR));
+        assert_eq!(world.edit_epoch(), 0);
+        // A no-op write does not bump it either.
+        assert_eq!(world.set_block(IVec3::new(1, 1, 1), AIR), None);
+        assert_eq!(world.edit_epoch(), 0);
+        // A real voxel write does.
+        assert!(world.set_block(IVec3::new(1, 1, 1), STONE).is_some());
+        assert_eq!(world.edit_epoch(), 1);
+        // A brush that carves nothing (all air) does not bump it.
+        assert!(world.brush_dig(Vec3::new(20.5, 1.5, 20.5), 1.0).is_empty());
+        assert_eq!(world.edit_epoch(), 1);
+        // A brush that carves solid terrain does.
+        world.insert(IVec3::Y, uniform(STONE));
+        assert!(!world.brush_dig(Vec3::new(1.5, 33.5, 1.5), 1.0).is_empty());
+        assert_eq!(world.edit_epoch(), 2);
     }
     #[test]
     fn terrain_is_seeded_and_revision_exhaustion_is_atomic() {

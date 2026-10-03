@@ -615,6 +615,10 @@ struct GrassField {
     dirty: Vec<(f32, IVec2)>,
     checked_at: f32,
     scan_focus: Vec3,
+    /// Last observed [`VoxelWorld::edit_epoch`]. A change forces an immediate
+    /// stamp scan, so a player edit invalidates its patches on the next frame
+    /// instead of waiting out `GRASS_STAMP_SCAN_INTERVAL`.
+    edit_epoch: u64,
     /// Focus patch cell and ceiling band of the last range/LOD walk. Neither
     /// membership nor tiers can change until the focus crosses a patch edge
     /// or the ceiling band moves, so the candidate box is walked only then.
@@ -984,6 +988,7 @@ fn update_grass(
         dirty,
         checked_at,
         scan_focus,
+        edit_epoch,
         walked,
         total_blades,
     } = &mut *field;
@@ -1106,9 +1111,15 @@ fn update_grass(
     }
 
     // Walking ~800 patch stamps per frame is too expensive; re-scan on a
-    // short interval, and early after a 4 m move. Stamp-dirty patches queue
+    // short interval, and early after a 4 m move. A voxel edit forces an
+    // immediate scan, so blades over changed terrain vanish on the next frame
+    // rather than lingering for up to the interval. Stamp-dirty patches queue
     // for rebuild; their entities stay drawn until the build lands.
-    let scan = time.elapsed_secs() - *checked_at >= GRASS_STAMP_SCAN_INTERVAL
+    let epoch = world.edit_epoch();
+    let edited = epoch != *edit_epoch;
+    *edit_epoch = epoch;
+    let scan = edited
+        || time.elapsed_secs() - *checked_at >= GRASS_STAMP_SCAN_INTERVAL
         || focus.0.distance(*scan_focus) >= GRASS_STAMP_SCAN_STEP;
     if scan {
         *checked_at = time.elapsed_secs();
@@ -1141,6 +1152,12 @@ fn update_grass(
         .min(GRASS_BUILDS_PER_UPDATE + dirty.len() / GRASS_BUILDS_PER_DIRTY);
     let mut drained = 0;
     while builds > 0 && drained < dirty.len() {
+        // Stop before consuming the entry: a saturated job cap must leave it
+        // queued for a later frame. Consuming it here would drop it from the
+        // queue while `queued` stays set, stranding the patch unbuilt forever.
+        if jobs.len() >= GRASS_MAX_JOBS {
+            break;
+        }
         let coord = dirty[drained].1;
         drained += 1;
         let Some(patch) = patches.get_mut(&coord) else {
@@ -1148,9 +1165,6 @@ fn update_grass(
         };
         if !patch.queued {
             continue;
-        }
-        if jobs.len() >= GRASS_MAX_JOBS {
-            break;
         }
         if jobs.iter().any(|job| job.coord == coord) {
             continue;
@@ -1849,31 +1863,32 @@ mod tests {
     }
 
     /// Diagonal grass-over-dirt surface `x + y = 32` covering the test patches.
+    fn sloped_grass_chunk() -> Chunk {
+        voxel_chunk_with(
+            |p| {
+                if p.x + p.y >= 32 {
+                    AIR
+                } else if p.x + p.y >= 31 {
+                    GRASS
+                } else {
+                    DIRT
+                }
+            },
+            |p| {
+                if p.x + p.y >= 32 {
+                    DENSITY_AIR
+                } else if p.x + p.y >= 31 {
+                    40
+                } else {
+                    127
+                }
+            },
+        )
+    }
+
     fn sloped_grass_world() -> VoxelWorld {
         let mut world = VoxelWorld::default();
-        world.insert(
-            IVec3::ZERO,
-            voxel_chunk_with(
-                |p| {
-                    if p.x + p.y >= 32 {
-                        AIR
-                    } else if p.x + p.y >= 31 {
-                        GRASS
-                    } else {
-                        DIRT
-                    }
-                },
-                |p| {
-                    if p.x + p.y >= 32 {
-                        DENSITY_AIR
-                    } else if p.x + p.y >= 31 {
-                        40
-                    } else {
-                        127
-                    }
-                },
-            ),
-        );
+        world.insert(IVec3::ZERO, sloped_grass_chunk());
         world
     }
 
@@ -2041,5 +2056,70 @@ mod tests {
         assert_eq!(grass_lod(IVec2::new(15, 0), focus), 2);
         assert!(grass_patch_in_range(IVec2::new(15, 0), focus));
         assert!(!grass_patch_in_range(IVec2::new(17, 0), focus));
+    }
+
+    /// A terrain edit must invalidate the grass over it on the next update,
+    /// not after the throttled stamp-scan interval. The clock is frozen so the
+    /// interval can never fire: only the edit epoch can trigger the scan.
+    #[test]
+    fn edit_forces_immediate_grass_rebuild() {
+        let mut app = renderer_app();
+        app.world_mut()
+            .resource_mut::<Time<bevy::time::Virtual>>()
+            .set_relative_speed(0.0);
+        app.world_mut()
+            .resource_mut::<VoxelWorld>()
+            .insert(IVec3::ZERO, sloped_grass_chunk());
+        app.world_mut().resource_mut::<RenderFocus>().0 = Vec3::new(4.0, 30.0, 4.0);
+
+        // Let the patch build and upload.
+        let mut built = false;
+        for _ in 0..500 {
+            app.update();
+            if app
+                .world()
+                .resource::<GrassField>()
+                .patches
+                .get(&IVec2::ZERO)
+                .is_some_and(|patch| patch.built && patch.draw.is_some())
+            {
+                built = true;
+                break;
+            }
+        }
+        assert!(built, "grass patch never built");
+        let before = app.world().resource::<GrassField>().patches[&IVec2::ZERO]
+            .draw
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
+
+        // The edit queues the patch for rebuild on the very next update.
+        app.world_mut()
+            .resource_mut::<VoxelWorld>()
+            .set_block(IVec3::new(4, 30, 4), STONE);
+        app.update();
+        let field = app.world().resource::<GrassField>();
+        assert!(
+            field.patches[&IVec2::ZERO].queued
+                || field.jobs.iter().any(|job| job.coord == IVec2::ZERO),
+            "edit did not invalidate the grass patch immediately"
+        );
+
+        // The rebuild lands and swaps in a fresh mesh.
+        let mut rebuilt = false;
+        for _ in 0..500 {
+            app.update();
+            if let Some((_, handle)) = &app.world().resource::<GrassField>().patches[&IVec2::ZERO]
+                .draw
+            {
+                if *handle != before {
+                    rebuilt = true;
+                    break;
+                }
+            }
+        }
+        assert!(rebuilt, "grass patch did not rebuild after the edit");
     }
 }
