@@ -750,8 +750,7 @@ fn receive_network(
         if snapshot.tick <= session.last_tick || Some(snapshot.you.id) != session.id {
             continue;
         }
-        let colliders: Vec<_> = loose.colliders().to_vec();
-        reconcile(&mut session, &world, &snapshot, &colliders);
+        reconcile(&mut session, &world, &snapshot, loose.colliders());
         let now = Instant::now();
         remotes.0.retain(|id, remote| {
             if snapshot.players.iter().any(|player| player.id == *id) {
@@ -991,7 +990,7 @@ fn predict(
         keys.just_pressed(KeyCode::Space),
     );
     session.accumulator += time.delta_secs().min(0.1);
-    let colliders: Vec<_> = loose.colliders().to_vec();
+    let colliders = loose.colliders();
     while session.accumulator >= FIXED_DT {
         session.accumulator -= FIXED_DT;
         // Stop producing new commands when the acknowledgement window is full.
@@ -1033,7 +1032,7 @@ fn predict(
             noclip: session.noclip_requested,
             attack: session.consume_attack(),
         };
-        session.predict_input(&world, input, &colliders);
+        session.predict_input(&world, input, colliders);
     }
     if !session.pending.is_empty() {
         let inputs = session
