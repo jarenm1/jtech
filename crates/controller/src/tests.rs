@@ -315,6 +315,49 @@ fn smooth_ramp_is_walkable_and_reports_grounded() {
 }
 
 #[test]
+fn steep_ground_slides_the_player_downhill() {
+    let mut world = VoxelWorld::default();
+    for x in -1..=1 {
+        for z in -1..=0 {
+            world.insert(
+                IVec3::new(x, 0, z),
+                Chunk::from_runs(0, &[(32768, AIR)]).unwrap(),
+            );
+            world.insert(
+                IVec3::new(x, -1, z),
+                Chunk::from_runs(0, &[(32768, AIR)]).unwrap(),
+            );
+        }
+    }
+    // A 2:1 rise (63 degrees), steeper than the 45 degree walkable limit.
+    for x in -4..16 {
+        for y in -4..16 {
+            for z in -4..6 {
+                let density = ((2.0 * x as f32 - y as f32) * 30.0).clamp(-128.0, 127.0) as i8;
+                world.set_voxel(
+                    IVec3::new(x, y, z),
+                    voxel_world::Voxel {
+                        material: if density > 0 { STONE } else { AIR },
+                        density,
+                        placed: false,
+                    },
+                );
+            }
+        }
+    }
+    let mut state = player(Vec3::new(4.0, 10.0, 0.5));
+    let input = PlayerInput::default();
+    for _ in 0..120 {
+        step_player(&world, &mut state, &input, FIXED_DT);
+    }
+    assert!(
+        state.position.x < 4.0,
+        "steep ground must slide the player downhill: {:?}",
+        state.position
+    );
+}
+
+#[test]
 fn sweep_lands_on_the_iso_surface_not_the_voxel_plane() {
     let world = ramp();
     let mut position = Vec3::new(3.5, 4.0, 0.5);
