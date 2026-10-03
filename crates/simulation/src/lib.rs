@@ -24,7 +24,10 @@ use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
 use material_damage::{MAX_DAMAGED_BLOCKS, tool_contact};
 use networking::ServerTransport;
-use physics::{EYE_HEIGHT, FIXED_DT, PlayerState, look_direction, overlaps_block};
+use physics::{
+    CollisionShape, DynamicCollider, EYE_HEIGHT, FIXED_DT, PlayerState, look_direction,
+    overlaps_block,
+};
 use physics_slice::PhysicsSlice;
 use protocol::{
     ActorSnapshot, ClientMessage, EditRejection, InputPacket, PlayerSnapshot,
@@ -208,6 +211,8 @@ impl Plugin for SimulationPlugin {
                 physics_needed: HashSet::new(),
                 physics,
                 collider_scratch: Vec::new(),
+                character_scratch: Vec::new(),
+                step_scratch: Vec::new(),
                 terrain: self.terrain.lock().take().expect("plugin built once"),
                 scatter,
                 spawn,
@@ -249,6 +254,62 @@ impl Plugin for SimulationPlugin {
         }
     }
 }
+/// Character collider ids start above the loose-body range so a character can
+/// never be confused with a physics body.
+pub(crate) const CHARACTER_ID_BASE: u64 = 1 << 31;
+
+/// Append every living character's feet-anchored AABB, skipping `skip`, so
+/// characters block and shove each other. Deterministic: players and actors
+/// iterate in id order.
+fn character_colliders(
+    players: &HashMap<u64, Player>,
+    actors: &actors::ActorMap,
+    skip: Option<u64>,
+    margin: f32,
+    out: &mut Vec<DynamicCollider>,
+) {
+    let mut ids: Vec<u64> = players.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let player = &players[&id];
+        if player.health.is_depleted() || skip == Some(id) {
+            continue;
+        }
+        out.push(character_collider(
+            CHARACTER_ID_BASE + id,
+            player.state.motion.position,
+            CollisionShape::default(),
+            margin,
+        ));
+    }
+    for (&id, actor) in actors {
+        if actor.health.is_depleted() {
+            continue;
+        }
+        out.push(character_collider(
+            CHARACTER_ID_BASE + u64::from(id),
+            actor.state.motion.position,
+            actor.body.shape,
+            margin,
+        ));
+    }
+}
+
+/// A character's feet-anchored AABB as a centered dynamic collider, inflated by
+/// `margin` on every axis.
+fn character_collider(id: u64, feet: Vec3, shape: CollisionShape, margin: f32) -> DynamicCollider {
+    DynamicCollider {
+        id: id as u32,
+        position: feet + Vec3::Y * (shape.height() * 0.5),
+        velocity: Vec3::ZERO,
+        half_extents: Vec3::new(
+            shape.half_width() + margin,
+            shape.height() * 0.5 + margin,
+            shape.half_depth() + margin,
+        ),
+    }
+}
+
 struct Player {
     state: controller::CharacterState,
     health: Health,
@@ -389,6 +450,10 @@ pub struct Simulation {
     /// Reused buffer for the per-tick dynamic-collider snapshot handed to the
     /// character motor, so the hot path does not allocate a fresh `Vec`.
     collider_scratch: Vec<physics::DynamicCollider>,
+    /// Reused buffer of every living character's AABB for actor-to-actor collision.
+    character_scratch: Vec<physics::DynamicCollider>,
+    /// Reused per-actor buffer of loose bodies plus other characters.
+    step_scratch: Vec<physics::DynamicCollider>,
     /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
     damage: HashMap<IVec3, DamageState>,
     /// Targets whose [`DamageState::release`] is set, keyed `(y, z, x)` so
@@ -1234,6 +1299,9 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         None => colliders.clear(),
     }
     let bodies = &colliders;
+    // Every living character's AABB, so actors block and shove each other.
+    let mut characters = std::mem::take(&mut sim.character_scratch);
+    character_colliders(&sim.players, &sim.actors, None, 0.0, &mut characters);
     for player in sim.players.values_mut() {
         if player.health.is_depleted() {
             // Dead players are frozen: no input movement, noclip, or GPU body push
@@ -1270,7 +1338,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 &mut player.state,
                 &input,
                 FIXED_DT,
-                &bodies,
+                bodies,
             );
             player.body_push_velocity =
                 Vec3::new(attempted.x, player.state.motion.velocity.y, attempted.y);
@@ -1307,8 +1375,9 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             player.terrain_revision = sim.terrain.revision;
         }
     }
-    sim.advance_actors(&world, &bodies);
+    sim.advance_actors(&world, &bodies, &characters);
     sim.collider_scratch = colliders;
+    sim.character_scratch = characters;
     sim.resolve_attacks(&world);
     for (id, message) in incoming.reliable {
         match message {
@@ -1664,6 +1733,66 @@ mod tests {
     }
 
     #[test]
+    fn titan_fires_its_area_ability_at_a_nearby_player() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set_block(IVec3::new(x, 0, z), voxel_world::STONE).unwrap();
+            }
+        }
+        sim.spawn_actor_kind(actors::ActorKind::titan(), Vec3::new(2.5, 1.0, 0.5))
+            .unwrap();
+        let mut player = Player::new();
+        player.state.motion.position = Vec3::new(2.5, 1.0, 4.5);
+        sim.players.insert(1, player);
+        let mut characters = Vec::new();
+        for _ in 0..120 {
+            character_colliders(&sim.players, &sim.actors, None, 0.0, &mut characters);
+            sim.advance_actors(&world, &[], &characters);
+            characters.clear();
+        }
+        assert!(
+            !sim.detonations.is_empty(),
+            "the titan must queue its area blast"
+        );
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
+    fn actors_block_each_other() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set_block(IVec3::new(x, 0, z), voxel_world::STONE).unwrap();
+            }
+        }
+        let mut kind = actors::ActorKind::dummy();
+        kind.brain = actors::BrainKind::External;
+        let left = sim.spawn_actor_kind(kind, Vec3::new(1.5, 1.0, 0.5)).unwrap();
+        sim.spawn_actor_kind(kind, Vec3::new(3.5, 1.0, 0.5)).unwrap();
+        sim.set_actor_intent(
+            left,
+            controller::CharacterIntent {
+                movement: glam::Vec2::X,
+                ..Default::default()
+            },
+        );
+        let mut characters = Vec::new();
+        for _ in 0..120 {
+            character_colliders(&sim.players, &sim.actors, None, 0.0, &mut characters);
+            sim.advance_actors(&world, &[], &characters);
+            characters.clear();
+        }
+        let x = sim.actor_position(left).unwrap().x;
+        assert!(x > 2.4 && x < 3.0, "actor must stop against the other: {x}");
+        put_resources(&mut app, world, sim);
+    }
+
+    #[test]
     fn melee_swings_damage_knockback_and_respawn_actors() {
         let mut app = headless_app(1);
         let (_generated, mut sim) = take_resources(&mut app);
@@ -1707,7 +1836,7 @@ mod tests {
         }
         assert!(sim.actor_health(dummy).unwrap().is_depleted());
         sim.tick += 300;
-        sim.advance_actors(&world, &[]);
+        sim.advance_actors(&world, &[], &[]);
         assert_eq!(sim.actor_health(dummy).unwrap(), Health::default());
         assert_eq!(sim.actor_position(dummy).unwrap(), Vec3::new(2.5, 1.0, 0.5));
         put_resources(&mut app, world, sim);
