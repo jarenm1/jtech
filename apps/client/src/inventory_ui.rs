@@ -16,11 +16,20 @@ use protocol::EXPLOSIVE_BOW_ITEM;
 use crate::{ClientSession, game_hud, pause_menu::PauseMenu};
 
 /// Local inventory panel state. `shown` caches the last rendered inventory and
-/// weapon set so the grid only rebuilds when the replicated contents change.
+/// the package revision that produced the weapon names, so the grid only
+/// rebuilds when the replicated contents change.
 #[derive(Resource, Default)]
 pub(crate) struct InventoryUi {
     pub open: bool,
-    shown: Option<(gameplay::Inventory, Vec<protocol::MeleeWeaponInfo>)>,
+    shown: Option<Shown>,
+}
+
+/// Snapshot of what the grid renders: owned stacks plus the package revision
+/// that names them. `ServerPackages::receive` bumps `revision` whenever
+/// `melee_weapons` is replaced, so it keys the name lookups too.
+struct Shown {
+    inventory: gameplay::Inventory,
+    revision: Option<u64>,
 }
 
 /// Where a dragged stack came from.
@@ -139,20 +148,30 @@ pub(crate) fn sync(
     grid: Single<Entity, With<InventoryGrid>>,
     cells: Query<Entity, With<InventoryCell>>,
 ) {
-    panel.display = if ui.open {
+    let desired = if ui.open {
         Display::Flex
     } else {
         Display::None
     };
+    if panel.display != desired {
+        panel.display = desired;
+    }
     if !ui.open {
         ui.shown = None;
         return;
     }
-    let shown = (session.inventory.clone(), session.packages.melee_weapons.clone());
-    if ui.shown.as_ref() == Some(&shown) {
+    let revision = session.packages.revision;
+    let unchanged = ui
+        .shown
+        .as_ref()
+        .is_some_and(|shown| shown.inventory == session.inventory && shown.revision == revision);
+    if unchanged {
         return;
     }
-    ui.shown = Some(shown);
+    ui.shown = Some(Shown {
+        inventory: session.inventory.clone(),
+        revision,
+    });
     for cell in &cells {
         commands.entity(cell).despawn();
     }
@@ -167,7 +186,7 @@ pub(crate) fn sync(
     });
 }
 
-fn spawn_cell(grid: &mut ChildSpawnerCommands, item: u32, name: String, count: Option<u32>) {
+fn spawn_cell(grid: &mut ChildSpawnerCommands, item: u32, name: impl Into<String>, count: Option<u32>) {
     grid.spawn((
         Button,
         Node {

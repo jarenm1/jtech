@@ -5,6 +5,8 @@
 //! panel lives in its own module with a higher global z-index so a menu
 //! backdrop can cover the gameplay HUD while the panel stays readable.
 
+use std::borrow::Cow;
+
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
@@ -81,6 +83,15 @@ impl SlotCount {
     }
 }
 
+
+/// Last values written to HUD components. Query items are compared against
+/// these so unchanged sessions neither allocate strings nor flag components
+/// changed (every write triggers a relayout pass).
+#[derive(Default)]
+pub(crate) struct Shown {
+    selected: Option<u8>,
+    counts: [Option<u32>; 10],
+}
 
 #[derive(Component)]
 pub(crate) struct FpsCounter;
@@ -295,21 +306,28 @@ pub(crate) fn update(
         (&Swatch, &mut BackgroundColor),
         (With<Swatch>, Without<HotbarSlot>),
     >,
+    mut shown: Local<Shown>,
 ) {
-    for (slot, mut background, mut border) in &mut slots {
-        let selected = slot.0 == session.selected;
-        background.0 = if selected {
-            palette::SLOT_SELECTED
-        } else {
-            palette::SLOT
-        };
-        border.set_all(if selected {
-            palette::AMBER
-        } else {
-            palette::BORDER
-        });
+    if shown.selected != Some(session.selected) {
+        shown.selected = Some(session.selected);
+        for (slot, mut background, mut border) in &mut slots {
+            let selected = slot.0 == session.selected;
+            background.0 = if selected {
+                palette::SLOT_SELECTED
+            } else {
+                palette::SLOT
+            };
+            *border = BorderColor::all(if selected {
+                palette::AMBER
+            } else {
+                palette::BORDER
+            });
+        }
     }
-    **selected_label = Text::new(item_name(&session, session.held_item()));
+    let name = item_name(&session, session.held_item());
+    if selected_label.0 != name.as_ref() {
+        selected_label.0 = name.into_owned();
+    }
     for (slot, mut text) in &mut counts {
         // Equipment and the bow are not stacks; their tiles show no count.
         let item = session.hotbar[slot.index()];
@@ -319,43 +337,57 @@ pub(crate) fn update(
         } else {
             0
         };
-        text.0 = if count == 0 {
-            String::new()
-        } else {
-            count.to_string()
-        };
+        if shown.counts[slot.index()] != Some(count) {
+            shown.counts[slot.index()] = Some(count);
+            text.0 = if count == 0 {
+                String::new()
+            } else {
+                count.to_string()
+            };
+        }
     }
     for (swatch, mut color) in &mut swatches {
-        color.0 = match session.hotbar[swatch.index()] {
+        let desired = match session.hotbar[swatch.index()] {
             // Equipment is always usable; only stacks dim when spent.
             Some(item) if session.packages.is_equipment(item) => item_swatch(item, false),
             Some(item) => item_swatch(item, session.inventory.count(item) == 0),
             None => palette::SLOT,
         };
+        if color.0 != desired {
+            color.0 = desired;
+        }
     }
 
     let (node, text, color) = &mut *status;
     let connected = session.transport.is_some() && session.id.is_some();
-    node.display = if connected {
+    let display = if connected {
         Display::None
     } else {
         Display::Flex
     };
+    if node.display != display {
+        node.display = display;
+    }
     if !connected {
-        text.0 = session.status.clone();
-        color.0 = if session.status.starts_with("Disconnected") {
+        if text.0 != session.status {
+            text.0.clone_from(&session.status);
+        }
+        let desired = if session.status.starts_with("Disconnected") {
             palette::DANGER
         } else {
             palette::CONNECTING
         };
+        if color.0 != desired {
+            color.0 = desired;
+        }
     }
 }
 
 /// Display name for an item id; replicated weapon names win, unknown ids read
 /// as a numbered unknown.
-pub(crate) fn item_name(session: &ClientSession, item: u32) -> String {
+pub(crate) fn item_name(session: &ClientSession, item: u32) -> Cow<'_, str> {
     if let Some(name) = session.packages.melee_name(item) {
-        return name.to_string();
+        return Cow::Borrowed(name);
     }
     if item == EXPLOSIVE_BOW_ITEM {
         return "Explosive Bow".into();
@@ -366,7 +398,7 @@ pub(crate) fn item_name(session: &ClientSession, item: u32) -> String {
         Ok(voxel_world::STONE) => "Stone".into(),
         Ok(voxel_world::SAND) => "Sand".into(),
         Ok(voxel_world::WOOD) => "Wood".into(),
-        _ => format!("Item {item}"),
+        _ => format!("Item {item}").into(),
     }
 }
 /// Empty stacks keep their material hue at low alpha so the tile reads as spent.
