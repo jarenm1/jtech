@@ -36,6 +36,10 @@ struct DropVisual {
 pub struct Drops {
     items: std::collections::HashMap<u32, DropVisual>,
     tick: Option<u64>,
+    /// Scratch: indices into the latest snapshot slice that passed validation.
+    scratch_valid: Vec<usize>,
+    /// Scratch: ids in the latest snapshot, for despawn reconciliation.
+    scratch_ids: HashSet<u32>,
 }
 
 #[derive(Resource)]
@@ -92,36 +96,33 @@ impl Drops {
             return;
         }
         self.tick = Some(tick);
-        let valid: Vec<_> = drops
-            .iter()
-            .take(MAX_DROPS)
-            .filter(|drop| {
-                drop.position.is_finite()
-                    && drop.count > 0
-                    && ((1..=u32::from(voxel_world::WOOD)).contains(&drop.item)
-                        || packages.is_equipment(drop.item))
-            })
-            .collect();
-        let ids: HashSet<_> = valid.iter().map(|drop| drop.id).collect();
+        self.scratch_valid.clear();
+        self.scratch_valid.extend(
+            drops
+                .iter()
+                .take(MAX_DROPS)
+                .enumerate()
+                .filter(|(_, drop)| {
+                    drop.position.is_finite()
+                        && drop.count > 0
+                        && ((1..=u32::from(voxel_world::WOOD)).contains(&drop.item)
+                            || packages.is_equipment(drop.item))
+                })
+                .map(|(index, _)| index),
+        );
+        self.scratch_ids.clear();
+        self.scratch_ids
+            .extend(self.scratch_valid.iter().map(|&index| drops[index].id));
         self.items.retain(|id, visual| {
-            if ids.contains(id) {
+            if self.scratch_ids.contains(id) {
                 true
             } else {
                 commands.entity(visual.entity).despawn();
                 false
             }
         });
-        for drop in valid {
-            let model = packages
-                .melee_weapons
-                .iter()
-                .find(|weapon| weapon.item == drop.item)
-                .and_then(|weapon| {
-                    weapon
-                        .model
-                        .as_ref()
-                        .map(|path| (weapon.package.clone(), path.clone()))
-                });
+        for &index in &self.scratch_valid {
+            let drop = &drops[index];
             self.items
                 .entry(drop.id)
                 .and_modify(|visual| {
@@ -133,6 +134,18 @@ impl Drops {
                     visual.received = now;
                 })
                 .or_insert_with(|| {
+                    // Resolve the authored model only for newly spawned drops;
+                    // existing visuals keep the model they were created with.
+                    let model = packages
+                        .melee_weapons
+                        .iter()
+                        .find(|weapon| weapon.item == drop.item)
+                        .and_then(|weapon| {
+                            weapon
+                                .model
+                                .as_ref()
+                                .map(|path| (weapon.package.clone(), path.clone()))
+                        });
                     // Cube placeholder; `upgrade_models` swaps in the authored
                     // model once the glTF resolves.
                     let material = assets

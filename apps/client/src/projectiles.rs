@@ -52,6 +52,10 @@ pub struct Projectiles {
     blasts: VecDeque<BlastVisual>,
     seen: HashSet<u32>,
     recent: VecDeque<u32>,
+    /// Scratch: indices into the latest snapshot slice that passed validation.
+    scratch_valid: Vec<usize>,
+    /// Scratch: ids in the latest snapshot, for despawn reconciliation.
+    scratch_ids: HashSet<u32>,
 }
 
 #[derive(Resource)]
@@ -132,25 +136,27 @@ impl Projectiles {
             return;
         }
         self.tick = Some(tick);
-        let valid: Vec<_> = arrows
-            .iter()
-            .take(MAX_ARROWS)
-            .filter(|arrow| {
-                arrow.position.is_finite()
-                    && arrow.velocity.is_finite()
-                    && !self.seen.contains(&arrow.id)
-            })
-            .collect();
-        let ids: HashSet<_> = valid.iter().map(|arrow| arrow.id).collect();
+        self.scratch_valid.clear();
+        self.scratch_ids.clear();
+        for (index, arrow) in arrows.iter().take(MAX_ARROWS).enumerate() {
+            if arrow.position.is_finite()
+                && arrow.velocity.is_finite()
+                && !self.seen.contains(&arrow.id)
+            {
+                self.scratch_valid.push(index);
+                self.scratch_ids.insert(arrow.id);
+            }
+        }
         self.arrows.retain(|id, arrow| {
-            if ids.contains(id) {
+            if self.scratch_ids.contains(id) {
                 true
             } else {
                 commands.entity(arrow.entity).despawn();
                 false
             }
         });
-        for arrow in valid {
+        for &index in &self.scratch_valid {
+            let arrow = &arrows[index];
             let rotation = orientation(arrow.velocity);
             self.arrows
                 .entry(arrow.id)
