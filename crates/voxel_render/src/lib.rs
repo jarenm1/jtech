@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use bevy::{
     asset::{RenderAssetUsages, embedded_asset},
@@ -629,10 +632,21 @@ struct GrassPatch {
     queued: bool,
 }
 
+/// One chunk's contour mesh, shared across patches and worker threads so a
+/// chunk is contoured once per revision instead of once per patch that wants it.
+struct GrassSurface {
+    stamp: [Option<u64>; 27],
+    mesh: Arc<MeshData>,
+}
+
 /// World-grid patches with throttled revision scans and async rebuilds.
 #[derive(Resource, Default)]
 struct GrassField {
     patches: HashMap<IVec2, GrassPatch>,
+    /// Cross-patch contour cache shared with the async workers: a chunk's
+    /// `surface_nets` result is computed once per revision and reused by every
+    /// patch (and thread) that wants it, instead of once per patch.
+    surfaces: Arc<Mutex<HashMap<IVec3, GrassSurface>>>,
     /// In-flight and ready-but-unuploaded patch builds, one per patch at most.
     jobs: Vec<GrassJob>,
     /// Persistent build queue, drained nearest-first a few patches per frame.
@@ -801,6 +815,7 @@ fn grass_patch_mesh(
     patch: IVec2,
     ceiling: i32,
     lod: usize,
+    surfaces: &Mutex<HashMap<IVec3, GrassSurface>>,
 ) -> GrassPatchData {
     let mut deps: HashMap<IVec3, Option<u64>> = HashMap::new();
     let min = patch * GRASS_PATCH_SIZE;
@@ -842,10 +857,35 @@ fn grass_patch_mesh(
                 }
             }
         }
-        // Each async job contours its own contributing chunks: the shared
-        // cross-patch cache cannot cross worker threads, and the per-patch
-        // `wanted` set already dedups within a build.
-        let terrain = surface_nets(&world.neighborhood(coord));
+        // Share one contour per chunk across every patch and worker: the stamp
+        // is derived from the same snapshot the mesher reads, so a hit is
+        // exactly the mesh a live contour would produce.
+        let stamp = world.mesh_stamp(coord);
+        let terrain = {
+            let cached = surfaces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&coord)
+                .filter(|surface| surface.stamp == stamp)
+                .map(|surface| surface.mesh.clone());
+            match cached {
+                Some(mesh) => mesh,
+                None => {
+                    let mesh = Arc::new(surface_nets(&world.neighborhood(coord)));
+                    surfaces
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            coord,
+                            GrassSurface {
+                                stamp,
+                                mesh: mesh.clone(),
+                            },
+                        );
+                    mesh
+                }
+            }
+        };
         let chunk_base = (coord * CHUNK_SIZE).as_vec3();
         for tri in terrain.indices.chunks_exact(3) {
             let (a, b, c) = (
@@ -1009,6 +1049,7 @@ fn update_grass(
     let focus_cell = (focus_xz / size).floor().as_ivec2();
     let GrassField {
         patches,
+        surfaces,
         jobs,
         dirty,
         checked_at,
@@ -1171,6 +1212,17 @@ fn update_grass(
                 .then_with(|| a.1.x.cmp(&b.1.x))
                 .then_with(|| a.1.y.cmp(&b.1.y))
         });
+        // Bound the shared contour cache to chunks a live patch still depends
+        // on; a dropped chunk is re-contoured on demand.
+        surfaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|coord, _| {
+                world.chunks.contains_key(coord)
+                    && patches
+                        .values()
+                        .any(|patch| patch.stamp.iter().any(|(c, _)| c == coord))
+            });
     }
     let mut builds = dirty
         .len()
@@ -1196,8 +1248,9 @@ fn update_grass(
         }
         let lod = grass_lod(coord, focus_xz);
         let snapshot = grass_snapshot(&world, coord, ceiling);
+        let surfaces = Arc::clone(surfaces);
         let task = AsyncComputeTaskPool::get().spawn(async move {
-            grass_patch_mesh(&snapshot, coord, ceiling, lod)
+            grass_patch_mesh(&snapshot, coord, ceiling, lod, &surfaces)
         });
         jobs.push(GrassJob {
             coord,
@@ -1402,6 +1455,10 @@ mod tests {
         }
         let material_runs: Vec<_> = cells.into_iter().map(|b| (1, b)).collect();
         Chunk::from_voxel_runs(0, &material_runs, &[(CHUNK_VOLUME as u16, DENSITY_AIR)]).unwrap()
+    }
+
+    fn fresh_surfaces() -> Mutex<HashMap<IVec3, GrassSurface>> {
+        Mutex::new(HashMap::new())
     }
 
     fn voxel_chunk_with(
@@ -1965,7 +2022,7 @@ mod tests {
     fn grass_roots_lie_on_surface_nets_triangles() {
         // Roots must sit on the emitted sloped triangles, not integer columns.
         let world = sloped_grass_world();
-        let data = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
+        let data = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &fresh_surfaces());
         assert!(data.blades > 10, "patch grew only {} blades", data.blades);
         assert_eq!(data.mesh.positions.len(), data.blades * 5);
         assert_eq!(data.mesh.indices.len(), data.blades * 9);
@@ -2000,10 +2057,16 @@ mod tests {
     #[test]
     fn grass_patch_rebuilds_only_when_consulted_chunks_change() {
         let mut world = sloped_grass_world();
-        let first = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
-        let second = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
+        let surfaces = fresh_surfaces();
+        let first = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &surfaces);
+        // The second build reuses the cached contour for every chunk.
+        let second = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &surfaces);
         assert_eq!(first.mesh.positions, second.mesh.positions);
         assert_eq!(first.mesh.indices, second.mesh.indices);
+        // A cache hit is byte-identical to a cold build.
+        let cold = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &fresh_surfaces());
+        assert_eq!(first.mesh.positions, cold.mesh.positions);
+        assert_eq!(first.mesh.indices, cold.mesh.indices);
         assert!(!grass_stamp_dirty(&world, &first.stamp));
 
         // An edit inside the meshed chunk's neighborhood is noticed.
@@ -2015,11 +2078,11 @@ mod tests {
 
         // A far patch that never consulted the edited chunk stays clean;
         // loading a chunk it *did* scan (as missing) dirties it.
-        let far = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0);
+        let far = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &fresh_surfaces());
         assert!(!grass_stamp_dirty(&world, &far.stamp));
         world.insert(IVec3::new(1, 0, 1), chunk_with(|_| AIR));
         assert!(grass_stamp_dirty(&world, &far.stamp));
-        let loaded = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0);
+        let loaded = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &fresh_surfaces());
 
         // Unloading a consulted chunk is as dirty as editing it.
         world.remove(IVec3::new(1, 0, 1));
@@ -2040,7 +2103,7 @@ mod tests {
                 },
             ),
         );
-        let grown = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
+        let grown = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &fresh_surfaces());
         let cell_roots = |mesh: &MeshData| {
             grass_roots(mesh)
                 .into_iter()
@@ -2053,7 +2116,7 @@ mod tests {
         );
 
         world.set_block(IVec3::new(4, 16, 4), STONE);
-        let smothered = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
+        let smothered = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &fresh_surfaces());
         assert_eq!(cell_roots(&smothered.mesh), 0);
         assert!(smothered.blades < grown.blades);
         assert!(smothered.blades > grown.blades - 20, "whole patch suppressed");
@@ -2064,8 +2127,8 @@ mod tests {
         // Same patch at full density vs the far tier: the far mesh is a strict
         // subset — rank is position-seeded, so blades return identically.
         let world = sloped_grass_world();
-        let near = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
-        let far = grass_patch_mesh(&world, IVec2::ZERO, 48, 2);
+        let near = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &fresh_surfaces());
+        let far = grass_patch_mesh(&world, IVec2::ZERO, 48, 2, &fresh_surfaces());
         assert!(far.blades > 0);
         assert!(far.blades < near.blades * 3 / 10);
         for i in (0..far.mesh.colors.len()).step_by(5) {
