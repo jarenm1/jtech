@@ -606,6 +606,9 @@ struct GrassField {
     /// Reuse contour meshes across patches; never contour the same unchanged
     /// chunk once per patch. Entries are evicted with their dependent patches.
     surfaces: HashMap<IVec3, GrassSurface>,
+    /// How many live patch stamps reference each chunk coordinate, so surface
+    /// eviction is one lookup per surface instead of rescanning every stamp.
+    surface_refs: HashMap<IVec3, u32>,
     /// Scratch candidate list, `clear()`ed each frame; the allocation persists.
     dirty: Vec<(f32, IVec2)>,
     checked_at: f32,
@@ -923,6 +926,17 @@ fn grass_patch_in_range(coord: IVec2, focus: Vec2) -> bool {
     nearest.distance_squared(focus) <= GRASS_RADIUS * GRASS_RADIUS
 }
 
+/// Count one patch stamp's chunk references; drop counts reaching zero.
+fn unref_stamp(refs: &mut HashMap<IVec3, u32>, stamp: &PatchStamp) {
+    for &(coord, _) in stamp {
+        let count = refs.get_mut(&coord).expect("installed stamp coord");
+        *count -= 1;
+        if *count == 0 {
+            refs.remove(&coord);
+        }
+    }
+}
+
 fn update_grass(
     mut commands: Commands,
     world: Res<VoxelWorld>,
@@ -936,12 +950,21 @@ fn update_grass(
     let focus_xz = Vec2::new(focus.0.x, focus.0.z);
     // A vertical band change must refresh even if XZ and revisions are stable.
     let ceiling = (focus.0.y.floor() as i32).div_euclid(8) * 8 + 16;
+    let GrassField {
+        patches,
+        surfaces,
+        surface_refs,
+        dirty,
+        checked_at,
+        scan_focus,
+    } = &mut *field;
 
     // Drop out-of-range patches; their entities and mesh assets die with them.
-    field.patches.retain(|&coord, patch| {
+    patches.retain(|&coord, patch| {
         if grass_patch_in_range(coord, focus_xz) {
             return true;
         }
+        unref_stamp(surface_refs, &patch.stamp);
         if let Some((entity, handle)) = patch.draw.take() {
             commands.entity(entity).despawn();
             meshes.remove(handle.id());
@@ -951,21 +974,21 @@ fn update_grass(
     // Walking ~800 patch stamps per frame is too expensive; re-scan on a
     // short interval, and early after a 4 m move. Range/LOD/ceiling checks
     // stay per-frame, so updates never depend on stale timestamps.
-    let scan = time.elapsed_secs() - field.checked_at >= GRASS_STAMP_SCAN_INTERVAL
-        || focus.0.distance(field.scan_focus) >= GRASS_STAMP_SCAN_STEP;
+    let scan = time.elapsed_secs() - *checked_at >= GRASS_STAMP_SCAN_INTERVAL
+        || focus.0.distance(*scan_focus) >= GRASS_STAMP_SCAN_STEP;
     if scan {
-        field.checked_at = time.elapsed_secs();
-        field.scan_focus = focus.0;
+        *checked_at = time.elapsed_secs();
+        *scan_focus = focus.0;
     }
-    let GrassField { patches, surfaces, .. } = &mut *field;
+    // A surface lives while a patch stamp still references it; the refcount
+    // index answers that in one lookup instead of rescanning every stamp.
     surfaces.retain(|coord, _| {
-        world.chunks.contains_key(coord)
-            && patches.values().any(|patch| patch.stamp.iter().any(|(c, _)| c == coord))
+        world.chunks.contains_key(coord) && surface_refs.contains_key(coord)
     });
 
     // Gather dirty in-range patches, nearest first. `dirty` is reused scratch:
     // clear() keeps the allocation, so an unchanged world allocates nothing.
-    field.dirty.clear();
+    dirty.clear();
     let size = GRASS_PATCH_SIZE as f32;
     let lo = ((focus_xz - Vec2::splat(GRASS_RADIUS)) / size)
         .floor()
@@ -982,7 +1005,7 @@ fn update_grass(
                 continue;
             }
             let lod = grass_lod(coord, focus_xz);
-            let patch = field.patches.entry(coord).or_insert_with(|| GrassPatch {
+            let patch = patches.entry(coord).or_insert_with(|| GrassPatch {
                 stamp: Vec::new(),
                 draw: None,
                 blades: 0,
@@ -996,22 +1019,26 @@ fn update_grass(
                 || (scan && grass_stamp_dirty(&world, &patch.stamp))
             {
                 let center = (coord.as_vec2() + 0.5) * size;
-                field.dirty.push((center.distance_squared(focus_xz), coord));
+                dirty.push((center.distance_squared(focus_xz), coord));
             }
         }
     }
-    field.dirty.sort_unstable_by(|a, b| {
+    dirty.sort_unstable_by(|a, b| {
         a.0.total_cmp(&b.0)
             .then_with(|| a.1.x.cmp(&b.1.x))
             .then_with(|| a.1.y.cmp(&b.1.y))
     });
 
-    let builds = field.dirty.len().min(GRASS_BUILDS_PER_UPDATE + field.dirty.len() / GRASS_BUILDS_PER_DIRTY);
+    let builds = dirty.len().min(GRASS_BUILDS_PER_UPDATE + dirty.len() / GRASS_BUILDS_PER_DIRTY);
     for index in 0..builds {
-        let coord = field.dirty[index].1;
+        let coord = dirty[index].1;
         let lod = grass_lod(coord, focus_xz);
-        let data = grass_patch_mesh(&world, coord, ceiling, lod, &mut field.surfaces);
-        let patch = field.patches.get_mut(&coord).expect("in-range patch");
+        let data = grass_patch_mesh(&world, coord, ceiling, lod, surfaces);
+        let patch = patches.get_mut(&coord).expect("in-range patch");
+        unref_stamp(surface_refs, &patch.stamp);
+        for &(dep, _) in &data.stamp {
+            *surface_refs.entry(dep).or_insert(0) += 1;
+        }
         patch.stamp = data.stamp;
         patch.blades = data.blades;
         patch.built = true;
@@ -1038,7 +1065,7 @@ fn update_grass(
             patch.draw = Some((entity, handle));
         }
     }
-    stats.grass_blades = field.patches.values().map(|patch| patch.blades).sum();
+    stats.grass_blades = patches.values().map(|patch| patch.blades).sum();
 }
 
 fn distance(coord: IVec3, focus: Vec3) -> f32 {
