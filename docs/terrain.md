@@ -283,9 +283,12 @@ resident patch depends on them.
 At most two patches are built/uploaded per update plus backlog relief after
 teleports, nearest first. Each build considers up to eight surface-bearing
 chunks, with a 48 m vertical scan below the local ceiling. Dependency-stamp
-scans run every 0.12 s or on a 4 m move; unchanged patches incur no contouring
-or mesh uploads. Patch entities are frustum-culled with wind-padded bounds;
-grass does not cast shadows and does not participate in the depth prepass.
+scans run every 0.12 s or on a 4 m move; a voxel edit (`VoxelWorld::edit_epoch`)
+forces an immediate scan so blades over changed terrain rebuild on the next
+update instead of lingering for up to the interval. Unchanged patches incur no
+contouring or mesh uploads. Patch entities are frustum-culled with wind-padded
+bounds; grass does not cast shadows and does not participate in the depth
+prepass.
 
 `grass.wgsl` handles coherent travelling wind, per-blade flutter, atlas-based
 root shading, and rank-varied distance scaling into fixed roots. Collapsed

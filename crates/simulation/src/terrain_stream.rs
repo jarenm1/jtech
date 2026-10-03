@@ -470,11 +470,9 @@ mod tests {
     fn spawn_world(seed: u64) -> (Vec3, voxel_world::VoxelWorld) {
         let generator = Arc::new(TerrainGenerator::default());
         let preferred = spawn_position(&generator, seed);
-        let mut world = voxel_world::VoxelWorld {
-            seed,
-            generator,
-            ..Default::default()
-        };
+        let mut world = voxel_world::VoxelWorld::default();
+        world.seed = seed;
+        world.generator = generator;
         for coord in local_chunks(preferred, 2) {
             world.ensure_chunk(coord);
         }
