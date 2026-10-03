@@ -80,19 +80,29 @@ pub(crate) fn update(
     cursor: Single<&CursorOptions>,
     mut button: Single<(&mut Node, &Interaction, &mut BackgroundColor), With<PowerButton>>,
     mut label: Single<&mut Text, With<PowerLabel>>,
+    mut shown: Local<Option<(bool, &'static str, Color)>>,
 ) {
     let (node, interaction, color) = &mut *button;
-    node.display = if session.held_item() == EXPLOSIVE_BOW_ITEM {
-        Display::Flex
-    } else {
-        Display::None
-    };
-    color.0 = match **interaction {
+    let visible = session.held_item() == EXPLOSIVE_BOW_ITEM;
+    let text = session.bow_power.label();
+    let tint = match **interaction {
         Interaction::Pressed if cursor.visible => palette::PRESSED,
         Interaction::Hovered if cursor.visible => palette::HOVER,
         _ => palette::PANEL,
     };
-    **label = Text::new(session.bow_power.label());
+    // The panel is static between input changes; skip the per-frame `Text`
+    // allocation and component writes when nothing it renders has moved.
+    if *shown == Some((visible, text, tint)) {
+        return;
+    }
+    *shown = Some((visible, text, tint));
+    node.display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    color.0 = tint;
+    **label = Text::new(text);
 }
 
 #[cfg(test)]
