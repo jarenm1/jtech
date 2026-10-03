@@ -164,7 +164,7 @@ impl Simulation {
             .map(|(&id, player)| {
                 (
                     id,
-                    player.state.position + Vec3::Y * (physics::PLAYER_HEIGHT * 0.5),
+                    player.state.motion.position + Vec3::Y * (physics::PLAYER_HEIGHT * 0.5),
                 )
             })
             .collect();

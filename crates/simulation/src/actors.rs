@@ -276,18 +276,18 @@ fn observation_of(
     // `observe` terrain raycast; ties resolve like the old `min_by`.
     let nearest_player = players
         .iter()
-        .filter(|(_, player)| !player.health.is_depleted() && !player.state.noclip)
+        .filter(|(_, player)| !player.health.is_depleted() && !player.state.motion.noclip)
         .min_by(|(_, a), (_, b)| {
-            a.state
+            a.state.motion
                 .position
                 .distance_squared(feet)
-                .total_cmp(&b.state.position.distance_squared(feet))
+                .total_cmp(&b.state.motion.position.distance_squared(feet))
         })
         .map(|(&id, player)| {
             observe(
                 SimEntity::Player(id),
-                player.state.position,
-                player.state.velocity,
+                player.state.motion.position,
+                player.state.motion.velocity,
             )
         });
     let nearest_actor = actors
@@ -479,7 +479,7 @@ impl Simulation {
             .iter()
             .filter(|(_, player)| {
                 !player.health.is_depleted()
-                    && !player.state.noclip
+                    && !player.state.motion.noclip
                     && player.input.attack
                     && self.tick >= player.attack_ready
                     // Registered weapons require ownership; hands, blocks and
@@ -510,7 +510,7 @@ impl Simulation {
                 .spec(self.players[&id].input.selected)
                 .unwrap_or(gameplay::combat::MELEE_HANDS);
             let player = &self.players[&id];
-            let origin = player.state.position + Vec3::Y * EYE_HEIGHT;
+            let origin = player.state.motion.position + Vec3::Y * EYE_HEIGHT;
             let direction = look_direction(player.input.yaw, player.input.pitch);
             let mut targets: Vec<SwingTarget> = self
                 .actors
@@ -526,11 +526,11 @@ impl Simulation {
                 self.players
                     .iter()
                     .filter(|(other, player)| {
-                        **other != id && !player.health.is_depleted() && !player.state.noclip
+                        **other != id && !player.health.is_depleted() && !player.state.motion.noclip
                     })
                     .map(|(&other, player)| SwingTarget {
                         id: other,
-                        position: player.state.position,
+                        position: player.state.motion.position,
                         shape: CollisionShape::default(),
                     }),
             );
@@ -570,7 +570,7 @@ impl Simulation {
             } else {
                 // Impulse first: a killing blow zeroes momentum through damage_player.
                 if let Some(victim) = self.players.get_mut(&hit.target) {
-                    apply_player_impulse(&mut victim.state, hit.impulse);
+                    apply_player_impulse(&mut victim.state.motion, hit.impulse);
                 }
                 self.damage_player_event(SimEntity::Player(id), hit.target, hit.damage);
             }
@@ -599,10 +599,10 @@ impl Simulation {
         targets.extend(
             self.players
                 .iter()
-                .filter(|(_, player)| !player.health.is_depleted() && !player.state.noclip)
+                .filter(|(_, player)| !player.health.is_depleted() && !player.state.motion.noclip)
                 .map(|(&other, player)| SwingTarget {
                     id: other,
-                    position: player.state.position,
+                    position: player.state.motion.position,
                     shape: CollisionShape::default(),
                 }),
         );
@@ -642,7 +642,7 @@ impl Simulation {
             }
         } else {
             if let Some(victim) = self.players.get_mut(&hit.target) {
-                apply_player_impulse(&mut victim.state, hit.impulse);
+                apply_player_impulse(&mut victim.state.motion, hit.impulse);
             }
             self.damage_player_event(SimEntity::Actor(id), hit.target, hit.damage);
         }

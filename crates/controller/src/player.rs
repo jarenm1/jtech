@@ -1,6 +1,7 @@
 //! Human wire-command adapter. Sequence/order belongs to networking, not the motor.
 use crate::{
-    CharacterBody, CharacterIntent, CharacterState, MovementProfile, finite, step_character,
+    CharacterBody, CharacterIntent, CharacterState, MAX_SLOTS, MovementProfile, finite,
+    step_character,
 };
 use glam::{IVec3, Vec2, Vec3};
 use physics::{DynamicCollider, PlayerState, look_direction};
@@ -21,6 +22,14 @@ pub struct PlayerInput {
     pub attack: bool,
     /// Held item id; the server maps it to melee specs.
     pub selected: u32,
+    /// Held sprint request.
+    pub sprint: bool,
+    /// Held crouch request.
+    pub crouch: bool,
+    /// One-tick ability requests, one per slot.
+    pub ability: [bool; MAX_SLOTS],
+    /// Body-relative aim direction for abilities.
+    pub aim: [f32; 2],
 }
 
 #[path = "noclip.rs"]
@@ -43,6 +52,8 @@ pub fn step_player(world: &VoxelWorld, state: &mut PlayerState, input: &PlayerIn
 /// `jump` requests one tick on the ground, but is held ascent in debug flight.
 /// Returns the horizontal velocity the character attempted this tick, before
 /// terrain or loose bodies clamped it; the server feeds it to GPU body push.
+/// This convenience form carries only motion; use [`step_character_player`] to
+/// keep statuses, cooldowns, casts and dashes.
 pub fn step_player_with_bodies(
     world: &VoxelWorld,
     state: &mut PlayerState,
@@ -50,42 +61,61 @@ pub fn step_player_with_bodies(
     dt: f32,
     bodies: &[DynamicCollider],
 ) -> Vec2 {
-    if !dt.is_finite() || dt <= 0.0 {
-        return Vec2::new(state.velocity.x, state.velocity.z);
-    }
-    if !state.position.is_finite() || state.position.abs().max_element() > 32_000_000.0 {
-        *state = PlayerState::default();
-    }
-    if !state.velocity.is_finite() {
-        state.velocity = Vec3::ZERO;
-    }
-    state.external_velocity = physics::bounded_horizontal(state.external_velocity);
-    if noclip::step(world, state, input, dt.min(0.25), bodies) {
-        return Vec2::new(state.velocity.x, state.velocity.z);
-    }
     let mut character = CharacterState {
         motion: *state,
         yaw: finite(input.yaw),
         ..Default::default()
     };
+    let attempted = step_character_player(world, &mut character, input, dt, bodies);
+    *state = character.motion;
+    attempted
+}
+
+/// Full-state human step: keeps statuses, cooldowns, casts and dashes so the
+/// authoritative player state replicates and replays completely.
+pub fn step_character_player(
+    world: &VoxelWorld,
+    character: &mut CharacterState,
+    input: &PlayerInput,
+    dt: f32,
+    bodies: &[DynamicCollider],
+) -> Vec2 {
+    if !dt.is_finite() || dt <= 0.0 {
+        return Vec2::new(character.motion.velocity.x, character.motion.velocity.z);
+    }
+    if !character.motion.position.is_finite()
+        || character.motion.position.abs().max_element() > 32_000_000.0
+    {
+        character.motion = PlayerState::default();
+    }
+    if !character.motion.velocity.is_finite() {
+        character.motion.velocity = Vec3::ZERO;
+    }
+    character.motion.external_velocity =
+        physics::bounded_horizontal(character.motion.external_velocity);
+    if noclip::step(world, &mut character.motion, input, dt.min(0.25), bodies) {
+        return Vec2::new(character.motion.velocity.x, character.motion.velocity.z);
+    }
+    character.yaw = finite(input.yaw);
     let mut intent = CharacterIntent {
         movement: Vec2::from_array(input.movement),
         turn: 0.0,
         jump: input.jump,
         attack: input.attack,
         held_item: 0,
-        ..Default::default()
+        sprint: input.sprint,
+        crouch: input.crouch,
+        ability: input.ability,
+        aim: Vec2::from_array(input.aim),
     };
-    let attempted = step_character(
+    step_character(
         world,
-        &mut character,
+        character,
         &CharacterBody::default(),
         &MovementProfile::default(),
         &mut intent,
         dt,
         bodies,
     )
-    .attempted;
-    *state = character.motion;
-    attempted
+    .attempted
 }

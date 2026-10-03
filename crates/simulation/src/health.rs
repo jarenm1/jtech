@@ -32,11 +32,11 @@ impl Simulation {
             }
             player.respawn_requested = false;
             player.pending.clear();
-            player.state.velocity = Vec3::ZERO;
-            player.state.external_velocity = glam::Vec2::ZERO;
+            player.state.motion.velocity = Vec3::ZERO;
+            player.state.motion.external_velocity = glam::Vec2::ZERO;
             player.body_push_velocity = Vec3::ZERO;
             // Full-loot death: the carried inventory scatters as drops.
-            let position = player.state.position + Vec3::Y * 0.5;
+            let position = player.state.motion.position + Vec3::Y * 0.5;
             let spilled = player.inventory.entries().to_vec();
             player.inventory = gameplay::Inventory::new();
             player.inventory_dirty = true;
@@ -146,11 +146,11 @@ impl Simulation {
         self.cancel_player_strikes(id);
         let loadout: Vec<(u32, u32)> = self.packages.melee_table().spawn_items().to_vec();
         let player = self.players.get_mut(&id).expect("respawn checked player");
-        player.state.position = position;
-        player.state.velocity = Vec3::ZERO;
-        player.state.external_velocity = glam::Vec2::ZERO;
-        player.state.grounded = false;
-        player.state.noclip = false;
+        player.state.motion.position = position;
+        player.state.motion.velocity = Vec3::ZERO;
+        player.state.motion.external_velocity = glam::Vec2::ZERO;
+        player.state.motion.grounded = false;
+        player.state.motion.noclip = false;
         player.input = PlayerInput {
             movement: [0.0; 2],
             jump: false,
@@ -228,7 +228,7 @@ mod tests {
         let mut player = Player::new();
         player.inventory.add(3, 40);
         player.inventory.add(5, 7);
-        player.state.position = Vec3::new(1.5, 4.0, 2.5);
+        player.state.motion.position = Vec3::new(1.5, 4.0, 2.5);
         sim.players.insert(1, player);
 
         sim.damage_player(1, u16::MAX);
@@ -276,8 +276,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        player.state.velocity = Vec3::new(4.0, -2.0, 1.0);
-        player.state.external_velocity = glam::Vec2::new(3.0, 0.0);
+        player.state.motion.velocity = Vec3::new(4.0, -2.0, 1.0);
+        player.state.motion.external_velocity = glam::Vec2::new(3.0, 0.0);
         player.body_push_velocity = Vec3::new(2.0, 0.0, 0.0);
         sim.players.insert(1, player);
         sim.strikes.push_back(super::super::QueuedStrike {
@@ -293,8 +293,8 @@ mod tests {
             assert!(player.health.is_depleted());
             assert!(player.pending.is_empty());
             assert_eq!(player.input.movement, [0.0; 2]);
-            assert_eq!(player.state.velocity, Vec3::ZERO);
-            assert_eq!(player.state.external_velocity, glam::Vec2::ZERO);
+            assert_eq!(player.state.motion.velocity, Vec3::ZERO);
+            assert_eq!(player.state.motion.external_velocity, glam::Vec2::ZERO);
             assert_eq!(player.body_push_velocity, Vec3::ZERO);
         }
         assert!(sim.strikes.is_empty());
@@ -304,9 +304,9 @@ mod tests {
         );
         assert_eq!(sim.players[&1].last_input, 1);
         // Damage while already dead does not repeat the transition or clear state.
-        sim.players.get_mut(&1).unwrap().state.velocity = Vec3::new(1.0, 1.0, 1.0);
+        sim.players.get_mut(&1).unwrap().state.motion.velocity = Vec3::new(1.0, 1.0, 1.0);
         assert_eq!(sim.damage_player(1, 10), Some(0));
-        assert_eq!(sim.players[&1].state.velocity, Vec3::new(1.0, 1.0, 1.0));
+        assert_eq!(sim.players[&1].state.motion.velocity, Vec3::new(1.0, 1.0, 1.0));
     }
 
     #[test]
@@ -366,8 +366,8 @@ mod tests {
         let world = app.world_mut().remove_resource::<VoxelWorld>().unwrap();
         let mut sim = app.world_mut().resource_mut::<Simulation>();
         let mut player = Player::new();
-        player.state.noclip = true;
-        player.state.external_velocity = glam::Vec2::new(5.0, 5.0);
+        player.state.motion.noclip = true;
+        player.state.motion.external_velocity = glam::Vec2::new(5.0, 5.0);
         player.body_push_velocity = Vec3::new(1.0, 1.0, 1.0);
         player.last_input = 40;
         player.highest_request = 7;
@@ -382,16 +382,16 @@ mod tests {
             assert_eq!(sim.players[&1].inventory.count(item), 1);
         }
         let player = &sim.players[&1];
-        assert!(!player.state.noclip);
-        assert_eq!(player.state.velocity, Vec3::ZERO);
-        assert_eq!(player.state.external_velocity, glam::Vec2::ZERO);
+        assert!(!player.state.motion.noclip);
+        assert_eq!(player.state.motion.velocity, Vec3::ZERO);
+        assert_eq!(player.state.motion.external_velocity, glam::Vec2::ZERO);
         assert_eq!(player.body_push_velocity, Vec3::ZERO);
         // Request dedup, cadence, and the monotonic input sequence survive respawn.
         assert_eq!(player.last_input, 40);
         assert_eq!(player.highest_request, 7);
         assert_eq!(player.last_edit, 3);
         // The landing cell is supported and clear of terrain.
-        let feet = player.state.position.floor().as_ivec3();
+        let feet = player.state.motion.position.floor().as_ivec3();
         assert_ne!(world.block(feet - glam::IVec3::Y), Some(voxel_world::AIR));
         for cell in [feet, feet + glam::IVec3::Y, feet + glam::IVec3::Y * 2] {
             assert_eq!(world.block(cell), Some(voxel_world::AIR));
@@ -472,7 +472,7 @@ mod tests {
         );
         world.set_block(ground, 3).unwrap();
         sim.finish_respawns(&world);
-        assert_eq!(sim.players[&1].state.position, Vec3::new(0.5, 16.0, 0.5));
+        assert_eq!(sim.players[&1].state.motion.position, Vec3::new(0.5, 16.0, 0.5));
         assert_eq!(sim.players[&1].life, 1);
         assert!(!sim.players[&1].respawn_requested);
         sim.finish_respawns(&world);
@@ -515,6 +515,6 @@ mod tests {
         sim.finish_respawns(&world);
         assert_eq!(sim.players[&1].life, 1);
         assert_eq!(sim.player_health(1), Some(Health::default()));
-        assert_eq!(sim.players[&1].state.velocity, Vec3::ZERO);
+        assert_eq!(sim.players[&1].state.motion.velocity, Vec3::ZERO);
     }
 }

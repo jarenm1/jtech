@@ -5,9 +5,10 @@ mod plugin;
 
 use bevy_ecs::prelude::Component;
 use glam::{Vec2, Vec3};
+use serde::{Deserialize, Serialize};
 pub use motor::step_character;
 pub use physics::{CollisionShape, DynamicCollider, FIXED_DT, PlayerState};
-pub use player::{PlayerInput, step_player, step_player_with_bodies};
+pub use player::{PlayerInput, step_character_player, step_player, step_player_with_bodies};
 pub use plugin::{ControllerPlugin, ControllerSet, ObservedBodies};
 
 /// Held body-relative axes: +X right, +Y forward (-Z at yaw zero).
@@ -171,7 +172,7 @@ impl MovementProfile {
 
 /// Exclusive locomotion/action mode. Ground and Air are derived from support;
 /// Cast, Dash and Blink are timed actions that lock input.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
     #[default]
     Ground,
@@ -183,7 +184,7 @@ pub enum Mode {
 
 /// Status effect kinds. Knockback stays physics-owned; these gate action and
 /// movement and are applied and cleared by the host's combat system.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatusKind {
     Stun,
     Sleep,
@@ -197,7 +198,7 @@ pub enum StatusKind {
 }
 
 /// One active status effect; `remaining` counts down in fixed ticks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub kind: StatusKind,
     pub remaining: u16,
@@ -207,7 +208,7 @@ pub struct Status {
 pub const MAX_STATUSES: usize = 8;
 
 /// Bounded set of active statuses in application order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusList {
     entries: [Option<Status>; MAX_STATUSES],
 }
@@ -343,7 +344,7 @@ impl AbilityTable {
 }
 
 /// In-progress cast: which slot, ticks remaining, and the aim captured at start.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Cast {
     pub slot: u8,
     pub remaining: u16,
@@ -351,7 +352,7 @@ pub struct Cast {
 }
 
 /// In-progress dash or blink.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Dash {
     pub slot: u8,
     pub remaining: u16,
@@ -369,7 +370,7 @@ pub struct MotorOutput {
 
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.
 /// `motion.noclip` is reserved for the human debug adapter, not a policy action.
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CharacterState {
     pub motion: physics::KinematicState,
     pub yaw: f32,
