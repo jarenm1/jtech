@@ -1,5 +1,5 @@
 //! cargo run --release -p gpu_physics --example benchmark -- --sparse-terrain
-use gpu_physics::{Body, GpuPhysics, PlayerCollider, TERRAIN_EVENT_READBACK_BYTES, Terrain};
+use gpu_physics::{Body, GpuPhysics, PlayerCollider, Terrain};
 use std::time::{Duration, Instant};
 fn percentile(values: &mut [Duration], p: f32) -> f64 {
     values.sort();
@@ -93,6 +93,7 @@ fn main() -> Result<(), String> {
         let mut submit = vec![];
         let mut wait = vec![];
         let mut tick = vec![];
+        let mut event_count = 0;
         for _ in 0..120 {
             let start = Instant::now();
             gpu.set_players(&players)?;
@@ -100,7 +101,7 @@ fn main() -> Result<(), String> {
             let submitted = start.elapsed();
             let waiting = Instant::now();
             let snapshot = gpu.wait_readback()?.unwrap();
-            gpu.take_terrain_contacts();
+            event_count = gpu.take_terrain_contacts().len();
             assert!(
                 snapshot
                     .iter()
@@ -118,7 +119,7 @@ fn main() -> Result<(), String> {
             percentile(&mut tick, 0.5),
             percentile(&mut tick, 0.95),
             percentile(&mut tick, 0.99),
-            count * std::mem::size_of::<Body>() + TERRAIN_EVENT_READBACK_BYTES
+            count * std::mem::size_of::<Body>() + 16 + event_count * 32
         );
     }
     Ok(())

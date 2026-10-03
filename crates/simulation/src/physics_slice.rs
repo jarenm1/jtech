@@ -19,6 +19,8 @@ pub(super) struct PhysicsSlice {
     next_id: u32,
     impulses: Vec<(u32, [f32; 3])>,
     players: Vec<PlayerCollider>,
+    /// Reusable target of `try_readback_into`; copied into `bodies` on completion.
+    readback_bodies: Vec<Body>,
     bodies_dirty: bool,
     dirty_cells: HashSet<IVec3>,
     contacts: Vec<TerrainContact>,
@@ -61,6 +63,7 @@ impl PhysicsSlice {
             dirty_cells: Default::default(),
             failed: false,
             contacts: Vec::new(),
+            readback_bodies: Vec::new(),
             tick: 0,
             revision: 0,
             submitted_at: None,
@@ -234,14 +237,19 @@ impl PhysicsSlice {
         if self.failed {
             return;
         }
-        match self.gpu.get_mut().try_readback() {
-            Ok(Some(bodies)) => {
-                self.readback_bytes += (bodies.len() * std::mem::size_of::<Body>()
-                    + gpu_physics::TERRAIN_EVENT_READBACK_BYTES)
-                    as u64;
-                self.bodies = bodies;
-                self.contacts
-                    .extend(self.gpu.get_mut().take_terrain_contacts());
+        match self
+            .gpu
+            .get_mut()
+            .try_readback_into(&mut self.readback_bodies)
+        {
+            Ok(true) => {
+                let contacts = self.gpu.get_mut().take_terrain_contacts();
+                self.readback_bytes += (self.readback_bodies.len()
+                    * std::mem::size_of::<Body>()
+                    + 16
+                    + contacts.len() * 32) as u64;
+                self.bodies.clone_from(&self.readback_bodies);
+                self.contacts.extend(contacts);
                 self.revision += 1;
                 self.completions += 1;
                 if let Some(started) = self.submitted_at.take() {
@@ -250,7 +258,7 @@ impl PhysicsSlice {
                     self.completion_us_max = self.completion_us_max.max(us);
                 }
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(error) => {
                 self.failed = true;
                 eprintln!(

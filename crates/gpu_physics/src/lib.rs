@@ -3,7 +3,7 @@
 //! `try_readback` polls without waiting. Terrain changes and body edits require idle state.
 //! World-space hashed broadphase with unbounded per-bucket linked lists.
 use bytemuck::{Pod, Zeroable};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use wgpu::util::DeviceExt;
 
 mod sparse;
@@ -23,8 +23,11 @@ pub const MAX_TERRAIN_CONTACTS: usize = 8192;
 const BODY_BYTES: usize = std::mem::size_of::<Body>();
 const EVENT_OFFSET: usize = MAX_BODIES * BODY_BYTES;
 const EVENT_BYTES: usize = 16 + MAX_TERRAIN_CONTACTS * 32;
-/// Fixed event payload copied with each completed batch, including its header.
+/// Event payload capacity per batch, including its 16-byte header. Only the
+/// header and emitted events are read back; this bounds the copy, not fixes it.
 pub const TERRAIN_EVENT_READBACK_BYTES: usize = EVENT_BYTES;
+/// Body snapshot plus the event header, mapped by every completed batch.
+const SNAPSHOT_BYTES: usize = EVENT_OFFSET + 16;
 
 /// Authored properties for metre cubes. Density and fracture resistance are independent.
 #[derive(Clone, Copy, Debug)]
@@ -286,7 +289,18 @@ pub struct GpuPhysics {
     sparse_terrain: Option<sparse::SparseTerrain>,
     count: usize,
     pending_impulses: Vec<[f32; 4]>,
-    pending: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// Persistent completion channel armed by each readback map callback.
+    map_tx: Sender<Result<(), wgpu::BufferAsyncError>>,
+    map_rx: Receiver<Result<(), wgpu::BufferAsyncError>>,
+    /// Bodies parked between the snapshot and event readback stages.
+    readback_bodies: Vec<Body>,
+    pending: Option<Pending>,
+}
+/// In-flight readback stage. The body snapshot always lands first; a second map
+/// fetches only the emitted, retained slice of the event array.
+enum Pending {
+    Snapshot,
+    Events { attempted: usize, retained: usize },
 }
 impl GpuPhysics {
     /// Start with no resident chunks. Nonresident terrain is solid.
@@ -472,6 +486,7 @@ impl GpuPhysics {
             })
         };
         let groups = [group(0, 1), group(1, 0)];
+        let (map_tx, map_rx) = mpsc::channel();
         Ok(Self {
             device,
             queue,
@@ -500,8 +515,21 @@ impl GpuPhysics {
             sparse_terrain: sparse.then(sparse::SparseTerrain::default),
             count: 0,
             pending_impulses: vec![[0.; 4]; MAX_BODIES],
+            map_tx,
+            map_rx,
+            readback_bodies: Vec::new(),
             pending: None,
         })
+    }
+    /// Arm `offset..offset + size` of the readback buffer; completion lands on
+    /// the persistent channel at the next device poll.
+    fn map_readback(&self, offset: u64, size: u64) {
+        let tx = self.map_tx.clone();
+        self.readback
+            .slice(offset..offset + size)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
     }
     pub fn is_busy(&self) -> bool {
         self.pending.is_some()
@@ -703,51 +731,110 @@ impl GpuPhysics {
             0,
             (self.count * BODY_BYTES) as u64,
         );
+        // Only the 16-byte event header rides the fixed copy; the emitted
+        // slice of the event array is fetched after the count is known.
         encoder.copy_buffer_to_buffer(
             &self.terrain_events,
             0,
             &self.readback,
             EVENT_OFFSET as u64,
-            EVENT_BYTES as u64,
+            16,
         );
         self.queue.submit([encoder.finish()]);
-        let (tx, rx) = mpsc::channel();
-        self.readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-        self.pending = Some(rx);
+        self.map_readback(0, SNAPSHOT_BYTES as u64);
+        self.pending = Some(Pending::Snapshot);
         Ok(true)
     }
-    pub fn try_readback(&mut self) -> Result<Option<Vec<Body>>, String> {
-        if self.pending.is_none() {
-            return Ok(None);
-        }
+    /// Poll the in-flight batch, writing the finished body snapshot into `out`.
+    /// Returns false while work remains in flight; `out` is only authoritative
+    /// after a true result. Capacity is retained across batches.
+    pub fn try_readback_into(&mut self, out: &mut Vec<Body>) -> Result<bool, String> {
+        let Some(stage) = self.pending.take() else {
+            return Ok(false);
+        };
         self.device
             .poll(wgpu::PollType::Poll)
             .map_err(|e| e.to_string())?;
-        let result = match self.pending.as_ref().unwrap().try_recv() {
+        let result = match self.map_rx.try_recv() {
             Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return Ok(None),
+            Err(mpsc::TryRecvError::Empty) => {
+                self.pending = Some(stage);
+                return Ok(false);
+            }
             Err(e) => return Err(e.to_string()),
         };
-        self.pending = None;
         result.map_err(|e| e.to_string())?;
-        let mapped = self.readback.slice(..).get_mapped_range();
-        let bodies = bytemuck::cast_slice(&mapped[..self.count * BODY_BYTES]).to_vec();
-        let attempted =
-            u32::from_ne_bytes(mapped[EVENT_OFFSET..EVENT_OFFSET + 4].try_into().unwrap()) as usize;
-        let available = attempted.min(MAX_TERRAIN_CONTACTS);
-        let retained = available.min(MAX_TERRAIN_CONTACTS - self.terrain_contacts.len());
-        let events: &[RawTerrainContact] =
-            bytemuck::cast_slice(&mapped[EVENT_OFFSET + 16..EVENT_OFFSET + 16 + retained * 32]);
-        self.terrain_contacts
-            .extend(events.iter().map(|event| event.contact));
-        self.terrain_contact_overflow += (attempted - retained) as u64;
-        drop(mapped);
-        self.readback.unmap();
-        Ok(Some(bodies))
+        match stage {
+            Pending::Snapshot => {
+                let mapped = self
+                    .readback
+                    .slice(..SNAPSHOT_BYTES as u64)
+                    .get_mapped_range();
+                self.readback_bodies.clear();
+                self.readback_bodies
+                    .extend_from_slice(bytemuck::cast_slice(&mapped[..self.count * BODY_BYTES]));
+                let attempted = u32::from_ne_bytes(
+                    mapped[EVENT_OFFSET..EVENT_OFFSET + 4].try_into().unwrap(),
+                ) as usize;
+                let retained = attempted
+                    .min(MAX_TERRAIN_CONTACTS)
+                    .min(MAX_TERRAIN_CONTACTS - self.terrain_contacts.len());
+                drop(mapped);
+                self.readback.unmap();
+                if retained == 0 {
+                    self.terrain_contact_overflow += attempted as u64;
+                    out.clone_from(&self.readback_bodies);
+                    return Ok(true);
+                }
+                // Fetch only the emitted events; the GPU buffer is not cleared
+                // until the next submit, which stays blocked while busy.
+                let mut encoder = self.device.create_command_encoder(&Default::default());
+                encoder.copy_buffer_to_buffer(
+                    &self.terrain_events,
+                    16,
+                    &self.readback,
+                    (EVENT_OFFSET + 16) as u64,
+                    (retained * 32) as u64,
+                );
+                self.queue.submit([encoder.finish()]);
+                self.map_readback(
+                    EVENT_OFFSET as u64,
+                    (16 + retained * 32) as u64,
+                );
+                self.pending = Some(Pending::Events {
+                    attempted,
+                    retained,
+                });
+                Ok(false)
+            }
+            Pending::Events {
+                attempted,
+                retained,
+            } => {
+                let mapped = self
+                    .readback
+                    .slice(EVENT_OFFSET as u64..(EVENT_OFFSET + 16 + retained * 32) as u64)
+                    .get_mapped_range();
+                let events: &[RawTerrainContact] = bytemuck::cast_slice(&mapped[16..]);
+                self.terrain_contacts
+                    .extend(events.iter().map(|event| event.contact));
+                self.terrain_contact_overflow += (attempted - retained) as u64;
+                drop(mapped);
+                self.readback.unmap();
+                out.clone_from(&self.readback_bodies);
+                Ok(true)
+            }
+        }
+    }
+    /// Owned-snapshot convenience wrapper; use `try_readback_into` per tick to
+    /// reuse the body vector's capacity.
+    pub fn try_readback(&mut self) -> Result<Option<Vec<Body>>, String> {
+        let mut bodies = Vec::new();
+        if self.try_readback_into(&mut bodies)? {
+            Ok(Some(bodies))
+        } else {
+            Ok(None)
+        }
     }
     /// Drain bounded terrain work after a successful body readback.
     pub fn take_terrain_contacts(&mut self) -> Vec<TerrainContact> {
@@ -755,12 +842,16 @@ impl GpuPhysics {
     }
     /// Blocking only for benchmarks and tests, never call this from a server tick.
     pub fn wait_readback(&mut self) -> Result<Option<Vec<Body>>, String> {
-        if self.pending.is_some() {
+        let mut bodies = Vec::new();
+        while self.pending.is_some() {
             self.device
                 .poll(wgpu::PollType::Wait)
                 .map_err(|e| e.to_string())?;
+            if self.try_readback_into(&mut bodies)? {
+                return Ok(Some(bodies));
+            }
         }
-        self.try_readback()
+        Ok(None)
     }
 }
 
@@ -1193,21 +1284,18 @@ mod tests {
             pass.set_bind_group(0, &gpu.groups[0], &[]);
             pass.dispatch_workgroups(attempts.div_ceil(64), 1, 1);
         }
+        // Mirror the production submit: header copy first, then the staged
+        // event fetch driven by `try_readback_into`.
         encoder.copy_buffer_to_buffer(
             &gpu.terrain_events,
             0,
             &gpu.readback,
             EVENT_OFFSET as u64,
-            EVENT_BYTES as u64,
+            16,
         );
         gpu.queue.submit([encoder.finish()]);
-        let (tx, rx) = mpsc::channel();
-        gpu.readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
-        gpu.pending = Some(rx);
+        gpu.map_readback(0, SNAPSHOT_BYTES as u64);
+        gpu.pending = Some(Pending::Snapshot);
         gpu.wait_readback().unwrap().unwrap();
         let contacts = gpu.take_terrain_contacts();
         assert_eq!(contacts.len(), MAX_TERRAIN_CONTACTS);
