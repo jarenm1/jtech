@@ -13,7 +13,7 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
 };
 use voxel_world::{
-    AIR, CHUNK_SIZE, ChunkNeighborhood, DIRT, GRASS, SAND, STONE, VoxelWorld,
+    AIR, CHUNK_SIZE, CHUNK_VOLUME, ChunkNeighborhood, DIRT, GRASS, SAND, STONE, VoxelWorld,
     chunk_coord,
 };
 
@@ -55,6 +55,28 @@ pub struct MeshData {
 }
 
 impl MeshData {
+    /// Allocate all five attribute buffers with room for `vertices` vertices
+    /// and `indices` indices so a meshing pass never grows them mid-flight.
+    fn with_capacity(vertices: usize, indices: usize) -> Self {
+        Self {
+            positions: Vec::with_capacity(vertices),
+            normals: Vec::with_capacity(vertices),
+            colors: Vec::with_capacity(vertices),
+            uvs: Vec::with_capacity(vertices),
+            indices: Vec::with_capacity(indices),
+        }
+    }
+
+    /// Reserve room for `vertices` more vertices and `indices` more indices
+    /// on top of the current contents.
+    fn reserve_additional(&mut self, vertices: usize, indices: usize) {
+        self.positions.reserve(vertices);
+        self.normals.reserve(vertices);
+        self.colors.reserve(vertices);
+        self.uvs.reserve(vertices);
+        self.indices.reserve(indices);
+    }
+
     fn byte_len(&self) -> usize {
         self.positions.len() * 12
             + self.normals.len() * 12
@@ -100,12 +122,16 @@ impl MeshData {
     }
 }
 
-/// Greedily merges coplanar exposed faces of player-placed cubes. Terrain
-/// density never culls a placed face: a cube buried in rock still draws.
-/// Coordinates are chunk-local; neighbor chunks supply the occlusion samples.
-/// Scratch space is one fixed 32x32 mask; output is bounded by six faces per voxel.
-pub fn placed_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
-    let mut mesh = MeshData::default();
+/// Greedily merges coplanar exposed faces of player-placed cubes, appending
+/// quads onto `mesh`. `quad` bases new indices on `positions.len()`, so the
+/// existing contents are never touched. Terrain density never culls a placed
+/// face: a cube buried in rock still draws. Coordinates are chunk-local;
+/// neighbor chunks supply the occlusion samples. Scratch space is one fixed
+/// 32x32 mask; output is bounded by six faces per voxel.
+pub fn placed_mesh(neighborhood: &ChunkNeighborhood, mesh: &mut MeshData) {
+    // Hard bound: six sign/axis passes each emit at most one quad per mask
+    // cell (checkerboard worst case), 6 * 32³ quads of 4 vertices / 6 indices.
+    mesh.reserve_additional(24 * CHUNK_VOLUME, 36 * CHUNK_VOLUME);
     let size = CHUNK_SIZE as usize;
     let mut mask = [AIR; (CHUNK_SIZE * CHUNK_SIZE) as usize];
     for axis in 0..3 {
@@ -166,7 +192,6 @@ pub fn placed_mesh(neighborhood: &ChunkNeighborhood) -> MeshData {
             }
         }
     }
-    mesh
 }
 
 /// Per-material surface roughness: the amplitude of the deterministic
@@ -249,7 +274,13 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
     let corner =
         |c: IVec3, i: usize| c + IVec3::new(i as i32 & 1, (i as i32 >> 1) & 1, (i >> 2) as i32);
 
-    let mut mesh = MeshData::default();
+    // Hard bounds: at most one vertex per dual cell (33³) and one quad (6
+    // indices) per lattice edge, 3 * 33³ edges. Reserving them up front keeps
+    // dense chunks from repeatedly reallocating every attribute buffer.
+    let mut mesh = MeshData::with_capacity(
+        (CELLS * CELLS * CELLS) as usize,
+        (18 * CELLS * CELLS * CELLS) as usize,
+    );
     let mut vert_index = vec![u32::MAX; (CELLS * CELLS * CELLS) as usize];
     for y in -1..CHUNK_SIZE {
         for z in -1..CHUNK_SIZE {
@@ -407,16 +438,10 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
 }
 
 /// Terrain surface plus placed cubes; placed vertices are appended after the
-/// smooth ones with indices rebased.
+/// smooth ones, their indices based on the vertex count at hand-off.
 pub fn mesh_chunk(neighborhood: &ChunkNeighborhood) -> MeshData {
     let mut mesh = surface_nets(neighborhood);
-    let placed = placed_mesh(neighborhood);
-    let base = mesh.positions.len() as u32;
-    mesh.positions.extend(placed.positions);
-    mesh.normals.extend(placed.normals);
-    mesh.colors.extend(placed.colors);
-    mesh.uvs.extend(placed.uvs);
-    mesh.indices.extend(placed.indices.iter().map(|i| i + base));
+    placed_mesh(neighborhood, &mut mesh);
     mesh
 }
 
@@ -1401,7 +1426,8 @@ mod tests {
     // merges, bad boundary ownership and flipped geometry, not just a triangle count.
     fn assert_placed_surface(world: &VoxelWorld, coord: IVec3) -> MeshData {
         let neighborhood = world.neighborhood(coord);
-        let mesh = placed_mesh(&neighborhood);
+        let mut mesh = MeshData::default();
+        placed_mesh(&neighborhood, &mut mesh);
         let mut expected = HashSet::new();
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
