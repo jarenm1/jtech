@@ -532,13 +532,30 @@ impl VoxelWorld {
         let base = point.floor().as_ivec3();
         let frac = point - base.as_vec3();
         let mut corners = [0.0f32; 8];
-        for (i, corner) in corners.iter_mut().enumerate() {
-            let offset = IVec3::new(
+        let corner_offset = |i: usize| {
+            IVec3::new(
                 (i & 1) as i32,
                 ((i >> 1) & 1) as i32,
                 ((i >> 2) & 1) as i32,
-            );
-            *corner = self.density(base + offset)? as f32;
+            )
+        };
+        // Fast path: all eight lattice corners share the base chunk, so one
+        // map lookup serves the whole trilinear sample. This is the common
+        // case for smooth collision, which otherwise hashes the chunk map
+        // eight times per sample.
+        let base_local = local_coord(base);
+        if base_local.x < CHUNK_SIZE - 1
+            && base_local.y < CHUNK_SIZE - 1
+            && base_local.z < CHUNK_SIZE - 1
+        {
+            let chunk = self.chunks.get(&chunk_coord(base))?;
+            for (i, corner) in corners.iter_mut().enumerate() {
+                *corner = chunk.density(base_local + corner_offset(i)) as f32;
+            }
+        } else {
+            for (i, corner) in corners.iter_mut().enumerate() {
+                *corner = self.density(base + corner_offset(i))? as f32;
+            }
         }
         let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
         let x00 = lerp(corners[0], corners[1], frac.x);
