@@ -314,53 +314,124 @@ impl Chunk {
         material_runs: &[(u16, u8)],
         density_runs: &[(u16, i8)],
     ) -> Result<Self, String> {
-        let expand = |runs: &[(u16, u8)]| -> Result<Vec<u8>, String> {
-            let mut out = Vec::with_capacity(CHUNK_VOLUME);
-            for &(count, block) in runs {
-                if count == 0 || block & !PLACED_FLAG > WOOD {
-                    return Err("zero run or invalid block".into());
-                }
-                if out.len() + count as usize > CHUNK_VOLUME {
-                    return Err("chunk run volume overflow".into());
-                }
-                out.extend(std::iter::repeat(block).take(count as usize));
+        // Validate both streams and total their volumes without expanding.
+        let mut material_total = 0usize;
+        for &(count, block) in material_runs {
+            if count == 0 || block & !PLACED_FLAG > WOOD {
+                return Err("zero run or invalid block".into());
             }
-            if out.len() != CHUNK_VOLUME {
-                return Err("chunk run volume incomplete".into());
+            material_total += count as usize;
+            if material_total > CHUNK_VOLUME {
+                return Err("chunk run volume overflow".into());
             }
-            Ok(out)
-        };
-        let materials = expand(material_runs)?;
-        let mut density = Vec::with_capacity(CHUNK_VOLUME);
-        for &(count, d) in density_runs {
+        }
+        if material_total != CHUNK_VOLUME {
+            return Err("chunk run volume incomplete".into());
+        }
+        let mut density_total = 0usize;
+        for &(count, _) in density_runs {
             if count == 0 {
                 return Err("zero density run".into());
             }
-            if density.len() + count as usize > CHUNK_VOLUME {
+            density_total += count as usize;
+            if density_total > CHUNK_VOLUME {
                 return Err("density run volume overflow".into());
             }
-            density.extend(std::iter::repeat(d).take(count as usize));
         }
-        if density.len() != CHUNK_VOLUME {
+        if density_total != CHUNK_VOLUME {
             return Err("density run volume incomplete".into());
         }
-        let mut chunk = Self {
-            revision,
-            storage: Storage::Uniform(AIR),
-        };
+
+        // Decide the storage tier straight from the run streams. The old decode
+        // expanded two 32 KiB arrays, wrote 32K voxels through `set_voxel`, then
+        // re-scanned in `compact`; this reproduces the same final tier (and the
+        // same voxel state) in one pass with no intermediate arrays.
+        let mut all_implied = true;
+        let mut all_same = true;
+        let mut first_material = 0u8;
+        let mut mi = 0usize;
+        let mut m_left = material_runs[0].0 as usize;
+        let mut di = 0usize;
+        let mut d_left = density_runs[0].0 as usize;
         for i in 0..CHUNK_VOLUME {
-            let raw = materials[i];
-            chunk.set_voxel(
-                i,
-                Voxel {
-                    material: raw & !PLACED_FLAG,
-                    density: density[i],
-                    placed: raw & PLACED_FLAG != 0,
-                },
-            );
+            if m_left == 0 {
+                mi += 1;
+                m_left = material_runs[mi].0 as usize;
+            }
+            if d_left == 0 {
+                di += 1;
+                d_left = density_runs[di].0 as usize;
+            }
+            let block = material_runs[mi].1;
+            let material = block & !PLACED_FLAG;
+            if i == 0 {
+                first_material = material;
+            } else if material != first_material {
+                all_same = false;
+            }
+            if block & PLACED_FLAG != 0 || density_runs[di].1 != Voxel::implied_density(material) {
+                all_implied = false;
+            }
+            m_left -= 1;
+            d_left -= 1;
         }
-        chunk.compact();
-        Ok(chunk)
+
+        if all_implied && all_same {
+            return Ok(Self {
+                revision,
+                storage: Storage::Uniform(first_material),
+            });
+        }
+
+        let mut materials = vec![0u8; CHUNK_VOLUME / 2];
+        let mut mi = 0usize;
+        let mut m_left = material_runs[0].0 as usize;
+        for i in 0..CHUNK_VOLUME {
+            if m_left == 0 {
+                mi += 1;
+                m_left = material_runs[mi].0 as usize;
+            }
+            let material = material_runs[mi].1 & !PLACED_FLAG;
+            materials[i / 2] |= material << ((i & 1) * 4);
+            m_left -= 1;
+        }
+        if all_implied {
+            return Ok(Self {
+                revision,
+                storage: Storage::Dense(materials.into_boxed_slice()),
+            });
+        }
+
+        let mut density = vec![0i8; CHUNK_VOLUME];
+        let mut placed = vec![0u8; CHUNK_VOLUME / 8];
+        let mut di = 0usize;
+        let mut d_left = density_runs[0].0 as usize;
+        let mut mi = 0usize;
+        let mut m_left = material_runs[0].0 as usize;
+        for i in 0..CHUNK_VOLUME {
+            if d_left == 0 {
+                di += 1;
+                d_left = density_runs[di].0 as usize;
+            }
+            if m_left == 0 {
+                mi += 1;
+                m_left = material_runs[mi].0 as usize;
+            }
+            density[i] = density_runs[di].1;
+            if material_runs[mi].1 & PLACED_FLAG != 0 {
+                placed[i / 8] |= 1 << (i & 7);
+            }
+            d_left -= 1;
+            m_left -= 1;
+        }
+        Ok(Self {
+            revision,
+            storage: Storage::Smooth {
+                materials: materials.into_boxed_slice(),
+                density: density.into_boxed_slice(),
+                placed: placed.into_boxed_slice(),
+            },
+        })
     }
     /// Legacy material runs; placed voxels report their material with the
     /// placed flag set so wire consumers can reconstruct full state.
