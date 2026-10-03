@@ -1,6 +1,6 @@
 //! Native generation and column surveys run outside the simulation tick.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::{Arc, mpsc},
 };
@@ -8,7 +8,7 @@ use std::{
 use glam::{IVec2, IVec3, Vec3};
 use parking_lot::Mutex;
 use voxel_world::{
-    CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, chunk_coord,
+    CHUNK_SIZE, Chunk, MAX_CHUNK_Y, MIN_CHUNK_Y, PreparedColumn, chunk_coord,
     terrain::{ScatterInstance, TerrainGenerator},
 };
 
@@ -18,6 +18,10 @@ const MAX_PENDING: usize = 16;
 // Reserve survey capacity even while chunk generation has a continuous backlog.
 const MAX_PENDING_CHUNKS: usize = 12;
 const SURVEYS_PER_TICK: usize = 8;
+/// Prepared columns retained by the generation worker. A loaded column
+/// typically means one survey plus several stacked chunk fills; the bound
+/// keeps the cache to the recent working set (~30KB per column).
+const MAX_CACHED_COLUMNS: usize = 128;
 
 enum Work {
     Survey(IVec2),
@@ -44,17 +48,38 @@ impl TerrainStream {
         std::thread::Builder::new()
             .name("terrain-generation".into())
             .spawn(move || {
+                // Generation, column bounds, and scatter are all functions of
+                // the chunk column, so every work item shares one prepared
+                // column per (cx, cz) instead of resampling it per chunk.
+                let mut cache = HashMap::new();
+                let mut order = VecDeque::new();
                 while let Ok(work) = work.recv() {
                     let result = match work {
                         Work::Survey(column) => Completed::Survey(
                             column,
-                            generator.column_bounds(column.x, column.y, seed),
+                            cached_column(
+                                &mut cache,
+                                &mut order,
+                                column,
+                                &generator,
+                                seed,
+                            )
+                            .bounds(),
                         ),
-                        Work::Generate(coord) => Completed::Generate(
-                            coord,
-                            Chunk::generate_with(coord, seed, &generator),
-                            generator.scatter_chunk(coord, seed),
-                        ),
+                        Work::Generate(coord) => {
+                            let column = cached_column(
+                                &mut cache,
+                                &mut order,
+                                IVec2::new(coord.x, coord.z),
+                                &generator,
+                                seed,
+                            );
+                            Completed::Generate(
+                                coord,
+                                Chunk::generate_with_column(coord, seed, &column),
+                                column.scatter(coord.y),
+                            )
+                        }
                     };
                     if finished.send(result).is_err() {
                         break;
@@ -156,6 +181,30 @@ impl TerrainStream {
             self.pending_columns.insert(column);
         }
     }
+}
+
+/// The worker's per-column state, prepared once and shared by every survey
+/// and chunk fill for that `(cx, cz)`. Insertion order is tracked so the
+/// oldest column is evicted past [`MAX_CACHED_COLUMNS`].
+fn cached_column<'a>(
+    cache: &'a mut HashMap<IVec2, Arc<PreparedColumn>>,
+    order: &mut VecDeque<IVec2>,
+    key: IVec2,
+    generator: &TerrainGenerator,
+    seed: u64,
+) -> &'a Arc<PreparedColumn> {
+    if !cache.contains_key(&key) {
+        while cache.len() >= MAX_CACHED_COLUMNS {
+            let Some(evicted) = order.pop_front() else { break };
+            cache.remove(&evicted);
+        }
+        order.push_back(key);
+        cache.insert(
+            key,
+            Arc::new(generator.prepare_column(key.x, key.y, seed)),
+        );
+    }
+    &cache[&key]
 }
 
 /// Include surfaces, cliff walls, a local underground/flight volume, and edited chunks.
