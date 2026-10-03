@@ -170,39 +170,39 @@ impl Simulation {
             .collect();
         players.sort_unstable_by_key(|(id, _)| *id);
         let melee = self.packages.melee_table();
+        let pickup_radius_sq = PICKUP_RADIUS * PICKUP_RADIUS;
         let mut changed = false;
-        for (id, center) in players {
-            let mut index = 0;
-            while index < self.drops.len() {
-                let drop = &mut self.drops[index];
-                if drop.age < PICKUP_DELAY_TICKS
-                    || drop.snapshot.position.distance(center) > PICKUP_RADIUS
-                {
-                    index += 1;
+        // Each drop still meets players lowest id first; a drop is removed at the
+        // same point a per-player scan would have removed it, so the outcome
+        // matches the old player-outer loop without deque shifting.
+        self.drops.retain_mut(|drop| {
+            if drop.age < PICKUP_DELAY_TICKS {
+                return true;
+            }
+            let equipment = melee.kind(drop.snapshot.item) == protocol::ItemKind::Equipment;
+            for &(id, center) in &players {
+                if drop.snapshot.position.distance_squared(center) > pickup_radius_sq {
                     continue;
                 }
-                let equipment = melee.kind(drop.snapshot.item) == protocol::ItemKind::Equipment;
-                let inventory = &mut self.players.get_mut(&id).unwrap().inventory;
+                let player = self.players.get_mut(&id).unwrap();
                 // Equipment always collects: each instance takes its own slot.
                 let taken = if equipment {
-                    inventory.add_equipment(drop.snapshot.item)
+                    player.inventory.add_equipment(drop.snapshot.item)
                 } else {
-                    drop.collect(inventory)
+                    drop.collect(&mut player.inventory)
                 };
                 if taken == 0 {
                     // The stack is full; leave the remainder for later or for others.
-                    index += 1;
                     continue;
                 }
-                self.players.get_mut(&id).unwrap().inventory_dirty = true;
+                player.inventory_dirty = true;
                 changed = true;
                 if equipment || drop.snapshot.count == 0 {
-                    self.drops.remove(index);
-                } else {
-                    index += 1;
+                    return false;
                 }
             }
-        }
+            true
+        });
         if changed {
             self.drop_revision += 1;
         }
