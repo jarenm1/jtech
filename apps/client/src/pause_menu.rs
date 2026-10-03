@@ -5,6 +5,8 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 
+use protocol::BowPower;
+
 use crate::{ClientSession, Options, game_hud::GameplayHud, inventory_ui::InventoryUi};
 
 #[derive(Resource, Default)]
@@ -194,23 +196,33 @@ pub(crate) fn sync(
     mut hud: Query<&mut Visibility, With<GameplayHud>>,
     mut buttons: Query<(&Interaction, &mut BackgroundColor), With<MenuAction>>,
     mut power: Single<&mut Text, With<PowerText>>,
+    mut shown: Local<(Option<bool>, Option<BowPower>)>,
 ) {
-    panel.display = if menu.open {
-        Display::Flex
-    } else {
-        Display::None
-    };
-    for mut visibility in &mut hud {
-        *visibility = if menu.open {
-            Visibility::Hidden
+    if shown.0 != Some(menu.open) {
+        shown.0 = Some(menu.open);
+        panel.display = if menu.open {
+            Display::Flex
         } else {
-            Visibility::Inherited
+            Display::None
         };
+        for mut visibility in &mut hud {
+            *visibility = if menu.open {
+                Visibility::Hidden
+            } else {
+                Visibility::Inherited
+            };
+        }
     }
     for (interaction, mut color) in &mut buttons {
-        color.0 = button_color(*interaction);
+        let desired = button_color(*interaction);
+        if color.0 != desired {
+            color.0 = desired;
+        }
     }
-    power.0 = format!("Bow power   {}", session.bow_power.label());
+    if shown.1 != Some(session.bow_power) {
+        shown.1 = Some(session.bow_power);
+        power.0 = format!("Bow power   {}", session.bow_power.label());
+    }
 }
 
 /// Single writer for cursor state. Any overlay that needs the mouse — pause
