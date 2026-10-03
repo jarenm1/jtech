@@ -9,8 +9,8 @@
 //! tick.
 use super::{Player, Simulation};
 use controller::{
-    Cast, CharacterBody, CharacterIntent, CharacterState, MAX_SLOTS, Mode, MovementProfile,
-    StatusList, step_character,
+    AbilityKind, AbilitySpec, AbilityTable, Cast, CastBehavior, CharacterBody, CharacterIntent,
+    CharacterState, MAX_SLOTS, Mode, MovementProfile, StatusList, step_character,
 };
 use gameplay::{
     Health,
@@ -58,6 +58,17 @@ pub enum BrainKind {
     Flee,
 }
 
+/// Host-side effect for a fired ability slot. The controller owns the cast,
+/// cooldown and movement; the host owns what the ability does.
+#[derive(Clone, Copy, Debug)]
+pub enum AbilityPayload {
+    /// Blast centred `range` metres along the aim from the caster's eye.
+    Blast {
+        range: f32,
+        spec: game_packages::BlastSpec,
+    },
+}
+
 /// Species data: one table entry per spawnable actor archetype.
 #[derive(Clone, Copy, Debug)]
 pub struct ActorKind {
@@ -70,6 +81,8 @@ pub struct ActorKind {
     /// Innate weapon; `ITEM` actors may resolve equipment later.
     pub melee: MeleeSpec,
     pub brain: BrainKind,
+    /// Host-side effect per ability slot; `None` leaves the slot inert.
+    pub payloads: [Option<AbilityPayload>; MAX_SLOTS],
 }
 impl ActorKind {
     /// Today's training dummy: player defaults, hands, stands still.
@@ -82,6 +95,7 @@ impl ActorKind {
             capabilities: ActorCapabilities::all(),
             melee: gameplay::combat::MELEE_HANDS,
             brain: BrainKind::Idle,
+            payloads: [None; MAX_SLOTS],
         }
     }
     /// Heavy melee bruiser: slow, thick, hunts the nearest player.
@@ -92,7 +106,18 @@ impl ActorKind {
                 CollisionShape::new(0.8, 0.8, 2.6).unwrap_or_default(),
                 600.0,
             )
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .with_abilities(AbilityTable::new([
+                Some(AbilitySpec {
+                    kind: AbilityKind::Area,
+                    behavior: CastBehavior::Root,
+                    cast_ticks: 30,
+                    cooldown_ticks: 180,
+                    magnitude: 4.0,
+                }),
+                None,
+                None,
+            ])),
             profile: MovementProfile {
                 speed: 3.0,
                 ..MovementProfile::default()
@@ -106,6 +131,20 @@ impl ActorKind {
                 knockback: 800.0,
             },
             brain: BrainKind::Hunter,
+            payloads: [
+                Some(AbilityPayload::Blast {
+                    range: 4.0,
+                    spec: game_packages::BlastSpec {
+                        radius: 4.0,
+                        energy: 2000.0,
+                        player_speed: 8.0,
+                        absorbed_fraction: 0.5,
+                        load_window: 0.05,
+                    },
+                }),
+                None,
+                None,
+            ],
         }
     }
     /// Fragile training prey: unarmed, flees attackers.
@@ -130,6 +169,7 @@ impl ActorKind {
                 knockback: 0.0,
             },
             brain: BrainKind::Flee,
+            payloads: [None; MAX_SLOTS],
         }
     }
 }
@@ -460,6 +500,7 @@ impl Simulation {
             ))
         }));
         self.actors = actors;
+        let mut fired: Vec<(u32, usize, Vec2)> = Vec::new();
         for (&id, actor) in self.actors.iter_mut() {
             if actor.health.is_depleted() {
                 if self.tick >= actor.respawn_at.unwrap_or(u64::MAX) {
@@ -486,7 +527,7 @@ impl Simulation {
                     .filter(|c| c.id != (super::CHARACTER_ID_BASE + u64::from(id)) as u32)
                     .copied(),
             );
-            step_character(
+            let output = step_character(
                 world,
                 &mut actor.state,
                 &actor.body,
@@ -497,7 +538,31 @@ impl Simulation {
             );
             self.step_scratch = step_bodies;
             actor.intent = intent;
+            for (slot, aim) in output.fired.iter().enumerate() {
+                if let Some(aim) = aim {
+                    fired.push((id, slot, *aim));
+                }
+            }
         }
+        for (id, slot, aim) in fired {
+            self.resolve_ability(id, slot, aim);
+        }
+    }
+
+    /// Apply a fired ability's host-side effect. The controller owns the cast,
+    /// cooldown and movement; this maps the slot to its authored payload.
+    fn resolve_ability(&mut self, id: u32, slot: usize, aim: Vec2) {
+        let Some(actor) = self.actors.get(&id) else {
+            return;
+        };
+        let Some(AbilityPayload::Blast { range, spec }) = actor.kind.payloads[slot] else {
+            return;
+        };
+        let origin = actor.state.motion.position + Vec3::Y * EYE_HEIGHT;
+        let center = origin + Vec3::new(aim.x, 0.0, aim.y) * range;
+        self.detonations
+            .push_back((self.next_arrow, center, spec, Some(SimEntity::Actor(id))));
+        self.next_arrow += 1;
     }
 
     /// Resolve one melee swing per attacker per tick: players swing along their

@@ -21,8 +21,8 @@ struct Motor<'a> {
     shape: CollisionShape,
     /// Movement and action gates derived from the active statuses.
     constraints: Constraints,
-    /// Ability slots that resolved this tick, for the host to apply effects to.
-    fired: [bool; MAX_SLOTS],
+    /// Ability slots that resolved this tick, with their aim, for the host.
+    fired: [Option<Vec2>; MAX_SLOTS],
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -44,7 +44,7 @@ pub fn step_character(
     if !dt.is_finite() || dt <= 0.0 {
         return MotorOutput {
             attempted: Vec2::new(character.motion.velocity.x, character.motion.velocity.z),
-            fired: [false; MAX_SLOTS],
+            fired: [None; MAX_SLOTS],
         };
     }
     let profile = profile.bounded();
@@ -68,7 +68,7 @@ pub fn step_character(
             ..Default::default()
         },
         attempted: Vec2::ZERO,
-        fired: [false; MAX_SLOTS],
+        fired: [None; MAX_SLOTS],
     };
     status(&mut motor, character);
     sanitize(&mut motor, character);
@@ -234,7 +234,7 @@ fn resolve(motor: &mut Motor, character: &mut CharacterState, slot: u8, aim: Vec
     let Some(spec) = motor.body.abilities.get(slot as usize) else {
         return;
     };
-    motor.fired[slot as usize] = true;
+    motor.fired[slot as usize] = Some(aim);
     character.cooldowns[slot as usize] = spec.cooldown_ticks;
     match spec.kind {
         AbilityKind::Dash => {

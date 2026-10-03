@@ -83,7 +83,9 @@ impl Brain for IdleBrain {
 }
 
 /// Melee pursuit: close on the nearest visible entity and swing on cooldown.
-/// Without a line-of-sight target it wanders, sweeping for new victims.
+/// Also fires slot 0 (an area ability for the titan) when the target is in
+/// reach and the slot is off cooldown. Without a line-of-sight target it
+/// wanders, sweeping for new victims.
 struct HunterBrain;
 impl Brain for HunterBrain {
     fn act(&mut self, obs: &ActorObservation, _tick: u64) -> CharacterIntent {
@@ -93,16 +95,19 @@ impl Brain for HunterBrain {
         if !target.line_of_sight {
             return wander();
         }
+        let ability = [obs.cooldowns[0] == 0 && target.distance < 6.0, false, false];
         if target.distance > obs.melee_range * 0.9 {
             CharacterIntent {
                 movement: Vec2::new(0.0, 1.0),
                 turn: face_turn(obs.yaw, obs.position, target.position),
+                ability,
                 ..CharacterIntent::default()
             }
         } else {
             CharacterIntent {
                 turn: face_turn(obs.yaw, obs.position, target.position),
                 attack: obs.attack_ready,
+                ability,
                 ..CharacterIntent::default()
             }
         }

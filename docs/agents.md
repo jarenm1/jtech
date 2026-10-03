@@ -49,7 +49,7 @@ one fixed action shape, per-species dims at the environment layer.
 | Kind | Locomotion | Capabilities | Combat |
 | --- | --- | --- | --- |
 | `dummy` | Ground | all | `MELEE_HANDS`, brain `Idle` |
-| `titan` | Ground, heavy body/profile | `MELEE` | Innate large-arc `MeleeSpec`, brain `Hunter` |
+| `titan` | Ground, heavy body/profile | `MELEE` | Innate large-arc `MeleeSpec` plus a rooted area blast on slot 0, brain `Hunter` |
 | `decoy` | Ground, light | `JUMP` | None, brain `Flee` (training prey) |
 
 New species = a table entry + optionally a `Brain`. No motor changes unless a
