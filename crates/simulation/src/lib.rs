@@ -213,6 +213,7 @@ impl Plugin for SimulationPlugin {
                 spawn,
                 spawn_chunks,
                 actors: BTreeMap::new(),
+                actor_observations: BTreeMap::new(),
                 next_actor: 1,
                 events: VecDeque::new(),
             })
@@ -399,6 +400,9 @@ pub struct Simulation {
     spawn: Vec3,
     spawn_chunks: HashSet<IVec3>,
     actors: actors::ActorMap,
+    /// Per-tick observation scratch rebuilt inside `advance_actors` so the
+    /// map allocation is not churned every tick.
+    actor_observations: BTreeMap<u32, ActorObservation>,
     next_actor: u32,
     /// Backlog of per-tick attribution events for `drain_events`; bounded
     /// oldest-first so an undraining consumer cannot grow memory.

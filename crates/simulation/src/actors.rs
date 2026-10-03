@@ -272,28 +272,41 @@ fn observation_of(
         distance: position.distance(feet),
         line_of_sight: line_of_sight(world, feet, position),
     };
+    // Candidates rank on distance alone, so only the winner pays for the
+    // `observe` terrain raycast; ties resolve like the old `min_by`.
     let nearest_player = players
         .iter()
         .filter(|(_, player)| !player.health.is_depleted() && !player.state.noclip)
+        .min_by(|(_, a), (_, b)| {
+            a.state
+                .position
+                .distance_squared(feet)
+                .total_cmp(&b.state.position.distance_squared(feet))
+        })
         .map(|(&id, player)| {
             observe(
                 SimEntity::Player(id),
                 player.state.position,
                 player.state.velocity,
             )
-        })
-        .min_by(|a, b| a.distance.total_cmp(&b.distance));
+        });
     let nearest_actor = actors
         .iter()
         .filter(|&(&id, other)| u64::from(id) != self_id && !other.health.is_depleted())
+        .min_by(|(_, a), (_, b)| {
+            a.state
+                .motion
+                .position
+                .distance_squared(feet)
+                .total_cmp(&b.state.motion.position.distance_squared(feet))
+        })
         .map(|(&id, other)| {
             observe(
                 SimEntity::Actor(id),
                 other.state.motion.position,
                 other.state.motion.velocity,
             )
-        })
-        .min_by(|a, b| a.distance.total_cmp(&b.distance));
+        });
     ActorObservation {
         tick,
         position: feet,
@@ -412,16 +425,18 @@ impl Simulation {
         // brains never observe a half-advanced tick. The map leaves self.actors
         // while observations borrow it.
         let actors = std::mem::take(&mut self.actors);
-        let observations: BTreeMap<u32, ActorObservation> = actors
-            .iter()
-            .filter(|(_, actor)| !actor.health.is_depleted())
-            .map(|(&id, actor)| {
-                (
-                    id,
-                    observation_of(actor, u64::from(id), &actors, &self.players, world, self.tick),
-                )
-            })
-            .collect();
+        let players = &self.players;
+        let observations = &mut self.actor_observations;
+        observations.clear();
+        observations.extend(actors.iter().filter_map(|(&id, actor)| {
+            if actor.health.is_depleted() {
+                return None;
+            }
+            Some((
+                id,
+                observation_of(actor, u64::from(id), &actors, players, world, self.tick),
+            ))
+        }));
         self.actors = actors;
         for (&id, actor) in self.actors.iter_mut() {
             if actor.health.is_depleted() {
