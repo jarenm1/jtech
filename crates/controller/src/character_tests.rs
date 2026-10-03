@@ -387,6 +387,52 @@ fn crouch_lowers_the_body_under_a_low_ceiling() {
 }
 
 #[test]
+fn status_effects_compose_by_strongest_wins_and_expire() {
+    let mut list = StatusList::default();
+    list.apply(StatusKind::Slow, 10);
+    list.apply(StatusKind::Slow, 4);
+    assert_eq!(list.entries()[0].unwrap().remaining, 10, "shorter refresh keeps the longer");
+    list.apply(StatusKind::Slow, 20);
+    assert_eq!(list.entries()[0].unwrap().remaining, 20, "longer refresh replaces");
+    list.apply(StatusKind::Stun, 3);
+    let constraints = list.constraints();
+    assert!(constraints.movement_locked && constraints.action_locked);
+    assert_eq!(constraints.speed_mult, 0.5);
+    for _ in 0..3 {
+        list.tick();
+    }
+    assert!(!list.constraints().action_locked, "stun must expire");
+    assert_eq!(list.constraints().speed_mult, 0.5, "slow must persist");
+}
+
+#[test]
+fn stun_locks_movement_and_jump() {
+    let world = tests::arena();
+    let body = CharacterBody::default();
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    state.statuses.apply(StatusKind::Stun, 30);
+    let mut intent = CharacterIntent {
+        movement: Vec2::X,
+        jump: true,
+        ..Default::default()
+    };
+    for _ in 0..20 {
+        tick(&world, &mut state, &body, &profile, &mut intent);
+    }
+    assert!(
+        (state.motion.position.x - 0.5).abs() < 0.01,
+        "stunned actor must not move: {:?}",
+        state.motion.position
+    );
+    assert!(
+        state.motion.velocity.y <= 0.0,
+        "stunned actor must not jump: {}",
+        state.motion.velocity.y
+    );
+}
+
+#[test]
 fn replay_restores_complete_motor_state_and_matches_human_adapter() {
     let world = tests::arena();
     let mut authority = actor(Vec3::new(0.5, 0.0, 0.5));

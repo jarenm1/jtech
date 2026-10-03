@@ -1,5 +1,6 @@
 use crate::{
-    CharacterBody, CharacterIntent, CharacterState, CollisionShape, MovementProfile, finite,
+    CharacterBody, CharacterIntent, CharacterState, CollisionShape, Constraints, MovementProfile,
+    finite,
 };
 use glam::{Vec2, Vec3};
 use physics::DynamicCollider;
@@ -18,6 +19,8 @@ struct Motor<'a> {
     support: Vec3,
     /// Effective collision shape for this tick; a crouch lowers the body.
     shape: CollisionShape,
+    /// Movement and action gates derived from the active statuses.
+    constraints: Constraints,
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -54,8 +57,14 @@ pub fn step_character(
         dt: dt.min(0.25),
         support: Vec3::Y,
         shape: body.shape,
+        constraints: Constraints {
+            speed_mult: 1.0,
+            turn_mult: 1.0,
+            ..Default::default()
+        },
         attempted: Vec2::ZERO,
     };
+    status(&mut motor, character);
     sanitize(&mut motor, character);
     stance(&mut motor, character);
     contact(&mut motor, character);
@@ -67,10 +76,17 @@ pub fn step_character(
     motor.attempted
 }
 
+/// Advance status timers and derive this tick's movement and action gates.
+fn status(motor: &mut Motor, character: &mut CharacterState) {
+    character.statuses.tick();
+    motor.constraints = character.statuses.constraints();
+}
+
 /// Bound the tick and the replay state, and advance yaw from held turn.
 fn sanitize(motor: &mut Motor, character: &mut CharacterState) {
     let state = &mut character.motion;
-    character.yaw = (finite(character.yaw) + motor.input.turn * motor.profile.turn_rate * motor.dt)
+    character.yaw = (finite(character.yaw)
+        + motor.input.turn * motor.profile.turn_rate * motor.dt * motor.constraints.turn_mult)
         .rem_euclid(std::f32::consts::TAU);
     // Noclip is exclusively an adapter concern. Generic actors always collide.
     state.noclip = false;
@@ -154,11 +170,15 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
     let (sy, cy) = yaw.sin_cos();
     let right = Vec3::new(cy, 0.0, -sy);
     let forward = Vec3::new(-sy, 0.0, -cy);
-    let movement = Vec2::new(
-        finite(motor.input.movement.x * motor.profile.strafe).clamp(-1.0, 1.0),
-        finite(motor.input.movement.y).clamp(-1.0, 1.0),
-    )
-    .clamp_length_max(1.0);
+    let movement = if motor.constraints.movement_locked {
+        Vec2::ZERO
+    } else {
+        Vec2::new(
+            finite(motor.input.movement.x * motor.profile.strafe).clamp(-1.0, 1.0),
+            finite(motor.input.movement.y).clamp(-1.0, 1.0),
+        )
+        .clamp_length_max(1.0)
+    };
     let speed = motor.profile.speed
         * if motor.input.sprint {
             motor.profile.sprint_mult
@@ -169,7 +189,8 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
             motor.profile.crouch_mult
         } else {
             1.0
-        };
+        }
+        * motor.constraints.speed_mult;
     let horizontal = (right * movement.x + forward * movement.y) * speed;
     let target = Vec2::new(horizontal.x, horizontal.z);
     let previous = physics::bounded_horizontal(
@@ -177,7 +198,10 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
     );
     // Ground steeper than the walkable limit overrides control: the actor
     // slides downhill, accumulating up to the profile speed.
-    if state.grounded && motor.support.y < motor.profile.max_slope_cos {
+    if state.grounded
+        && !motor.constraints.movement_locked
+        && motor.support.y < motor.profile.max_slope_cos
+    {
         let downhill = (motor.support * motor.support.y - Vec3::Y).normalize_or_zero();
         let slide = Vec2::new(downhill.x, downhill.z) * motor.profile.gravity * motor.dt;
         let slid = (previous + slide).clamp_length_max(motor.profile.speed) + state.external_velocity;
@@ -215,6 +239,7 @@ fn gravity(motor: &mut Motor, character: &mut CharacterState) {
     let state = &mut character.motion;
     if character.jump_buffer > 0
         && (state.grounded || character.coyote > 0)
+        && !motor.constraints.action_locked
         && motor.profile.jump_speed > 0.0
     {
         state.velocity.y = motor.profile.jump_speed;

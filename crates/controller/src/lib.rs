@@ -194,6 +194,60 @@ impl StatusList {
     pub fn entries(&self) -> &[Option<Status>; MAX_STATUSES] {
         &self.entries
     }
+
+    /// Apply or refresh a status. Strongest-wins per kind: a longer remaining
+    /// duration replaces a shorter one, otherwise the existing entry stands.
+    /// A full list drops the new status rather than evicting an active one.
+    pub fn apply(&mut self, kind: StatusKind, ticks: u16) {
+        for status in self.entries.iter_mut().flatten() {
+            if status.kind == kind {
+                status.remaining = status.remaining.max(ticks);
+                return;
+            }
+        }
+        if let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some(Status {
+                kind,
+                remaining: ticks,
+            });
+        }
+    }
+
+    /// Decrement every active status and drop the ones that expire.
+    pub fn tick(&mut self) {
+        for entry in self.entries.iter_mut() {
+            if let Some(status) = entry {
+                status.remaining = status.remaining.saturating_sub(1);
+                if status.remaining == 0 {
+                    *entry = None;
+                }
+            }
+        }
+    }
+
+    /// Movement and action gates derived from the active statuses. Stun, sleep
+    /// and knockup lock everything; root locks movement; silence locks casts;
+    /// slow scales speed. Taunt, fear and blind are host-level, not motor gates.
+    pub fn constraints(&self) -> Constraints {
+        let mut constraints = Constraints {
+            speed_mult: 1.0,
+            turn_mult: 1.0,
+            ..Default::default()
+        };
+        for status in self.entries.iter().flatten() {
+            match status.kind {
+                StatusKind::Stun | StatusKind::Sleep | StatusKind::Knockup => {
+                    constraints.action_locked = true;
+                    constraints.movement_locked = true;
+                }
+                StatusKind::Root => constraints.movement_locked = true,
+                StatusKind::Silence => constraints.cast_locked = true,
+                StatusKind::Slow => constraints.speed_mult = constraints.speed_mult.min(0.5),
+                StatusKind::Taunt | StatusKind::Fear | StatusKind::Blind => {}
+            }
+        }
+        constraints
+    }
 }
 
 /// Per-tick movement and action gates derived from active statuses and mode.
