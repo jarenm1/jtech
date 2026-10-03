@@ -60,13 +60,15 @@ pub(crate) fn spawn(commands: &mut Commands) {
 
 pub(crate) fn cycle_on_click(
     buttons: Query<&Interaction, (With<PowerButton>, Changed<Interaction>)>,
-    cursor: Single<&CursorOptions>,
+    cursor: Option<Single<&CursorOptions>>,
     mut session: ResMut<ClientSession>,
 ) {
     if session.health.is_depleted() {
         return;
     }
-    if cursor.visible && session.held_item() == EXPLOSIVE_BOW_ITEM {
+    // Headless has no window entity, so no `CursorOptions`: no clicks arrive.
+    let cursor_visible = cursor.is_some_and(|cursor| cursor.visible);
+    if cursor_visible && session.held_item() == EXPLOSIVE_BOW_ITEM {
         for interaction in &buttons {
             if *interaction == Interaction::Pressed {
                 session.bow_power = session.bow_power.next();
@@ -77,17 +79,19 @@ pub(crate) fn cycle_on_click(
 
 pub(crate) fn update(
     session: Res<ClientSession>,
-    cursor: Single<&CursorOptions>,
+    cursor: Option<Single<&CursorOptions>>,
     mut button: Single<(&mut Node, &Interaction, &mut BackgroundColor), With<PowerButton>>,
     mut label: Single<&mut Text, With<PowerLabel>>,
     mut shown: Local<Option<(bool, &'static str, Color)>>,
 ) {
+    // Headless has no window entity, so no `CursorOptions`: no hover or press.
+    let cursor_visible = cursor.is_some_and(|cursor| cursor.visible);
     let (node, interaction, color) = &mut *button;
     let visible = session.held_item() == EXPLOSIVE_BOW_ITEM;
     let text = session.bow_power.label();
     let tint = match **interaction {
-        Interaction::Pressed if cursor.visible => palette::PRESSED,
-        Interaction::Hovered if cursor.visible => palette::HOVER,
+        Interaction::Pressed if cursor_visible => palette::PRESSED,
+        Interaction::Hovered if cursor_visible => palette::HOVER,
         _ => palette::PANEL,
     };
     // The panel is static between input changes; skip the per-frame `Text`

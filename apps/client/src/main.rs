@@ -20,11 +20,19 @@ use std::{
 };
 
 use bevy::{
-    app::AppExit,
+    app::{AppExit, ScheduleRunnerPlugin},
+    camera::RenderTarget,
+    image::BevyDefault,
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
-    render::view::screenshot::{Screenshot, save_to_disk},
-    window::{CursorGrabMode, CursorOptions, PresentMode},
+    render::{
+        RenderPlugin,
+        render_resource::{TextureFormat, TextureUsages},
+        settings::{RenderCreation, WgpuSettings},
+        view::screenshot::{Screenshot, save_to_disk},
+    },
+    window::{CursorGrabMode, CursorOptions, ExitCondition, PresentMode, WindowRef},
+    winit::WinitPlugin,
 };
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerState, look_direction};
@@ -37,6 +45,16 @@ use voxel_world::{
     CHUNK_SIZE, Chunk, VoxelWorld, WORLD_MAX_Y, WORLD_MIN_Y, WorldPlugin, chunk_coord,
 };
 
+/// Which wgpu adapter the renderer should use. `Software` forces the fallback
+/// (lavapipe/llvmpipe) adapter so captures run on CPU without touching the GPU.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum RenderBackend {
+    #[default]
+    Auto,
+    Software,
+    Gpu,
+}
+
 #[derive(Resource)]
 struct Options {
     server: SocketAddr,
@@ -44,17 +62,32 @@ struct Options {
     frames: Option<u64>,
     screenshot: Option<String>,
     lighting: lighting::DayCycle,
+    /// Render offscreen to an image instead of a window. Implies `bot`.
+    headless: bool,
+    width: u32,
+    height: u32,
+    backend: RenderBackend,
 }
 
-impl Options {
-    fn parse() -> Result<Self, String> {
-        let mut options = Self {
+impl Default for Options {
+    fn default() -> Self {
+        Self {
             server: "127.0.0.1:4000".parse().unwrap(),
             bot: false,
             frames: None,
             screenshot: None,
             lighting: lighting::DayCycle::default(),
-        };
+            headless: false,
+            width: 1280,
+            height: 800,
+            backend: RenderBackend::Auto,
+        }
+    }
+}
+
+impl Options {
+    fn parse() -> Result<Self, String> {
+        let mut options = Self::default();
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -66,6 +99,35 @@ impl Options {
                         .map_err(|_| "invalid server IP:port")?
                 }
                 "--bot" => options.bot = true,
+                "--headless" => options.headless = true,
+                "--width" => {
+                    options.width = args
+                        .next()
+                        .ok_or("--width needs a pixel count")?
+                        .parse()
+                        .map_err(|_| "invalid width")?;
+                    if options.width == 0 {
+                        return Err("--width must be positive".into());
+                    }
+                }
+                "--height" => {
+                    options.height = args
+                        .next()
+                        .ok_or("--height needs a pixel count")?
+                        .parse()
+                        .map_err(|_| "invalid height")?;
+                    if options.height == 0 {
+                        return Err("--height must be positive".into());
+                    }
+                }
+                "--render-backend" => {
+                    options.backend = match args.next().as_deref() {
+                        Some("auto") => RenderBackend::Auto,
+                        Some("software") => RenderBackend::Software,
+                        Some("gpu") => RenderBackend::Gpu,
+                        _ => return Err("--render-backend expects auto|software|gpu".into()),
+                    };
+                }
                 "--frames" => {
                     let frames = args
                         .next()
@@ -109,12 +171,17 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-0 hotbar | Tab inventory | Esc pause menu | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nHeadless capture: [--headless] [--width N] [--height N] [--render-backend auto|software|gpu]\n  --headless renders offscreen to an image (implies --bot) and needs no display server.\n  --render-backend software forces the CPU fallback adapter (lavapipe/llvmpipe): no GPU use.\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-0 hotbar | Tab inventory | Esc pause menu | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unknown argument: {arg}")),
             }
+        }
+        if options.headless {
+            // No window means no keyboard or mouse, so the scripted traversal is
+            // the only input source: headless always drives the bot.
+            options.bot = true;
         }
         Ok(options)
     }
@@ -379,6 +446,11 @@ struct PlayerCamera;
 #[derive(Component)]
 struct RemoteActorEntity;
 
+/// Window- and cursor-coupled systems only run when a real window exists:
+/// `--headless` spawns no window entity and has no input devices.
+fn windowed(options: Res<Options>) -> bool {
+    !options.headless
+}
 
 struct ClientPlugin;
 
@@ -400,7 +472,11 @@ impl Plugin for ClientPlugin {
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
-                (inventory_ui::input, inventory_ui::sync, inventory_ui::drag)
+                (
+                    inventory_ui::input.run_if(windowed),
+                    inventory_ui::sync,
+                    inventory_ui::drag.run_if(windowed),
+                )
                     .chain()
                     .before(pause_menu::sync),
             )
@@ -409,14 +485,14 @@ impl Plugin for ClientPlugin {
                 Update,
                 (
                     receive_network,
-                    pause_menu::input,
+                    pause_menu::input.run_if(windowed),
                     pause_menu::actions,
                     pause_menu::sync,
                     death_overlay::input,
                     death_overlay::actions,
                     death_overlay::sync,
-                    pause_menu::sync_cursor,
-                    controls,
+                    pause_menu::sync_cursor.run_if(windowed),
+                    controls.run_if(windowed),
                     bow_power_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
                     predict,
                     edit_blocks,
@@ -445,6 +521,8 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(2)
     });
+    let headless = options.headless;
+    let backend = options.backend;
     let cache = package_assets::PackageAssets::cache_dir();
     let _ = std::fs::create_dir_all(&cache);
     let mut app = App::new();
@@ -457,18 +535,42 @@ fn main() {
             None,
         ),
     );
-    app
-        .insert_resource(options.lighting)
-        .insert_resource(options)
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
+    let mut plugins = DefaultPlugins.set(WindowPlugin {
+        primary_window: if headless {
+            None
+        } else {
+            Some(Window {
                 title: "Voxel".into(),
                 resolution: (1280, 800).into(),
                 present_mode: PresentMode::AutoVsync,
                 ..default()
+            })
+        },
+        // Headless has no window to close, so exit is driven by `--frames`.
+        exit_condition: if headless {
+            ExitCondition::DontExit
+        } else {
+            ExitCondition::OnAllClosed
+        },
+        ..default()
+    });
+    if headless {
+        // WinitPlugin panics without a display server; ScheduleRunnerPlugin
+        // drives the loop instead of the winit event loop.
+        plugins = plugins.disable::<WinitPlugin>();
+    }
+    if backend != RenderBackend::Auto {
+        plugins = plugins.set(RenderPlugin {
+            render_creation: RenderCreation::Automatic(WgpuSettings {
+                force_fallback_adapter: backend == RenderBackend::Software,
+                ..default()
             }),
             ..default()
-        }))
+        });
+    }
+    app.insert_resource(options.lighting)
+        .insert_resource(options)
+        .add_plugins(plugins)
         .add_plugins((
             bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
             WorldPlugin,
@@ -478,8 +580,13 @@ fn main() {
             loose_blocks::LooseBlocksPlugin,
             projectiles::ProjectilesPlugin,
             drops::DropsPlugin,
-        ))
-        .run();
+        ));
+    if headless {
+        app.add_plugins(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
+            1.0 / 60.0,
+        )));
+    }
+    app.run();
 }
 
 /// Camera far plane covering the largest server interest square in three
@@ -493,6 +600,19 @@ fn camera_far_distance() -> f32 {
     (horizontal * horizontal + vertical * vertical).sqrt()
 }
 
+/// Offscreen render target for `--headless`. Kept as a resource so
+/// `capture_screenshot` can read the same image back.
+#[derive(Resource)]
+struct HeadlessTarget(Handle<Image>);
+
+/// A render-attachment image the camera draws into, with `COPY_SRC` so the
+/// screenshot path can read it back to the CPU.
+fn headless_target(width: u32, height: u32) -> Image {
+    let mut image = Image::new_target_texture(width, height, TextureFormat::bevy_default());
+    image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
+    image
+}
+
 fn setup(
     mut commands: Commands,
     options: Res<Options>,
@@ -500,7 +620,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut cursor: Single<&mut CursorOptions>,
+    cursor: Option<Single<&mut CursorOptions>>,
 ) {
     match ClientTransport::connect(options.server) {
         Ok(transport) => {
@@ -509,14 +629,28 @@ fn setup(
         }
         Err(error) => session.disconnect(error),
     }
-    cursor.grab_mode = if options.bot {
-        CursorGrabMode::None
+    // Headless has no window entity, so `CursorOptions` does not exist.
+    if let Some(mut cursor) = cursor {
+        cursor.grab_mode = if options.bot {
+            CursorGrabMode::None
+        } else {
+            CursorGrabMode::Locked
+        };
+        cursor.visible = options.bot;
+    }
+    let target = if options.headless {
+        let handle = images.add(headless_target(options.width, options.height));
+        commands.insert_resource(HeadlessTarget(handle.clone()));
+        RenderTarget::from(handle)
     } else {
-        CursorGrabMode::Locked
+        RenderTarget::Window(WindowRef::Primary)
     };
-    cursor.visible = options.bot;
     commands.spawn((
         Camera3d::default(),
+        Camera {
+            target,
+            ..default()
+        },
         Projection::Perspective(PerspectiveProjection {
             fov: 75.0_f32.to_radians(),
             // Cover the 3D diagonal of the largest server interest square,
@@ -966,13 +1100,16 @@ fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
 fn predict(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    cursor: Single<&CursorOptions>,
+    cursor: Option<Single<&CursorOptions>>,
     options: Res<Options>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
     loose: Res<loose_blocks::LooseBlocks>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
+    // Headless spawns no window entity, so there is no `CursorOptions`: treat
+    // the cursor as hidden, matching what the bot path already assumes.
+    let cursor_visible = cursor.is_some_and(|cursor| cursor.visible);
     if session.id.is_none() || session.transport.is_none() {
         return;
     }
@@ -988,7 +1125,7 @@ fn predict(
     }
     if !menu.blocks_gameplay()
         && !options.bot
-        && !cursor.visible
+        && !cursor_visible
         && keys.just_pressed(KeyCode::KeyV)
     {
         session.noclip_requested = !session.noclip_requested;
@@ -1003,7 +1140,7 @@ fn predict(
         return;
     }
     session.capture_jump(
-        !options.bot && !cursor.visible && !menu.blocks_gameplay(),
+        !options.bot && !cursor_visible && !menu.blocks_gameplay(),
         keys.just_pressed(KeyCode::Space),
     );
     session.accumulator += time.delta_secs().min(0.1);
@@ -1029,7 +1166,7 @@ fn predict(
                 _ => [-1.0, 0.0],
             };
             jump = session.sequence.is_multiple_of(90);
-        } else if !cursor.visible && !menu.blocks_gameplay() {
+        } else if !cursor_visible && !menu.blocks_gameplay() {
             movement[0] = f32::from(u8::from(keys.pressed(KeyCode::KeyD)))
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyA)));
             movement[1] = f32::from(u8::from(keys.pressed(KeyCode::KeyW)))
@@ -1073,7 +1210,7 @@ fn predict(
 fn edit_blocks(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
-    cursor: Single<&CursorOptions>,
+    cursor: Option<Single<&CursorOptions>>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
     actors: Res<RemoteActors>,
@@ -1082,8 +1219,11 @@ fn edit_blocks(
     mut bow_repeat: Local<BowRepeat>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
+    // Headless spawns no window entity, so there is no `CursorOptions`: treat
+    // the cursor as hidden, matching what the bot path already assumes.
+    let cursor_visible = cursor.is_some_and(|cursor| cursor.visible);
     if menu.blocks_gameplay()
-        || cursor.visible
+        || cursor_visible
         || session.transport.is_none()
         || session.id.is_none()
         || session.health.is_depleted()
@@ -1283,6 +1423,7 @@ fn capture_screenshot(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     options: Res<Options>,
+    target: Option<Res<HeadlessTarget>>,
     mut session: ResMut<ClientSession>,
 ) {
     let auto_capture = !session.captured
@@ -1294,9 +1435,11 @@ fn capture_screenshot(
             .clone()
 
             .unwrap_or_else(|| format!("/tmp/voxel-{}.png", session.frame));
-        commands
-            .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(path.clone()));
+        let screenshot = match target {
+            Some(target) => Screenshot::image(target.0.clone()),
+            None => Screenshot::primary_window(),
+        };
+        commands.spawn(screenshot).observe(save_to_disk(path.clone()));
         session.captured = true;
         info!("CAPTURE {path}");
     }
