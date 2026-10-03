@@ -10,6 +10,7 @@ fn actor(position: Vec3) -> CharacterState {
             ..Default::default()
         },
         yaw: 0.0,
+        ..Default::default()
     }
 }
 fn animal() -> (CharacterBody, MovementProfile) {

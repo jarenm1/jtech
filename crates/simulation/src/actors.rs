@@ -343,6 +343,7 @@ impl Simulation {
                         ..Default::default()
                     },
                     yaw: 0.0,
+                    ..Default::default()
                 },
                 body: kind.body,
                 profile: kind.profile,
