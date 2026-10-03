@@ -29,7 +29,7 @@ Insert the authoritative **`VoxelWorld` resource** into the same Bevy world. The
 
 The server installs the plugin on its manually paced `Update` schedule, after the authoritative simulation step. Controller actors use that simulation's `VoxelWorld`; each tick the host copies current physics colliders into `ObservedBodies`. The client installs the default plugin with a 60 Hz fixed clock and copies its received loose-cube observations. Existing human players are advanced explicitly by the shared adapter, not also spawned as ECS motor entities.
 
-For a minimal scripted NPC, spawn `(CharacterState, CharacterBody, MovementProfile, CharacterIntent)` and update its intent in `ControllerSet::Intent`. The headless plugin test exercises this path with an animal body/profile and compares it to direct motor stepping. NPC replication, terrain interest management, combat, and animation are separate host responsibilities. Current controller actors collide with terrain and observed loose cubes; actor-to-actor collision and NPC force feedback into the GPU solver are not wired yet.
+For a minimal scripted NPC, spawn `(CharacterState, CharacterBody, MovementProfile, CharacterIntent)` and update its intent in `ControllerSet::Intent`. The headless plugin test exercises this path with an animal body/profile and compares it to direct motor stepping. NPC replication, terrain interest management, combat, and animation are separate host responsibilities. `simulation::character_colliders` builds every living character's AABB as a dynamic collider; the server feeds it to each **actor's** motor, so actors block and shove each other and players. The human player step still uses loose bodies only, and NPC force feedback into the GPU solver is not wired.
 
 ## Human adapter
 

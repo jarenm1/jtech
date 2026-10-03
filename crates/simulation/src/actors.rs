@@ -437,7 +437,12 @@ impl Simulation {
     /// Step every living actor one fixed tick and revive actors whose respawn
     /// delay elapsed. Held movement persists; `resolve_attacks` consumes the
     /// attack edge after the motor step.
-    pub(super) fn advance_actors(&mut self, world: &VoxelWorld, bodies: &[DynamicCollider]) {
+    pub(super) fn advance_actors(
+        &mut self,
+        world: &VoxelWorld,
+        bodies: &[DynamicCollider],
+        characters: &[DynamicCollider],
+    ) {
         // Observations see pre-step state for every living actor at once so
         // brains never observe a half-advanced tick. The map leaves self.actors
         // while observations borrow it.
@@ -471,6 +476,16 @@ impl Simulation {
                 ActorBrain::External => actor.intent,
             };
             intent = gate_intent(intent, actor.kind.capabilities);
+            // Loose bodies plus every other character, so actors collide.
+            let mut step_bodies = std::mem::take(&mut self.step_scratch);
+            step_bodies.clear();
+            step_bodies.extend_from_slice(bodies);
+            step_bodies.extend(
+                characters
+                    .iter()
+                    .filter(|c| c.id != (super::CHARACTER_ID_BASE + u64::from(id)) as u32)
+                    .copied(),
+            );
             step_character(
                 world,
                 &mut actor.state,
@@ -478,8 +493,9 @@ impl Simulation {
                 &actor.profile,
                 &mut intent,
                 FIXED_DT,
-                bodies,
+                &step_bodies,
             );
+            self.step_scratch = step_bodies;
             actor.intent = intent;
         }
     }
