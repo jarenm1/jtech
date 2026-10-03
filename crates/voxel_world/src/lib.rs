@@ -141,17 +141,77 @@ pub fn index(local: IVec3) -> usize {
     (local.x + 32 * (local.z + 32 * local.y)) as usize
 }
 
+/// Bytes of packed chunk data covered by one shared copy-on-write page.
+/// Material nibbles take four pages, density eight, the placed bitmap one.
+const PAGE_LEN: usize = 4096;
+/// Chunk payload split into shared copy-on-write pages. Cloning a `Chunk`
+/// (the `Arc::make_mut` fallback when a renderer or `ActiveTerrain` snapshot
+/// still holds the `Arc`) bumps page refcounts instead of deep-copying the
+/// arrays; a voxel edit clone-detaches only the pages containing the edited
+/// bytes, so retained snapshots keep reading the old pages.
+#[derive(Clone, Debug)]
+struct Pages<T> {
+    pages: Box<[Arc<[T; PAGE_LEN]>]>,
+    len: usize,
+}
+impl<T: Clone> Pages<T> {
+    fn filled(len: usize, fill: T) -> Self {
+        assert!(len % PAGE_LEN == 0, "chunk arrays span whole pages");
+        Self {
+            pages: (0..len / PAGE_LEN)
+                .map(|_| Arc::new(std::array::from_fn(|_| fill.clone())))
+                .collect(),
+            len,
+        }
+    }
+    /// COW element access: clone-detaches the containing 4 KiB page only
+    /// when it is still shared with a retained snapshot.
+    fn get_mut(&mut self, i: usize) -> &mut T {
+        &mut Arc::make_mut(&mut self.pages[i / PAGE_LEN])[i % PAGE_LEN]
+    }
+}
+impl<T> Pages<T> {
+    fn from_fn(len: usize, mut f: impl FnMut(usize) -> T) -> Self {
+        assert!(len % PAGE_LEN == 0, "chunk arrays span whole pages");
+        let mut i = 0;
+        Self {
+            pages: (0..len / PAGE_LEN)
+                .map(|_| {
+                    Arc::new(std::array::from_fn(|_| {
+                        let value = f(i);
+                        i += 1;
+                        value
+                    }))
+                })
+                .collect(),
+            len,
+        }
+    }
+    fn all(&self, mut f: impl FnMut(&T) -> bool) -> bool {
+        self.pages
+            .iter()
+            .flat_map(|page| page.iter())
+            .take(self.len)
+            .all(|v| f(v))
+    }
+}
+impl<T> std::ops::Index<usize> for Pages<T> {
+    type Output = T;
+    fn index(&self, i: usize) -> &T {
+        &self.pages[i / PAGE_LEN][i % PAGE_LEN]
+    }
+}
 #[derive(Clone, Debug)]
 enum Storage {
     /// Every voxel identical; material implies density, nothing placed.
     Uniform(u8),
     /// Packed material nibbles only; density implied, nothing placed.
-    Dense(Box<[u8]>),
+    Dense(Pages<u8>),
     /// Full voxel state: material nibbles, per-voxel density, placed bitmap.
     Smooth {
-        materials: Box<[u8]>,
-        density: Box<[i8]>,
-        placed: Box<[u8]>,
+        materials: Pages<u8>,
+        density: Pages<i8>,
+        placed: Pages<u8>,
     },
 }
 #[derive(Debug)]
@@ -226,7 +286,8 @@ impl Chunk {
                 materials: bytes, ..
             } => {
                 let shift = (index & 1) * 4;
-                bytes[index / 2] = (bytes[index / 2] & !(15 << shift)) | (block << shift);
+                let byte = bytes.get_mut(index / 2);
+                *byte = (*byte & !(15 << shift)) | (block << shift);
             }
             Storage::Uniform(_) => unreachable!("materials allocated before write"),
         }
@@ -242,13 +303,15 @@ impl Chunk {
                     return;
                 }
                 if implied {
-                    self.storage =
-                        Storage::Dense(vec![old | (old << 4); CHUNK_VOLUME / 2].into_boxed_slice());
+                    self.storage = Storage::Dense(Pages::filled(
+                        CHUNK_VOLUME / 2,
+                        old | (old << 4),
+                    ));
                 } else {
                     self.storage = Storage::Smooth {
-                        materials: vec![old | (old << 4); CHUNK_VOLUME / 2].into_boxed_slice(),
-                        density: vec![Voxel::implied_density(old); CHUNK_VOLUME].into_boxed_slice(),
-                        placed: vec![0; CHUNK_VOLUME / 8].into_boxed_slice(),
+                        materials: Pages::filled(CHUNK_VOLUME / 2, old | (old << 4)),
+                        density: Pages::filled(CHUNK_VOLUME, Voxel::implied_density(old)),
+                        placed: Pages::filled(CHUNK_VOLUME / 8, 0),
                     };
                 }
             }
@@ -259,15 +322,14 @@ impl Chunk {
                     else {
                         unreachable!()
                     };
-                    let mut density = Vec::with_capacity(CHUNK_VOLUME);
-                    for i in 0..CHUNK_VOLUME {
+                    let density = Pages::from_fn(CHUNK_VOLUME, |i| {
                         let m = (materials[i / 2] >> ((i & 1) * 4)) & 15;
-                        density.push(Voxel::implied_density(m));
-                    }
+                        Voxel::implied_density(m)
+                    });
                     self.storage = Storage::Smooth {
                         materials,
-                        density: density.into_boxed_slice(),
-                        placed: vec![0; CHUNK_VOLUME / 8].into_boxed_slice(),
+                        density,
+                        placed: Pages::filled(CHUNK_VOLUME / 8, 0),
                     };
                 }
             }
@@ -279,11 +341,12 @@ impl Chunk {
             density, placed, ..
         } = &mut self.storage
         {
-            density[index] = voxel.density;
+            *density.get_mut(index) = voxel.density;
+            let byte = placed.get_mut(index / 8);
             if voxel.placed {
-                placed[index / 8] |= 1 << (index & 7);
+                *byte |= 1 << (index & 7);
             } else {
-                placed[index / 8] &= !(1 << (index & 7));
+                *byte &= !(1 << (index & 7));
             }
         }
     }
@@ -313,7 +376,7 @@ impl Chunk {
         }
         let mut chunk = Self {
             revision,
-            storage: Storage::Dense(vec![0; CHUNK_VOLUME / 2].into_boxed_slice()),
+            storage: Storage::Dense(Pages::filled(CHUNK_VOLUME / 2, 0)),
             runs_cache: Mutex::new(None),
         };
         let mut cursor = 0;
@@ -402,7 +465,7 @@ impl Chunk {
             });
         }
 
-        let mut materials = vec![0u8; CHUNK_VOLUME / 2];
+        let mut materials = Pages::filled(CHUNK_VOLUME / 2, 0);
         let mut mi = 0usize;
         let mut m_left = material_runs[0].0 as usize;
         for i in 0..CHUNK_VOLUME {
@@ -411,19 +474,19 @@ impl Chunk {
                 m_left = material_runs[mi].0 as usize;
             }
             let material = material_runs[mi].1 & !PLACED_FLAG;
-            materials[i / 2] |= material << ((i & 1) * 4);
+            *materials.get_mut(i / 2) |= material << ((i & 1) * 4);
             m_left -= 1;
         }
         if all_implied {
             return Ok(Self {
                 revision,
-                storage: Storage::Dense(materials.into_boxed_slice()),
+                storage: Storage::Dense(materials),
                 runs_cache: Mutex::new(None),
             });
         }
 
-        let mut density = vec![0i8; CHUNK_VOLUME];
-        let mut placed = vec![0u8; CHUNK_VOLUME / 8];
+        let mut density = Pages::filled(CHUNK_VOLUME, 0);
+        let mut placed = Pages::filled(CHUNK_VOLUME / 8, 0);
         let mut di = 0usize;
         let mut d_left = density_runs[0].0 as usize;
         let mut mi = 0usize;
@@ -437,9 +500,9 @@ impl Chunk {
                 mi += 1;
                 m_left = material_runs[mi].0 as usize;
             }
-            density[i] = density_runs[di].1;
+            *density.get_mut(i) = density_runs[di].1;
             if material_runs[mi].1 & PLACED_FLAG != 0 {
-                placed[i / 8] |= 1 << (i & 7);
+                *placed.get_mut(i / 8) |= 1 << (i & 7);
             }
             d_left -= 1;
             m_left -= 1;
@@ -447,9 +510,9 @@ impl Chunk {
         Ok(Self {
             revision,
             storage: Storage::Smooth {
-                materials: materials.into_boxed_slice(),
-                density: density.into_boxed_slice(),
-                placed: placed.into_boxed_slice(),
+                materials,
+                density,
+                placed,
             },
             runs_cache: Mutex::new(None),
         })
@@ -508,10 +571,10 @@ impl Chunk {
     pub fn is_empty(&self) -> bool {
         match &self.storage {
             Storage::Uniform(block) => *block == AIR,
-            Storage::Dense(bytes) => bytes.iter().all(|&b| b == 0),
+            Storage::Dense(bytes) => bytes.all(|b| *b == 0),
             Storage::Smooth {
                 materials, placed, ..
-            } => materials.iter().all(|&b| b == 0) && placed.iter().all(|&b| b == 0),
+            } => materials.all(|b| *b == 0) && placed.all(|b| *b == 0),
         }
     }
     pub fn generate(coord: IVec3, seed: u64) -> Self {
@@ -539,7 +602,7 @@ impl Chunk {
             placed,
         } = &self.storage
         {
-            if placed.iter().all(|&b| b == 0)
+            if placed.all(|b| *b == 0)
                 && (0..CHUNK_VOLUME).all(|i| {
                     let m = (materials[i / 2] >> ((i & 1) * 4)) & 15;
                     density[i] == Voxel::implied_density(m)
