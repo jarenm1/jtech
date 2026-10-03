@@ -74,6 +74,7 @@ pub fn step_player_with_bodies(
         jump: input.jump,
         attack: input.attack,
         held_item: 0,
+        ..Default::default()
     };
     let attempted = step_character(
         world,

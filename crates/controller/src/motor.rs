@@ -104,7 +104,13 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
         finite(motor.input.movement.y).clamp(-1.0, 1.0),
     )
     .clamp_length_max(1.0);
-    let horizontal = (right * movement.x + forward * movement.y) * motor.profile.speed;
+    let speed = motor.profile.speed
+        * if motor.input.sprint {
+            motor.profile.sprint_mult
+        } else {
+            1.0
+        };
+    let horizontal = (right * movement.x + forward * movement.y) * speed;
     let target = Vec2::new(horizontal.x, horizontal.z);
     let previous = physics::bounded_horizontal(
         Vec2::new(state.velocity.x, state.velocity.z) - state.external_velocity,

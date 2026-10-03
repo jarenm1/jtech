@@ -191,6 +191,7 @@ fn invalid_configuration_actions_and_ticks_are_bounded() {
         jump: true,
         attack: false,
         held_item: 0,
+        ..Default::default()
     };
     tick(
         &world,
@@ -226,10 +227,39 @@ fn invalid_configuration_actions_and_ticks_are_bounded() {
         jump: false,
         attack: false,
         held_item: 0,
+        ..Default::default()
     }
     .bounded();
     assert!(extreme.movement.length() <= 1.0);
     assert_eq!(extreme.turn, -1.0);
+}
+
+#[test]
+fn sprint_scales_target_speed_by_the_profile_multiplier() {
+    let world = tests::arena();
+    let (body, profile) = animal();
+    let profile = MovementProfile {
+        sprint_mult: 2.0,
+        ..profile
+    };
+    let run = |sprint: bool| {
+        let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+        let mut intent = CharacterIntent {
+            movement: Vec2::Y,
+            sprint,
+            ..Default::default()
+        };
+        for _ in 0..90 {
+            tick(&world, &mut state, &body, &profile, &mut intent);
+        }
+        state.motion.velocity.z
+    };
+    let walk = run(false);
+    let sprint = run(true);
+    assert!(
+        (sprint / walk - 2.0).abs() < 1e-3,
+        "walk {walk} sprint {sprint}"
+    );
 }
 
 #[test]
@@ -321,6 +351,7 @@ fn headless_plugin_runs_script_before_motor_and_matches_direct_ticks() {
                 jump: false,
                 attack: false,
                 held_item: 0,
+                ..Default::default()
             },
         );
     }

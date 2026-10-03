@@ -23,6 +23,8 @@ pub struct CharacterIntent {
     pub attack: bool,
     /// Item the character swings with; the host maps it to a melee spec.
     pub held_item: u32,
+    /// Held sprint request: scales target speed by the profile's sprint multiplier.
+    pub sprint: bool,
 }
 impl CharacterIntent {
     pub fn bounded(self) -> Self {
@@ -36,6 +38,7 @@ impl CharacterIntent {
             jump: self.jump,
             attack: self.attack,
             held_item: self.held_item,
+            sprint: self.sprint,
         }
     }
 }
@@ -68,6 +71,8 @@ impl Default for CharacterBody {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MovementProfile {
     pub speed: f32,
+    /// Target-speed multiplier while sprinting.
+    pub sprint_mult: f32,
     pub acceleration: f32,
     pub braking: f32,
     pub air_control: f32,
@@ -82,6 +87,7 @@ impl Default for MovementProfile {
     fn default() -> Self {
         Self {
             speed: 6.0,
+            sprint_mult: 1.5,
             acceleration: 10_000.0,
             braking: 10_000.0,
             air_control: 1.0,
@@ -98,6 +104,7 @@ impl MovementProfile {
     pub(crate) fn bounded(self) -> Self {
         Self {
             speed: finite(self.speed).clamp(0.0, 60.0),
+            sprint_mult: finite(self.sprint_mult).clamp(1.0, 4.0),
             acceleration: finite(self.acceleration).clamp(0.0, 10_000.0),
             braking: finite(self.braking).clamp(0.0, 10_000.0),
             air_control: finite(self.air_control).clamp(0.0, 1.0),
