@@ -345,6 +345,48 @@ fn grounded_actor_steps_over_a_low_obstruction() {
 }
 
 #[test]
+fn crouch_lowers_the_body_under_a_low_ceiling() {
+    let mut world = tests::arena();
+    // A ceiling one cell above the floor: standing height does not fit.
+    for x in 1..6 {
+        for z in -1..=1 {
+            world.set_block(IVec3::new(x, 1, z), STONE);
+        }
+    }
+    let body = CharacterBody::default();
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut intent = CharacterIntent {
+        movement: Vec2::X,
+        crouch: true,
+        ..Default::default()
+    };
+    for _ in 0..60 {
+        tick(&world, &mut state, &body, &profile, &mut intent);
+    }
+    assert!(state.crouching);
+    assert!(
+        state.motion.position.x > 1.0,
+        "crouched actor must pass under the ceiling: {:?}",
+        state.motion.position
+    );
+    // The same ceiling blocks a standing actor.
+    let mut standing = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut walk = CharacterIntent {
+        movement: Vec2::X,
+        ..Default::default()
+    };
+    for _ in 0..60 {
+        tick(&world, &mut standing, &body, &profile, &mut walk);
+    }
+    assert!(
+        standing.motion.position.x < 1.0,
+        "standing actor must be blocked: {:?}",
+        standing.motion.position
+    );
+}
+
+#[test]
 fn replay_restores_complete_motor_state_and_matches_human_adapter() {
     let world = tests::arena();
     let mut authority = actor(Vec3::new(0.5, 0.0, 0.5));
