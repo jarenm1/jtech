@@ -13,6 +13,7 @@ use std::{
 const MAX_PENDING: usize = 2 * 1024 * 1024;
 const IO_BUDGET: usize = 256 * 1024;
 const MESSAGE_BUDGET: usize = 64;
+const COMPACT_THRESHOLD: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrafficStats {
     pub received_bytes: u64,
@@ -22,6 +23,7 @@ pub struct TrafficStats {
 struct Framed {
     socket: TcpStream,
     input: Vec<u8>,
+    input_pos: usize,
     output: VecDeque<Vec<u8>>,
     offset: usize,
     pending: usize,
@@ -33,10 +35,24 @@ impl Framed {
         Ok(Self {
             socket,
             input: Vec::new(),
+            input_pos: 0,
             output: VecDeque::new(),
             offset: 0,
             pending: 0,
         })
+    }
+    fn compact_input(&mut self, force: bool) {
+        if self.input_pos == 0 {
+            return;
+        }
+        if force
+            || self.input_pos == self.input.len()
+            || self.input_pos >= COMPACT_THRESHOLD
+            || self.input_pos * 2 > self.input.len()
+        {
+            self.input.drain(..self.input_pos);
+            self.input_pos = 0;
+        }
     }
     fn queue(&mut self, message: &impl Serialize) -> io::Result<()> {
         let bytes = encode(message, MAX_FRAME)?;
@@ -53,7 +69,12 @@ impl Framed {
         self.output.push_back(frame);
         Ok(())
     }
-    fn poll<T: DeserializeOwned>(&mut self, stats: &mut TrafficStats) -> io::Result<Vec<T>> {
+    fn poll<T: DeserializeOwned>(
+        &mut self,
+        stats: &mut TrafficStats,
+        output: &mut Vec<T>,
+    ) -> io::Result<()> {
+        output.clear();
         let mut budget = IO_BUDGET;
         while budget > 0 {
             let Some(frame) = self.output.front() else {
@@ -77,6 +98,7 @@ impl Framed {
                 Err(e) => return Err(e),
             }
         }
+        self.compact_input(self.input.len() >= MAX_FRAME + 4);
         let mut buffer = [0_u8; 8192];
         let mut budget = IO_BUDGET;
         while budget > 0 && self.input.len() < MAX_FRAME + 4 {
@@ -96,30 +118,29 @@ impl Framed {
                 Err(e) => return Err(e),
             }
         }
-        let mut result = Vec::new();
-        let mut consumed = 0;
-        while result.len() < MESSAGE_BUDGET && self.input.len() - consumed >= 4 {
-            let length =
-                u32::from_le_bytes(self.input[consumed..consumed + 4].try_into().unwrap()) as usize;
+        while output.len() < MESSAGE_BUDGET && self.input.len() - self.input_pos >= 4 {
+            let length = u32::from_le_bytes(
+                self.input[self.input_pos..self.input_pos + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
             if length == 0 || length > MAX_FRAME {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid frame length",
                 ));
             }
-            if self.input.len() - consumed < length + 4 {
+            if self.input.len() - self.input_pos < length + 4 {
                 break;
             }
-            result.push(decode(
-                &self.input[consumed + 4..consumed + 4 + length],
+            output.push(decode(
+                &self.input[self.input_pos + 4..self.input_pos + 4 + length],
                 MAX_FRAME,
             )?);
-            consumed += length + 4;
+            self.input_pos += length + 4;
         }
-        if consumed > 0 {
-            self.input.drain(..consumed);
-        }
-        Ok(result)
+        self.compact_input(false);
+        Ok(())
     }
 }
 #[derive(Default)]
@@ -173,7 +194,8 @@ impl ClientTransport {
         }
     }
     pub fn poll(&mut self) -> io::Result<Incoming> {
-        let reliable = self.tcp.poll(&mut self.stats)?;
+        let mut reliable = Vec::new();
+        self.tcp.poll(&mut self.stats, &mut reliable)?;
         let mut snapshots = Vec::new();
         let mut bytes = [0_u8; MAX_DATAGRAM + 1];
         for _ in 0..64 {
@@ -206,6 +228,7 @@ struct Peer {
     connected: Instant,
     active: bool,
     last_seen: Instant,
+    scratch: Vec<ClientMessage>,
 }
 #[derive(Default)]
 pub struct ServerIncoming {
@@ -288,6 +311,7 @@ impl ServerTransport {
                             connected: Instant::now(),
                             active: false,
                             last_seen: Instant::now(),
+                            scratch: Vec::new(),
                         },
                     );
                 }
@@ -303,9 +327,12 @@ impl ServerTransport {
                 incoming.disconnected.push(id);
                 continue;
             }
-            match peer.tcp.poll::<ClientMessage>(&mut self.stats) {
-                Ok(messages) => {
-                    for message in messages {
+            match peer
+                .tcp
+                .poll::<ClientMessage>(&mut self.stats, &mut peer.scratch)
+            {
+                Ok(()) => {
+                    for message in peer.scratch.drain(..) {
                         if !peer.active {
                             if matches!(
                                 message,
@@ -390,13 +417,14 @@ mod tests {
             .unwrap();
         let mut framed = Framed::new(receiver).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
+        let mut messages = Vec::new();
         loop {
-            match framed.poll::<ClientMessage>(&mut TrafficStats::default()) {
+            match framed.poll::<ClientMessage>(&mut TrafficStats::default(), &mut messages) {
                 Err(error) => {
                     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
                     break;
                 }
-                Ok(_) => assert!(Instant::now() < deadline),
+                Ok(()) => assert!(Instant::now() < deadline),
             }
             std::thread::yield_now();
         }
