@@ -4,7 +4,7 @@ use super::active_terrain::{self, ActiveTerrain};
 use glam::{IVec3, Vec3};
 use gpu_physics::{Body, GpuPhysics, PlayerCollider, TerrainContact};
 use protocol::{MAX_PHYSICS_BODIES, PhysicsBodySnapshot};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use voxel_world::{CHUNK_SIZE, MAX_CHUNK_Y, MIN_CHUNK_Y, VoxelWorld, chunk_coord};
 
 pub(super) struct PhysicsSlice {
@@ -13,6 +13,8 @@ pub(super) struct PhysicsSlice {
     terrain: ActiveTerrain,
     bodies: Vec<Body>,
     ids: Vec<u32>,
+    /// Stable body ID -> GPU slot, mirroring `ids`; lookups avoid per-call ID scans.
+    id_to_slot: HashMap<u32, usize>,
     origins: Vec<IVec3>,
     next_id: u32,
     impulses: Vec<(u32, [f32; 3])>,
@@ -50,6 +52,7 @@ impl PhysicsSlice {
             terrain: ActiveTerrain::default(),
             bodies: Vec::new(),
             ids: Vec::new(),
+            id_to_slot: HashMap::new(),
             origins: Vec::new(),
             next_id: 1,
             impulses: Vec::new(),
@@ -142,6 +145,7 @@ impl PhysicsSlice {
         body.set_damage_joules(damage);
         self.impulses.push((self.next_id, impulse.to_array()));
         self.bodies.push(body);
+        self.id_to_slot.insert(self.next_id, self.ids.len());
         self.ids.push(self.next_id);
         self.origins.push(origin);
         self.revision += 1;
@@ -157,7 +161,7 @@ impl PhysicsSlice {
         load: &super::explosion::BlastLoad,
     ) -> Option<(IVec3, u8)> {
         assert!(!self.is_busy() && !self.failed);
-        let slot = self.ids.iter().position(|&old| old == id)?;
+        let slot = *self.id_to_slot.get(&id)?;
         let body = &mut self.bodies[slot];
         let material = gpu_physics::material(body.material);
         body.set_damage_joules(
@@ -179,12 +183,15 @@ impl PhysicsSlice {
         }
         // Do not regrid a sleeping body before its reserved blast impulse runs.
         body.damage_sleep &= 0xffff;
-        let pending: Vec3 = self
+        // At most one entry per body ID is queued; merge the new momentum into it.
+        let existing = self
             .impulses
-            .iter()
-            .filter(|(old, _)| *old == id)
-            .map(|(_, impulse)| Vec3::from_array(*impulse))
-            .sum();
+            .iter_mut()
+            .find(|(old, _)| *old == id)
+            .map(|(_, impulse)| impulse);
+        let pending: Vec3 = existing
+            .as_ref()
+            .map_or(Vec3::ZERO, |impulse| Vec3::from_array(**impulse));
         let velocity = Vec3::from_array(body.velocity) + pending / material.density;
         let impulse = super::explosion::kinetic_impulse(
             material.density,
@@ -192,7 +199,7 @@ impl PhysicsSlice {
             load.direction,
             load.kinetic_energy,
         );
-        if let Some((_, queued)) = self.impulses.iter_mut().find(|(old, _)| *old == id) {
+        if let Some(queued) = existing {
             *queued = (Vec3::from_array(*queued) + impulse).to_array();
         } else {
             self.impulses.push((id, impulse.to_array()));
@@ -289,17 +296,15 @@ impl PhysicsSlice {
 
     /// Latest observed body position; `None` for unknown ids.
     pub fn body_position(&self, id: u32) -> Option<Vec3> {
-        self.ids
-            .iter()
-            .position(|&old| old == id)
-            .map(|slot| Vec3::from_array(self.bodies[slot].position))
+        self.id_to_slot
+            .get(&id)
+            .map(|&slot| Vec3::from_array(self.bodies[slot].position))
     }
 
     pub fn body_damage(&self, id: u32) -> f32 {
-        self.ids
-            .iter()
-            .position(|&old| old == id)
-            .map_or(0.0, |slot| self.bodies[slot].damage_joules())
+        self.id_to_slot
+            .get(&id)
+            .map_or(0.0, |&slot| self.bodies[slot].damage_joules())
     }
 
 
@@ -339,17 +344,22 @@ impl PhysicsSlice {
         if self.failed {
             return vec![nearest];
         }
-        let Some(slot) = self.ids.iter().position(|&body_id| body_id == id) else {
+        let Some(&slot) = self.id_to_slot.get(&id) else {
             return Vec::new();
         };
         nearby_cells(Vec3::from_array(self.bodies[slot].position))
     }
     pub fn remove(&mut self, id: u32) {
-        if let Some(slot) = self.ids.iter().position(|&old| old == id) {
+        if let Some(slot) = self.id_to_slot.remove(&id) {
+            // ids order (stable IDs) sets deterministic claim order in settling, so
+            // keep the remaining slots in place and rewrite only the shifted tail.
             self.ids.remove(slot);
             self.bodies.remove(slot);
             self.impulses.retain(|(body_id, _)| *body_id != id);
             self.origins.remove(slot);
+            for (slot, &id) in self.ids.iter().enumerate().skip(slot) {
+                self.id_to_slot.insert(id, slot);
+            }
             self.revision += 1;
             self.bodies_dirty = true;
         }
@@ -412,7 +422,7 @@ impl PhysicsSlice {
                 self.bodies_dirty = false;
             }
             for (id, impulse) in self.impulses.drain(..) {
-                if let Some(slot) = self.ids.iter().position(|&old| old == id) {
+                if let Some(&slot) = self.id_to_slot.get(&id) {
                     gpu.impulse(slot, impulse)?;
                 }
             }
