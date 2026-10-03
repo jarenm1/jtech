@@ -76,19 +76,28 @@ fn sanitize(motor: &mut Motor, character: &mut CharacterState) {
 
 /// Repair snapshot overlap, then refresh support with a shallow downward probe.
 fn contact(motor: &mut Motor, character: &mut CharacterState) {
-    let state = &mut character.motion;
-    physics::separate_bodies(motor.world, state, motor.bodies, motor.body.shape);
-    let mut probe = state.position;
-    state.grounded = state.velocity.y <= 0.0
-        && physics::sweep_with_bodies(
-            motor.world,
-            &mut probe,
-            1,
-            -0.002,
-            motor.bodies,
-            None,
-            motor.body.shape,
-        );
+    let grounded = {
+        let state = &mut character.motion;
+        physics::separate_bodies(motor.world, state, motor.bodies, motor.body.shape);
+        let mut probe = state.position;
+        state.velocity.y <= 0.0
+            && physics::sweep_with_bodies(
+                motor.world,
+                &mut probe,
+                1,
+                -0.002,
+                motor.bodies,
+                None,
+                motor.body.shape,
+            )
+    };
+    character.motion.grounded = grounded;
+    // Coyote time: keep a jump available briefly after walking off an edge.
+    character.coyote = if grounded {
+        motor.profile.coyote_ticks
+    } else {
+        character.coyote.saturating_sub(1)
+    };
 }
 
 /// Turn held body-relative input into a target horizontal velocity and
@@ -135,10 +144,21 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
 
 /// Admit a grounded jump, then integrate gravity.
 fn gravity(motor: &mut Motor, character: &mut CharacterState) {
+    // Buffer the press so a jump requested just before landing still fires.
+    character.jump_buffer = if motor.input.jump {
+        motor.profile.jump_buffer_ticks
+    } else {
+        character.jump_buffer.saturating_sub(1)
+    };
     let state = &mut character.motion;
-    if motor.input.jump && motor.profile.jump_speed > 0.0 && state.grounded {
+    if character.jump_buffer > 0
+        && (state.grounded || character.coyote > 0)
+        && motor.profile.jump_speed > 0.0
+    {
         state.velocity.y = motor.profile.jump_speed;
         state.grounded = false;
+        character.jump_buffer = 0;
+        character.coyote = 0;
     }
     state.velocity.y = (state.velocity.y - motor.profile.gravity * motor.dt).clamp(-60.0, 60.0);
 }

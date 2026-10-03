@@ -12,7 +12,9 @@ pub use plugin::{ControllerPlugin, ControllerSet, ObservedBodies};
 
 /// Held body-relative axes: +X right, +Y forward (-Z at yaw zero).
 /// Turn is a held fraction of the profile's maximum yaw rate; positive turns left.
-/// Jump is a one-tick request, consumed even when airborne. No automatic buffering.
+/// Jump is a one-tick request, consumed even when airborne; the motor buffers it
+/// and applies coyote time so presses just before landing or just after leaving
+/// the ground still fire.
 /// Attack is a one-tick action edge: the motor ignores it, and the host's combat
 /// system consumes and clears it each tick so policies submit it like jump.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -73,6 +75,10 @@ pub struct MovementProfile {
     pub speed: f32,
     /// Target-speed multiplier while sprinting.
     pub sprint_mult: f32,
+    /// Ticks after leaving the ground during which a jump still fires.
+    pub coyote_ticks: u8,
+    /// Ticks a jump request stays buffered while airborne.
+    pub jump_buffer_ticks: u8,
     pub acceleration: f32,
     pub braking: f32,
     pub air_control: f32,
@@ -88,6 +94,8 @@ impl Default for MovementProfile {
         Self {
             speed: 6.0,
             sprint_mult: 1.5,
+            coyote_ticks: 6,
+            jump_buffer_ticks: 6,
             acceleration: 10_000.0,
             braking: 10_000.0,
             air_control: 1.0,
@@ -105,6 +113,8 @@ impl MovementProfile {
         Self {
             speed: finite(self.speed).clamp(0.0, 60.0),
             sprint_mult: finite(self.sprint_mult).clamp(1.0, 4.0),
+            coyote_ticks: self.coyote_ticks.min(60),
+            jump_buffer_ticks: self.jump_buffer_ticks.min(60),
             acceleration: finite(self.acceleration).clamp(0.0, 10_000.0),
             braking: finite(self.braking).clamp(0.0, 10_000.0),
             air_control: finite(self.air_control).clamp(0.0, 1.0),
@@ -186,6 +196,10 @@ pub struct CharacterState {
     pub yaw: f32,
     pub mode: Mode,
     pub statuses: StatusList,
+    /// Ticks of coyote time remaining after leaving the ground.
+    pub coyote: u8,
+    /// Ticks a buffered jump request stays live.
+    pub jump_buffer: u8,
 }
 impl CharacterState {
     pub fn apply_impulse(&mut self, body: &CharacterBody, impulse: Vec3) {

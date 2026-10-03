@@ -263,6 +263,52 @@ fn sprint_scales_target_speed_by_the_profile_multiplier() {
 }
 
 #[test]
+fn buffered_jump_fires_on_landing() {
+    let world = tests::arena();
+    let body = CharacterBody::default();
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.45, 0.5));
+    let mut intent = CharacterIntent {
+        jump: true,
+        ..Default::default()
+    };
+    tick(&world, &mut state, &body, &profile, &mut intent);
+    assert!(
+        state.motion.velocity.y <= 0.0,
+        "an airborne press must not jump immediately"
+    );
+    for _ in 0..10 {
+        tick(&world, &mut state, &body, &profile, &mut intent);
+    }
+    assert!(
+        state.motion.velocity.y > 0.0,
+        "the buffered press must fire on landing"
+    );
+}
+
+#[test]
+fn coyote_time_allows_a_jump_just_after_leaving_the_ground() {
+    let world = tests::arena();
+    let body = CharacterBody::default();
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut idle = CharacterIntent::default();
+    tick(&world, &mut state, &body, &profile, &mut idle);
+    assert!(state.motion.grounded && state.coyote > 0);
+    // Step off the edge: airborne, but still inside the coyote window.
+    state.motion.position.y = 0.0;
+    let mut jump = CharacterIntent {
+        jump: true,
+        ..Default::default()
+    };
+    tick(&world, &mut state, &body, &profile, &mut jump);
+    assert!(
+        state.motion.velocity.y > 0.0,
+        "a press inside the coyote window must still jump"
+    );
+}
+
+#[test]
 fn replay_restores_complete_motor_state_and_matches_human_adapter() {
     let world = tests::arena();
     let mut authority = actor(Vec3::new(0.5, 0.0, 0.5));
