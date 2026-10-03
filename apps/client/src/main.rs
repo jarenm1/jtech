@@ -1211,6 +1211,14 @@ fn predict(
             descend,
             noclip: session.noclip_requested,
             attack: session.consume_attack(),
+            sprint: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+            crouch: keys.pressed(KeyCode::KeyC),
+            ability: [
+                keys.just_pressed(KeyCode::KeyQ),
+                keys.just_pressed(KeyCode::KeyE),
+                keys.just_pressed(KeyCode::KeyR),
+            ],
+            aim: [0.0, 1.0],
         };
         session.predict_input(&world, input, colliders);
     }

@@ -22,8 +22,8 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
         }
     }
     let mut player = Player::new();
-    player.state.position = Vec3::new(16.5, 10.0, 16.5);
-    player.state.grounded = true;
+    player.state.motion.position = Vec3::new(16.5, 10.0, 16.5);
+    player.state.motion.grounded = true;
     {
         let mut sim = app.world_mut().resource_mut::<Simulation>();
         sim.players.insert(1, player);
@@ -37,8 +37,8 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
         app.update();
         let sim = app.world().resource::<Simulation>();
         let state = sim.players[&1].state;
-        peak = peak.max(state.position.y);
-        launch_speed = launch_speed.max(state.velocity.y);
+        peak = peak.max(state.motion.position.y);
+        launch_speed = launch_speed.max(state.motion.velocity.y);
         if gpu {
             app.world_mut()
                 .resource_scope(|world, mut sim: Mut<Simulation>| {

@@ -74,8 +74,8 @@ mod tests {
                 .unwrap(),
             );
             let mut player = Player::new();
-            player.state.position = app.world().resource::<Simulation>().spawn;
-            player.state.noclip = true;
+            player.state.motion.position = app.world().resource::<Simulation>().spawn;
+            player.state.motion.noclip = true;
             player.input.noclip = true;
             app.world_mut()
                 .resource_mut::<Simulation>()

@@ -8,7 +8,7 @@ fn flight_inputs_replicate_and_missing_input_hovers_without_body_push() {
     world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
     app.insert_resource(world);
     let mut player = Player::new();
-    player.state.position = Vec3::new(4.0, 8.0, 4.0);
+    player.state.motion.position = Vec3::new(4.0, 8.0, 4.0);
     let input = PlayerInput {
         sequence: 1,
         noclip: true,
@@ -24,10 +24,10 @@ fn flight_inputs_replicate_and_missing_input_hovers_without_body_push() {
     app.update();
     let sim = app.world().resource::<Simulation>();
     let player = &sim.players[&1];
-    assert!(player.state.noclip);
-    assert!(player.state.position.y < 8.0);
+    assert!(player.state.motion.noclip);
+    assert!(player.state.motion.position.y < 8.0);
     assert_eq!(player.body_push_velocity, Vec3::ZERO);
-    let position = player.state.position;
+    let position = player.state.motion.position;
     let snapshot = player.snapshot(1);
     let bytes = protocol::encode(&snapshot, protocol::MAX_DATAGRAM).unwrap();
     let received: PlayerSnapshot = protocol::decode(&bytes, protocol::MAX_DATAGRAM).unwrap();
@@ -36,8 +36,8 @@ fn flight_inputs_replicate_and_missing_input_hovers_without_body_push() {
         app.update();
     }
     let sim = app.world().resource::<Simulation>();
-    assert_eq!(sim.players[&1].state.position, position);
-    assert_eq!(sim.players[&1].state.velocity, Vec3::ZERO);
+    assert_eq!(sim.players[&1].state.motion.position, position);
+    assert_eq!(sim.players[&1].state.motion.velocity, Vec3::ZERO);
     app.world_mut()
         .resource_mut::<Simulation>()
         .players
@@ -50,6 +50,6 @@ fn flight_inputs_replicate_and_missing_input_hovers_without_body_push() {
         });
     app.update();
     let state = app.world().resource::<Simulation>().players[&1].state;
-    assert!(!state.noclip);
-    assert!(state.velocity.y < 0.0);
+    assert!(!state.motion.noclip);
+    assert!(state.motion.velocity.y < 0.0);
 }

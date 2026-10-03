@@ -2,7 +2,6 @@ use super::*;
 use controller::step_player;
 use protocol::PlayerSnapshot;
 use voxel_world::{AIR, STONE};
-
 fn arena() -> VoxelWorld {
     let mut world = VoxelWorld::default();
     for x in -1..=1 {
@@ -19,7 +18,6 @@ fn arena() -> VoxelWorld {
     }
     world
 }
-
 #[test]
 fn reconciliation_preserves_blast_momentum_through_input_replay() {
     let world = arena();
@@ -77,7 +75,6 @@ fn reconciliation_preserves_blast_momentum_through_input_replay() {
     reconcile(&mut client, &world, &snapshot, &[]);
     assert_eq!(client.state, expected);
 }
-
 #[test]
 fn reconciliation_copies_authoritative_health_without_predicting_damage() {
     let world = arena();
@@ -114,18 +111,15 @@ fn reconciliation_copies_authoritative_health_without_predicting_damage() {
     reconcile(&mut client, &world, &snapshot, &[]);
     assert_eq!(client.health, health);
     assert!(client.state.position.x > start.position.x);
-
     snapshot.tick += 1;
     snapshot.you.health.damage(u16::MAX);
     reconcile(&mut client, &world, &snapshot, &[]);
     assert!(client.health.is_depleted());
-
     snapshot.tick += 1;
     snapshot.you.health.heal(20);
     reconcile(&mut client, &world, &snapshot, &[]);
     assert_eq!(client.health, snapshot.you.health);
 }
-
 #[test]
 fn movement_prediction_preserves_replicated_health() {
     let world = arena();
@@ -159,7 +153,6 @@ fn movement_prediction_preserves_replicated_health() {
         assert_eq!(client.pending.len(), 20);
     }
 }
-
 #[test]
 fn health_hud_bar_tracks_authoritative_fraction() {
     let mut app = App::new();
@@ -179,7 +172,6 @@ fn health_hud_bar_tracks_authoritative_fraction() {
         assert_eq!(fills.single(world).unwrap().width, percent(expected_width));
     }
 }
-
 #[test]
 fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_physics() {
     let world = arena();
@@ -250,7 +242,6 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
     assert!(client.pending.is_empty());
     assert_eq!(client.state, expected);
 }
-
 #[test]
 fn terrain_changes_are_used_when_replaying_prediction() {
     let mut world = arena();
@@ -298,7 +289,6 @@ fn terrain_changes_are_used_when_replaying_prediction() {
     assert!((client.state.position.x - 0.7).abs() < 0.0001);
     assert!(!physics::overlaps_block(&client.state, IVec3::new(1, 0, 0)));
 }
-
 #[test]
 fn reconciliation_uses_authoritative_loose_block_colliders() {
     let world = arena();
@@ -342,7 +332,6 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
     );
     assert!((client.state.position.x - 0.7).abs() < 0.001);
 }
-
 #[test]
 fn action_feedback_tracks_partial_hits_destruction_and_rejections() {
     let mut client = ClientSession::default();
@@ -369,7 +358,6 @@ fn action_feedback_tracks_partial_hits_destruction_and_rejections() {
     assert_eq!(client.last_action, Some(rejected));
     assert_eq!(client.accepted_edits, 3);
     assert_eq!(client.rejected_edits, 1);
-
     let placed = ActionResult {
         request: 5,
         accepted: true,
@@ -380,7 +368,6 @@ fn action_feedback_tracks_partial_hits_destruction_and_rejections() {
     assert_eq!(client.last_action, Some(placed));
     assert_eq!(client.accepted_edits, 4);
 }
-
 #[test]
 fn delayed_launch_result_does_not_replace_newer_hit_feedback() {
     let mut client = ClientSession::default();
@@ -401,7 +388,6 @@ fn delayed_launch_result_does_not_replace_newer_hit_feedback() {
     assert_eq!(client.accepted_edits, 1);
     assert_eq!(client.rejected_edits, 1);
 }
-
 #[test]
 fn bow_slot_selection_and_untargeted_shot_routing() {
     let mut keys = ButtonInput::<KeyCode>::default();
@@ -432,7 +418,6 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
     client.selected = selected_slot(&keys).unwrap();
     assert!(block_action(&mut client, &world, false, false, true).is_none());
 }
-
 #[test]
 fn bow_requests_copy_each_selected_power() {
     let mut client = ClientSession {
@@ -457,7 +442,6 @@ fn bow_requests_copy_each_selected_power() {
         ));
     }
 }
-
 #[test]
 fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
     let mut app = App::new();
@@ -543,7 +527,6 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
         BowPower::Standard
     );
 }
-
 #[test]
 fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
     let mut client = ClientSession {
@@ -582,7 +565,6 @@ fn bow_cadence_changes_immediately_and_zero_rate_disables_firing() {
     assert!(!repeat_bow(&mut repeat, 1.0, true, 0));
     assert!(repeat_bow(&mut repeat, 1.1, true, 25));
 }
-
 #[test]
 fn reconciliation_replays_flight_mode_and_returns_to_walking() {
     let world = arena();
@@ -656,7 +638,6 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
     assert!(!client.state.noclip);
     assert!(client.state.velocity.y < 0.0);
 }
-
 #[test]
 fn camera_far_distance_covers_vertical_corner_of_view_region() {
     // The interest square reaches (MAX_VIEW_RADIUS + 2) chunks along each
@@ -671,14 +652,13 @@ fn camera_far_distance_covers_vertical_corner_of_view_region() {
         "far plane {far} clips corner {corner}"
     );
 }
-
 fn snapshot(tick: u64, life: u64, state: PlayerState, health: Health) -> Snapshot {
     Snapshot {
         tick,
         you: PlayerSnapshot {
             id: 1,
             last_input: 0,
-            state,
+            state: state,
             health,
             life,
             yaw: 0.0,
@@ -687,7 +667,6 @@ fn snapshot(tick: u64, life: u64, state: PlayerState, health: Health) -> Snapsho
         actors: vec![],
     }
 }
-
 #[test]
 fn reordered_snapshots_ignore_stale_life_and_state() {
     let world = arena();
@@ -727,7 +706,6 @@ fn reordered_snapshots_ignore_stale_life_and_state() {
     assert_eq!(client.state, current);
     assert_eq!(client.last_tick, 5);
 }
-
 #[test]
 fn life_change_resets_replay_presentation_noclip_and_sequence() {
     let world = arena();
@@ -767,7 +745,6 @@ fn life_change_resets_replay_presentation_noclip_and_sequence() {
     assert!(!client.noclip_requested);
     assert_eq!(client.sequence, 12, "sequence stays monotonic");
 }
-
 #[test]
 fn life_change_applies_even_when_the_snapshot_is_still_dead() {
     let world = arena();
@@ -796,7 +773,6 @@ fn life_change_applies_even_when_the_snapshot_is_still_dead() {
     assert!(!client.noclip_requested);
     assert!(client.health.is_depleted());
 }
-
 #[test]
 fn dead_reconciliation_discards_local_replay_and_keeps_sequence_monotonic() {
     let world = arena();
@@ -830,7 +806,6 @@ fn dead_reconciliation_discards_local_replay_and_keeps_sequence_monotonic() {
     assert_eq!(client.correction, Vec3::ZERO);
     assert_eq!(client.sequence, 40);
 }
-
 #[test]
 fn input_packets_and_respawn_requests_carry_observed_life() {
     let client = ClientSession {
@@ -858,7 +833,6 @@ fn input_packets_and_respawn_requests_carry_observed_life() {
         ClientMessage::Respawn { life: 5 }
     ));
 }
-
 #[test]
 fn controls_block_look_and_slot_changes_while_dead() {
     let mut app = App::new();
@@ -892,13 +866,11 @@ fn controls_block_look_and_slot_changes_while_dead() {
     app.update();
     assert_eq!(app.world().resource::<ClientSession>().selected, 3);
     assert_eq!(app.world().resource::<ClientSession>().yaw, yaw);
-
     app.world_mut().resource_mut::<ClientSession>().health = Health::default();
     app.update();
     assert_eq!(app.world().resource::<ClientSession>().selected, 6);
     assert_ne!(app.world().resource::<ClientSession>().yaw, yaw);
 }
-
 #[test]
 fn death_heartbeat_keeps_sending_without_prediction_or_sequence_growth() {
     let mut client = ClientSession {
@@ -924,7 +896,6 @@ fn death_heartbeat_keeps_sending_without_prediction_or_sequence_growth() {
     assert_eq!(client.sequence, 40);
     assert_eq!(client.state, state);
 }
-
 #[test]
 fn ground_jump_edge_survives_render_only_frames_and_fires_once_per_catchup() {
     let mut session = ClientSession::default();
@@ -939,7 +910,6 @@ fn ground_jump_edge_survives_render_only_frames_and_fires_once_per_catchup() {
     assert!(session.consume_jump(true, true));
     assert!(!session.consume_jump(true, false));
 }
-
 #[test]
 fn left_click_plays_swing_animation_without_a_melee_target() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

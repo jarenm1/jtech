@@ -249,7 +249,7 @@ impl Plugin for SimulationPlugin {
     }
 }
 struct Player {
-    state: PlayerState,
+    state: controller::CharacterState,
     health: Health,
     life: u64,
     respawn_requested: bool,
@@ -289,7 +289,7 @@ struct AssetDownload {
 impl Player {
     fn new() -> Self {
         Self {
-            state: PlayerState::default(),
+            state: controller::CharacterState::default(),
             health: Health::default(),
             life: 0,
             respawn_requested: false,
@@ -319,10 +319,10 @@ impl Player {
         PlayerSnapshot {
             id,
             last_input: self.last_input,
-            state: self.state,
+            state: self.state.motion,
             health: self.health,
             life: self.life,
-            yaw: self.input.yaw,
+            yaw: self.state.yaw,
         }
     }
     fn enqueue(&mut self, input: PlayerInput) {
@@ -697,7 +697,7 @@ impl Simulation {
         // Re-raycast the validated aim: the dig sphere centers just inside
         // the struck surface, not on the cell the client named.
         let player = &self.players[&id];
-        let eye = player.state.position + Vec3::Y * EYE_HEIGHT;
+        let eye = player.state.motion.position + Vec3::Y * EYE_HEIGHT;
         let direction = look_direction(player.input.yaw, player.input.pitch);
         let hit = world
             .raycast(eye, direction, 6.0)
@@ -917,9 +917,9 @@ impl Simulation {
                             && !self
                                 .players
                                 .values()
-                                .any(|p| overlaps_block(&p.state, target))
+                                .any(|p| overlaps_block(&p.state.motion, target))
                     } else {
-                        can_settle(world, target, self.players.values().map(|p| &p.state))
+                        can_settle(world, target, self.players.values().map(|p| &p.state.motion))
                     })
                     && !physics.overlaps_except(target, id)
                     && (self.damage.len() < MAX_DAMAGED_BLOCKS
@@ -974,10 +974,10 @@ impl Simulation {
             physics.set_player_colliders(
                 players
                     .into_iter()
-                    .filter(|(_, player)| !player.state.noclip && !player.health.is_depleted())
+                    .filter(|(_, player)| !player.state.motion.noclip && !player.health.is_depleted())
                     .enumerate()
                     .map(|(slot, (_, player))| gpu_physics::PlayerCollider {
-                        position: player.state.position.to_array(),
+                        position: player.state.motion.position.to_array(),
                         id: slot as u32,
                         velocity: player.body_push_velocity.to_array(),
                         padding: 0,
@@ -1067,7 +1067,7 @@ fn validate_edit_target(
     }
     if !world
         .raycast(
-            player.state.position + Vec3::Y * EYE_HEIGHT,
+            player.state.motion.position + Vec3::Y * EYE_HEIGHT,
             look_direction(player.input.yaw, player.input.pitch),
             6.0,
         )
@@ -1177,7 +1177,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             sim.drop_player(id);
             continue;
         };
-        player.state.position = position;
+        player.state.motion.position = position;
         let melee = sim.packages.melee_table();
         for &(item, count) in melee.spawn_items() {
             if melee.kind(item) == protocol::ItemKind::Equipment {
@@ -1188,7 +1188,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 player.inventory.add(item, count);
             }
         }
-        let spawn = player.state;
+        let spawn = player.state.motion;
         let health = player.health;
         let inventory = player.inventory.clone();
         sim.players.insert(id, player);
@@ -1236,8 +1236,8 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 attack: false,
                 ..player.input
             };
-            player.state.velocity = Vec3::ZERO;
-            player.state.external_velocity = glam::Vec2::ZERO;
+            player.state.motion.velocity = Vec3::ZERO;
+            player.state.motion.external_velocity = glam::Vec2::ZERO;
             player.body_push_velocity = Vec3::ZERO;
         } else {
             let input = if let Some((sequence, input)) = player.pending.pop_first() {
@@ -1256,7 +1256,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             // The same pass reports the horizontal velocity attempted before
             // loose bodies clamped the sweep; the GPU resolves that kinematic
             // push against material mass and terrain.
-            let attempted = controller::step_player_with_bodies(
+            let attempted = controller::step_character_player(
                 &world,
                 &mut player.state,
                 &input,
@@ -1264,36 +1264,36 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 &bodies,
             );
             player.body_push_velocity =
-                Vec3::new(attempted.x, player.state.velocity.y, attempted.y);
-            if player.state.noclip {
+                Vec3::new(attempted.x, player.state.motion.velocity.y, attempted.y);
+            if player.state.motion.noclip {
                 player.body_push_velocity = Vec3::ZERO;
             }
-            if !player.state.position.is_finite()
-                || player.state.position.x.abs() >= 31_999_900.0
-                || player.state.position.z.abs() >= 31_999_900.0
+            if !player.state.motion.position.is_finite()
+                || player.state.motion.position.x.abs() >= 31_999_900.0
+                || player.state.motion.position.z.abs() >= 31_999_900.0
             {
                 player.state = previous;
-                player.state.velocity = Vec3::ZERO;
+                player.state.motion.velocity = Vec3::ZERO;
             }
         }
-        let center = chunk_coord(player.state.position.floor().as_ivec3());
+        let center = chunk_coord(player.state.motion.position.floor().as_ivec3());
         if player.interest_center != Some(center) || player.terrain_revision != sim.terrain.revision
         {
             player.interest = interests(
-                player.state.position,
+                player.state.motion.position,
                 sim.config.radius,
                 &sim.terrain.bounds,
                 sim.journal.keys().copied(),
             );
             player.safety = interests(
-                player.state.position,
+                player.state.motion.position,
                 sim.config.radius + 1,
                 &sim.terrain.bounds,
                 sim.journal.keys().copied(),
             );
             player
                 .safety
-                .extend(terrain_stream::local_chunks(player.state.position, 3));
+                .extend(terrain_stream::local_chunks(player.state.motion.position, 3));
             player.interest_center = Some(center);
             player.terrain_revision = sim.terrain.revision;
         }
@@ -1386,7 +1386,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
             sim.players
                 .values()
                 .map(|p| {
-                    let delta = *coord - chunk_coord(p.state.position.floor().as_ivec3());
+                    let delta = *coord - chunk_coord(p.state.motion.position.floor().as_ivec3());
                     delta.as_vec3().length_squared() as u64
                 })
                 .min()
@@ -1399,7 +1399,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     let centers: Vec<_> = sim
         .players
         .values()
-        .map(|p| chunk_coord(p.state.position.floor().as_ivec3()))
+        .map(|p| chunk_coord(p.state.motion.position.floor().as_ivec3()))
         .collect();
     sim.terrain.survey(&centers, sim.config.radius + 2);
     let evicted: Vec<_> = world
@@ -1444,7 +1444,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         let Some(player) = sim.players.get(id) else {
             continue;
         };
-        let center = chunk_coord(player.state.position.floor().as_ivec3());
+        let center = chunk_coord(player.state.motion.position.floor().as_ivec3());
         let available: Vec<_> = player
             .interest
             .iter()
@@ -1496,7 +1496,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         // scan plus a Vec per recipient.
         let mut player_buckets: HashMap<IVec3, Vec<PlayerSnapshot>> = HashMap::new();
         for (&id, player) in &sim.players {
-            let chunk = chunk_coord(player.state.position.floor().as_ivec3());
+            let chunk = chunk_coord(player.state.motion.position.floor().as_ivec3());
             player_buckets
                 .entry(chunk)
                 .or_default()
@@ -1641,7 +1641,7 @@ mod tests {
         let target = IVec3::new(2, 3, 2);
         world.set_block(target, 5).unwrap();
         let mut player = Player::new();
-        player.state.position = Vec3::new(2.5, 2.0, 5.5);
+        player.state.motion.position = Vec3::new(2.5, 2.0, 5.5);
         player.interest.insert(IVec3::ZERO);
         player.known.insert(IVec3::ZERO, 1);
         assert!(valid_player_edit(&world, &player, 100, 1, target, 0, 1));
@@ -1667,7 +1667,7 @@ mod tests {
         }
         let dummy = sim.spawn_actor(Vec3::new(2.5, 1.0, 0.5)).unwrap();
         let mut player = Player::new();
-        player.state.position = Vec3::new(2.5, 1.0, 3.5);
+        player.state.motion.position = Vec3::new(2.5, 1.0, 3.5);
         player.input.pitch = 0.0;
         player.input.yaw = 0.0; // -Z faces the dummy
         player.input.attack = true;
@@ -1716,7 +1716,7 @@ mod tests {
         }
         let dummy = sim.spawn_actor(Vec3::new(2.5, 1.0, 0.5)).unwrap();
         let mut player = Player::new();
-        player.state.position = Vec3::new(2.5, 1.0, 3.5);
+        player.state.motion.position = Vec3::new(2.5, 1.0, 3.5);
         player.input.pitch = 0.0;
         player.input.yaw = 0.0;
         player.input.attack = true;
@@ -1955,8 +1955,8 @@ mod tests {
         let (world, mut sim) = take_resources(&mut app);
         let mut player = Player::new();
         player.health.damage(u16::MAX);
-        player.state.position = Vec3::new(0.5, 40.0, 0.5);
-        let position = player.state.position;
+        player.state.motion.position = Vec3::new(0.5, 40.0, 0.5);
+        let position = player.state.motion.position;
         player.body_push_velocity = Vec3::new(3.0, 0.0, 0.0);
         player.input.movement = [1.0, 0.0];
         player.enqueue(PlayerInput {
@@ -1971,8 +1971,8 @@ mod tests {
         let sim = app.world().resource::<Simulation>();
         let player = &sim.players[&1];
         assert!(player.health.is_depleted());
-        assert_eq!(player.state.position, position);
-        assert_eq!(player.state.velocity, Vec3::ZERO);
+        assert_eq!(player.state.motion.position, position);
+        assert_eq!(player.state.motion.velocity, Vec3::ZERO);
         assert_eq!(player.body_push_velocity, Vec3::ZERO);
         assert_eq!(player.last_input, 1);
         assert!(player.pending.is_empty());
@@ -2068,7 +2068,7 @@ mod tests {
         assert!(sim.drops[0].snapshot.position.y < settled.y);
 
         let mut player = Player::new();
-        player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+        player.state.motion.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
         sim.players.insert(1, player);
         sim.collect_drops();
         assert!(sim.drops.is_empty());
@@ -2112,7 +2112,7 @@ mod tests {
         let (_floor, ground) = drop_arena(&mut world, &sim);
 
         let mut player = Player::new();
-        player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+        player.state.motion.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
         player.inventory.add(u32::from(voxel_world::STONE), 1_000_000);
         sim.players.insert(1, player);
         sim.spawn_drop(ground.as_vec3() + Vec3::splat(0.5), u32::from(voxel_world::STONE), 3);
@@ -2137,7 +2137,7 @@ mod tests {
         let (_floor, ground) = drop_arena(&mut world, &sim);
 
         let mut player = Player::new();
-        player.state.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
+        player.state.motion.position = ground.as_vec3() + Vec3::new(0.5, 0.0, 0.5);
         player.inventory.add_equipment(7);
         sim.players.insert(1, player);
         // A second knife drop is collected, not refused or merged.
@@ -2208,12 +2208,12 @@ mod tests {
             }
         }
         let mut attacker = Player::new();
-        attacker.state.position = Vec3::new(2.5, 1.0, 3.5);
+        attacker.state.motion.position = Vec3::new(2.5, 1.0, 3.5);
         attacker.input.yaw = 0.0; // -Z faces the victim
         attacker.input.attack = true;
         sim.players.insert(1, attacker);
         let mut victim = Player::new();
-        victim.state.position = Vec3::new(2.5, 1.0, 0.5);
+        victim.state.motion.position = Vec3::new(2.5, 1.0, 0.5);
         sim.players.insert(2, victim);
 
         sim.tick = 100;
