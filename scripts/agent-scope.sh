@@ -2,29 +2,36 @@
 # Run an agent command inside a resource-capped systemd user scope.
 #
 # Caps CPU and memory so parallel agents cannot saturate the workstation, and
-# optionally serializes GPU access behind a lock. See AGENTS.md, "Resource
-# governance".
+# optionally serializes GPU access behind a lock. Every scope also joins one
+# shared slice whose aggregate cap bounds the total across all agents, not just
+# each scope. See AGENTS.md, "Resource governance".
 #
 #   scripts/agent-scope.sh -- cargo test -p simulation
 #   scripts/agent-scope.sh --cpu-quota 200% -- cargo build
 #   scripts/agent-scope.sh --gpu -- cargo run -p voxel-client -- --headless ...
 #
-# Environment overrides: AGENT_CPU_QUOTA, AGENT_MEMORY_MAX, AGENT_GPU_LOCK.
+# Environment overrides: AGENT_CPU_QUOTA, AGENT_MEMORY_MAX, AGENT_GPU_LOCK,
+# AGENT_SLICE, AGENT_SLICE_CPU_QUOTA, AGENT_SLICE_MEMORY_MAX.
 set -euo pipefail
 
 cpu_quota="${AGENT_CPU_QUOTA:-400%}"
 memory_max="${AGENT_MEMORY_MAX:-8G}"
 gpu_lock="${AGENT_GPU_LOCK:-${XDG_RUNTIME_DIR:-/tmp}/jtech-agent-gpu.lock}"
+slice="${AGENT_SLICE:-agents.slice}"
+slice_cpu_quota="${AGENT_SLICE_CPU_QUOTA:-600%}"
+slice_memory_max="${AGENT_SLICE_MEMORY_MAX:-16G}"
 gpu=0
 
 usage() {
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cpu-quota) cpu_quota="$2"; shift 2 ;;
         --memory-max) memory_max="$2"; shift 2 ;;
+        --slice) slice="$2"; shift 2 ;;
+        --no-slice) slice=""; shift ;;
         --gpu) gpu=1; shift ;;
         -h | --help)
             usage
@@ -60,8 +67,30 @@ scope=(
     -p "CPUQuota=$cpu_quota"
     -p "MemoryMax=$memory_max"
     -p "MemorySwapMax=0"
-    --
 )
+
+# Every agent scope joins one shared slice so the aggregate across parallel
+# agents is bounded, not just each scope. Fill in only the caps the human has
+# not already set (a persistent drop-in, or a non-infinity runtime value).
+if [[ -n "$slice" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        props=()
+        cpu_now=$(systemctl --user show "$slice" -p CPUQuotaPerSecUSec --value 2>/dev/null || true)
+        if [[ -z "$cpu_now" || "$cpu_now" == "infinity" ]]; then
+            props+=("CPUQuota=$slice_cpu_quota")
+        fi
+        mem_now=$(systemctl --user show "$slice" -p MemoryMax --value 2>/dev/null || true)
+        if [[ -z "$mem_now" || "$mem_now" == "infinity" ]]; then
+            props+=("MemoryMax=$slice_memory_max")
+        fi
+        if ((${#props[@]} > 0)); then
+            systemctl --user set-property "$slice" "${props[@]}" >/dev/null 2>&1 || true
+        fi
+    fi
+    scope+=("--slice=$slice")
+fi
+
+scope+=(--)
 
 # The GPU is a single shared device: `--gpu` serializes jobs so concurrent
 # agents cannot each open a Vulkan context on it. CPU-only work (including
