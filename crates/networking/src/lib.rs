@@ -180,7 +180,7 @@ impl ClientTransport {
         self.tcp.queue(&message)
     }
     pub fn send_inputs(&mut self, packet: InputPacket) -> io::Result<()> {
-        if packet.inputs.is_empty() || packet.inputs.len() > 8 {
+        if packet.inputs.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "input redundancy must be 1..=8",
@@ -389,7 +389,7 @@ impl ServerTransport {
                         self.stats.rejected_datagrams += 1;
                         continue;
                     };
-                    if packet.inputs.is_empty() || packet.inputs.len() > 8 {
+                    if packet.inputs.is_empty() {
                         self.stats.rejected_datagrams += 1;
                         continue;
                     }

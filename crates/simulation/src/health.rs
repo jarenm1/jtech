@@ -427,7 +427,7 @@ mod tests {
                         movement: [1.0, 0.0],
                         noclip: true,
                         ..Default::default()
-                    }],
+                    }].into(),
                 },
             );
         }
@@ -443,7 +443,7 @@ mod tests {
                 inputs: vec![PlayerInput {
                     sequence: 601,
                     ..Default::default()
-                }],
+                }].into(),
             },
         );
         assert!(sim.players[&1].pending.contains_key(&601));

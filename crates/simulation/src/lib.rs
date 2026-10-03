@@ -519,7 +519,7 @@ impl Simulation {
         if packet.life != player.life {
             return;
         }
-        for input in packet.inputs {
+        for input in packet.inputs.iter().copied() {
             player.enqueue(input);
         }
     }
@@ -1995,7 +1995,7 @@ mod tests {
                     sequence: 1,
                     movement: [1.0, 0.0],
                     ..Default::default()
-                }],
+                }].into(),
             },
         );
         assert!(sim.players[&1].pending.is_empty());
@@ -2008,7 +2008,7 @@ mod tests {
                     sequence: 2,
                     movement: [1.0, 0.0],
                     ..Default::default()
-                }],
+                }].into(),
             },
         );
         assert_eq!(sim.players[&1].pending.len(), 1);

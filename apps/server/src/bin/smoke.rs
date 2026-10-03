@@ -880,7 +880,7 @@ fn check_health(app: &mut App, first: &mut Bot, second: &mut Bot) -> Result<()> 
             movement: [1.0, 0.0],
             noclip: true,
             ..Default::default()
-        }],
+        }].into(),
     })?;
     drive(app, &mut [first, second], 30, [0.0; 2], -1.5)?;
     require(

@@ -846,7 +846,7 @@ fn input_packets_and_respawn_requests_carry_observed_life() {
         movement: [0.0, 1.0],
         ..default()
     };
-    let packet = client.input_packet(vec![input]);
+    let packet = client.input_packet(vec![input].into());
     assert_eq!(packet.session, 7);
     assert_eq!(packet.life, 5);
     assert_eq!(packet.inputs.len(), 1);
