@@ -6,6 +6,7 @@ pub mod combat;
 
 use bevy_ecs::prelude::Component;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const PLAYER_MAX_HEALTH: u16 = 100;
 
@@ -99,6 +100,10 @@ pub type ItemStack = (u32, u32);
 #[serde(try_from = "InventoryEntries")]
 pub struct Inventory {
     entries: Vec<ItemStack>,
+    /// Owned count per item id, kept in step with `entries` so `count` is a
+    /// lookup instead of a scan. Rebuilt on decode; never on the wire.
+    #[serde(skip)]
+    totals: HashMap<u32, u32>,
 }
 
 // Reject malformed wire data: item 0 or zero counts. Duplicate ids are legal:
@@ -112,13 +117,16 @@ impl TryFrom<InventoryEntries> for Inventory {
     type Error = &'static str;
 
     fn try_from(value: InventoryEntries) -> Result<Self, Self::Error> {
+        let mut totals = HashMap::with_capacity(value.entries.len());
         for &(item, count) in &value.entries {
             if item == 0 || count == 0 {
                 return Err("inventory entries must be nonzero stacks");
             }
+            *totals.entry(item).or_insert(0) += count;
         }
         Ok(Self {
             entries: value.entries,
+            totals,
         })
     }
 }
@@ -135,11 +143,7 @@ impl Inventory {
     /// Total owned count across every entry for `item`; equipment instances
     /// each contribute their own entry.
     pub fn count(&self, item: u32) -> u32 {
-        self.entries
-            .iter()
-            .filter(|&&(id, _)| id == item)
-            .map(|&(_, count)| count)
-            .sum()
+        self.totals.get(&item).copied().unwrap_or(0)
     }
 
     pub fn total(&self) -> u64 {
@@ -161,7 +165,7 @@ impl Inventory {
         if item == 0 || amount == 0 {
             return 0;
         }
-        match self.position(item) {
+        let accepted = match self.position(item) {
             Some(index) => {
                 let accepted = amount.min(u32::MAX - self.entries[index].1);
                 self.entries[index].1 += accepted;
@@ -171,7 +175,9 @@ impl Inventory {
                 self.entries.push((item, amount));
                 amount
             }
-        }
+        };
+        *self.totals.entry(item).or_insert(0) += accepted;
+        accepted
     }
 
     /// Add one equipment instance as its own entry, even when the item is
@@ -181,29 +187,37 @@ impl Inventory {
             return 0;
         }
         self.entries.push((item, 1));
+        *self.totals.entry(item).or_insert(0) += 1;
         1
     }
 
     /// Remove up to `amount` across every entry for `item`, returning how many
     /// were taken. Empty entries are dropped from the list.
     pub fn take(&mut self, item: u32, amount: u32) -> u32 {
-        let mut remaining = amount;
-        let mut index = 0;
-        while remaining > 0 && index < self.entries.len() {
-            if self.entries[index].0 != item {
-                index += 1;
-                continue;
+        let want = amount.min(self.count(item));
+        if want == 0 {
+            return 0;
+        }
+        // One compaction pass: matching entries drain first-seen-first until
+        // `remaining` is spent; emptied entries drop out without shifting.
+        let mut remaining = want;
+        self.entries.retain_mut(|&mut (id, ref mut count)| {
+            if id != item || remaining == 0 {
+                return true;
             }
-            let taken = remaining.min(self.entries[index].1);
-            self.entries[index].1 -= taken;
+            let taken = remaining.min(*count);
+            *count -= taken;
             remaining -= taken;
-            if self.entries[index].1 == 0 {
-                self.entries.remove(index);
-            } else {
-                index += 1;
+            *count != 0
+        });
+        let taken = want - remaining;
+        match self.totals.get_mut(&item) {
+            Some(total) if *total > taken => *total -= taken,
+            _ => {
+                self.totals.remove(&item);
             }
         }
-        amount - remaining
+        taken
     }
 }
 
