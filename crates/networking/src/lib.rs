@@ -246,6 +246,8 @@ pub struct ServerTransport {
     udp: UdpSocket,
     peers: HashMap<u64, Peer>,
     send_scratch: Vec<u8>,
+    session_tokens: HashMap<u64, u64>,
+    udp_addrs: HashMap<SocketAddr, u64>,
     next_id: u64,
     pub stats: TrafficStats,
 }
@@ -260,6 +262,8 @@ impl ServerTransport {
             udp,
             peers: HashMap::new(),
             send_scratch: Vec::new(),
+            session_tokens: HashMap::new(),
+            udp_addrs: HashMap::new(),
             next_id: 1,
             stats: TrafficStats::default(),
         })
@@ -268,7 +272,15 @@ impl ServerTransport {
         self.listener.local_addr()
     }
     pub fn disconnect(&mut self, id: u64) {
-        self.peers.remove(&id);
+        self.remove_peer(id);
+    }
+    fn remove_peer(&mut self, id: u64) {
+        if let Some(peer) = self.peers.remove(&id) {
+            self.session_tokens.remove(&peer.session);
+            if let Some(udp) = peer.udp {
+                self.udp_addrs.remove(&udp);
+            }
+        }
     }
     pub fn send(&mut self, id: u64, message: &ServerMessage) -> io::Result<()> {
         self.peers
@@ -303,11 +315,12 @@ impl ServerTransport {
                     let mut random = [0_u8; 8];
                     getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
                     let session = u64::from_ne_bytes(random);
-                    if session == 0 || self.peers.values().any(|p| p.session == session) {
+                    if session == 0 || self.session_tokens.contains_key(&session) {
                         continue;
                     }
                     let id = self.next_id;
                     self.next_id += 1;
+                    self.session_tokens.insert(session, id);
                     self.peers.insert(
                         id,
                         Peer {
@@ -364,8 +377,8 @@ impl ServerTransport {
                 Err(_) => incoming.disconnected.push(id),
             }
         }
-        for id in &incoming.disconnected {
-            self.peers.remove(id);
+        for &id in &incoming.disconnected {
+            self.remove_peer(id);
         }
         let mut bytes = [0_u8; MAX_DATAGRAM + 1];
         for _ in 0..256 {
@@ -380,12 +393,25 @@ impl ServerTransport {
                         self.stats.rejected_datagrams += 1;
                         continue;
                     }
-                    let Some((&id, peer)) = self.peers.iter_mut().find(|(_, peer)| {
-                        peer.active
-                            && peer.session == packet.session
-                            && peer.address.ip() == address.ip()
-                            && peer.udp.is_none_or(|bound| bound == address)
-                    }) else {
+                    let id = self
+                        .udp_addrs
+                        .get(&address)
+                        .copied()
+                        .filter(|&id| {
+                            self.peers
+                                .get(&id)
+                                .is_some_and(|peer| peer.session == packet.session)
+                        })
+                        .or_else(|| self.session_tokens.get(&packet.session).copied());
+                    let Some((id, peer)) = id
+                        .and_then(|id| self.peers.get_mut(&id).map(|peer| (id, peer)))
+                        .filter(|(_, peer)| {
+                            peer.active
+                                && peer.session == packet.session
+                                && peer.address.ip() == address.ip()
+                                && peer.udp.is_none_or(|bound| bound == address)
+                        })
+                    else {
                         self.stats.rejected_datagrams += 1;
                         continue;
                     };
@@ -397,6 +423,9 @@ impl ServerTransport {
                     }) {
                         self.stats.rejected_datagrams += 1;
                         continue;
+                    }
+                    if peer.udp.is_none() {
+                        self.udp_addrs.insert(address, id);
                     }
                     peer.udp = Some(address);
                     peer.last_seen = Instant::now();
