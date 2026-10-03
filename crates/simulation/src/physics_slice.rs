@@ -74,10 +74,10 @@ impl PhysicsSlice {
     }
 
     /// Pin collision halos independently of player interest, and source cells for recovery.
-    pub fn needed_chunks(&self) -> HashSet<IVec3> {
-        let mut chunks = active_terrain::needed_chunks(&self.bodies);
-        chunks.extend(self.origins.iter().copied().map(chunk_coord));
-        chunks
+    /// `out` is cleared so callers can keep a resident set allocated across ticks.
+    pub fn needed_chunks(&self, out: &mut HashSet<IVec3>) {
+        active_terrain::needed_chunks(&self.bodies, out);
+        out.extend(self.origins.iter().copied().map(chunk_coord));
     }
 
     pub fn resident_chunks(&self) -> usize {

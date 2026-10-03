@@ -19,6 +19,12 @@ pub(super) struct ActiveTerrain {
     // Holding the old Arc makes authoritative edits copy-on-write. Identity
     // also detects a replacement chunk with an unchanged revision number.
     snapshots: HashMap<IVec3, Arc<Chunk>>,
+    // Residency is rebuilt for every physics batch; retain capacity across syncs.
+    needed: HashSet<IVec3>,
+    retained: Vec<[i32; 3]>,
+    changed: Vec<([i32; 3], Vec<u32>)>,
+    // Decoded chunk buffers are CHUNK_VOLUME cells; recycle rather than free.
+    cells: Vec<Vec<u32>>,
 }
 
 fn valid_position(body: &Body) -> bool {
@@ -29,8 +35,9 @@ fn valid_position(body: &Body) -> bool {
 /// Conservative batch collision footprint. Each enabled body needs at most
 /// eight chunks; invalid coordinates are ignored here and rejected by sync.
 /// Only the world's finite vertical terrain range requires resident pages.
-pub(super) fn needed_chunks(bodies: &[Body]) -> HashSet<IVec3> {
-    let mut needed = HashSet::new();
+/// `out` is cleared so callers can keep a resident set allocated across calls.
+pub(super) fn needed_chunks(bodies: &[Body], out: &mut HashSet<IVec3>) {
+    out.clear();
     for body in bodies
         .iter()
         .filter(|body| body.material != 0 && valid_position(body))
@@ -46,16 +53,16 @@ pub(super) fn needed_chunks(bodies: &[Body]) -> HashSet<IVec3> {
         for y in low[1].max(MIN_CHUNK_Y)..=high[1].min(MAX_CHUNK_Y) {
             for z in low[2].max(-MAX_COORD)..=high[2].min(MAX_COORD) {
                 for x in low[0].max(-MAX_COORD)..=high[0].min(MAX_COORD) {
-                    needed.insert(IVec3::new(x, y, z));
+                    out.insert(IVec3::new(x, y, z));
                 }
             }
         }
     }
-    needed
 }
 
-fn decode(chunk: &Chunk) -> Vec<u32> {
-    let mut cells = Vec::with_capacity(CHUNK_VOLUME);
+fn decode(chunk: &Chunk, cells: &mut Vec<u32>) {
+    cells.clear();
+    cells.reserve(CHUNK_VOLUME);
     for y in 0..CHUNK_SIZE {
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
@@ -63,7 +70,6 @@ fn decode(chunk: &Chunk) -> Vec<u32> {
             }
         }
     }
-    cells
 }
 
 impl ActiveTerrain {
@@ -86,45 +92,53 @@ impl ActiveTerrain {
             return Err("body outside supported terrain coordinates".into());
         }
         debug_assert_eq!(CHUNK_SIZE as u32, TERRAIN_CHUNK_SIZE);
-        let needed = needed_chunks(bodies);
-        if needed.len() > MAX_TERRAIN_CHUNKS {
+        needed_chunks(bodies, &mut self.needed);
+        if self.needed.len() > MAX_TERRAIN_CHUNKS {
             return Err(format!(
                 "physics terrain needs {} pages; limit is {MAX_TERRAIN_CHUNKS}",
-                needed.len()
+                self.needed.len()
             ));
         }
-        if needed.iter().any(|coord| !world.chunks.contains_key(coord)) {
+        if self
+            .needed
+            .iter()
+            .any(|coord| !world.chunks.contains_key(coord))
+        {
             return Ok(None);
         }
-        let mut retained: Vec<_> = needed.iter().map(|coord| coord.to_array()).collect();
-        retained.sort_unstable();
-        let changed: Vec<_> = retained
-            .iter()
-            .filter_map(|&coord| {
-                let key = IVec3::from_array(coord);
-                let chunk = &world.chunks[&key];
-                if self
-                    .snapshots
-                    .get(&key)
-                    .is_some_and(|old| Arc::ptr_eq(old, chunk))
-                {
-                    None
-                } else {
-                    Some((coord, decode(chunk)))
-                }
-            })
-            .collect();
-        if changed.is_empty() && needed.len() == self.snapshots.len() {
+        self.retained.clear();
+        self.retained
+            .extend(self.needed.iter().map(|coord| coord.to_array()));
+        self.retained.sort_unstable();
+        self.changed.clear();
+        self.changed.extend(self.retained.iter().filter_map(|&coord| {
+            let key = IVec3::from_array(coord);
+            let chunk = &world.chunks[&key];
+            if self
+                .snapshots
+                .get(&key)
+                .is_some_and(|old| Arc::ptr_eq(old, chunk))
+            {
+                None
+            } else {
+                let mut cells = self.cells.pop().unwrap_or_default();
+                decode(chunk, &mut cells);
+                Some((coord, cells))
+            }
+        }));
+        if self.changed.is_empty() && self.needed.len() == self.snapshots.len() {
             return Ok(Some(0));
         }
-        let uploaded = gpu.update_sparse_terrain(&retained, &changed)?;
+        let uploaded = gpu.update_sparse_terrain(&self.retained, &self.changed)?;
         // Commit only after a successful upload. Retaining unchanged snapshots
         // avoids decoding their cells or reallocating their GPU pages.
-        self.snapshots.retain(|coord, _| needed.contains(coord));
-        for (coord, _) in changed {
+        self.snapshots
+            .retain(|coord, _| self.needed.contains(coord));
+        for (coord, cells) in self.changed.drain(..) {
             let coord = IVec3::from_array(coord);
             self.snapshots
                 .insert(coord, Arc::clone(&world.chunks[&coord]));
+            self.cells.push(cells);
         }
         Ok(Some(uploaded))
     }
@@ -138,10 +152,16 @@ impl ActiveTerrain {
 mod tests {
     use super::*;
 
+    fn footprint(bodies: &[Body]) -> HashSet<IVec3> {
+        let mut chunks = HashSet::new();
+        needed_chunks(bodies, &mut chunks);
+        chunks
+    }
+
     #[test]
     fn remote_positive_and_negative_bodies_need_only_local_pages() {
         for (x, z, cx, cz) in [(3200., 6400., 100, 200), (-3200., -6400., -100, -200)] {
-            let chunks = needed_chunks(&[Body::new([x, 16., z], 3)]);
+            let chunks = footprint(&[Body::new([x, 16., z], 3)]);
             let expected: HashSet<_> = [0, 1]
                 .into_iter()
                 .flat_map(|y| {
@@ -156,8 +176,8 @@ mod tests {
 
     #[test]
     fn seam_crossing_retains_overlap_and_releases_trailing_pages() {
-        let before = needed_chunks(&[Body::new([15.5, 16., 16.], 3)]);
-        let after = needed_chunks(&[Body::new([16.5, 16., 16.], 3)]);
+        let before = footprint(&[Body::new([15.5, 16., 16.], 3)]);
+        let after = footprint(&[Body::new([16.5, 16., 16.], 3)]);
         assert!(before.iter().any(|p| p.x == -1));
         assert!(after.iter().any(|p| p.x == 1));
         assert!(after.iter().all(|p| p.x >= 0));
@@ -181,7 +201,7 @@ mod tests {
             31_999_984.,
         ] {
             let body = Body::new([x, 16., x], 3);
-            let chunks = needed_chunks(&[body]);
+            let chunks = footprint(&[body]);
             for dx in -14..=14 {
                 for dy in -14..=14 {
                     for dz in -14..=14 {
@@ -208,12 +228,12 @@ mod tests {
         ] {
             bodies.push(Body::new(position, 3));
         }
-        assert!(needed_chunks(&bodies).is_empty());
-        assert!(needed_chunks(&[Body::new([0., 1000., 0.], 3)]).is_empty());
+        assert!(footprint(&bodies).is_empty());
+        assert!(footprint(&[Body::new([0., 1000., 0.], 3)]).is_empty());
         let bodies: Vec<_> = (0..256)
             .map(|i| Body::new([i as f32 * 128., -31., 0.], 3))
             .collect();
-        let chunks = needed_chunks(&bodies);
+        let chunks = footprint(&bodies);
         assert!(chunks.len() <= bodies.len() * 8);
         assert!(chunks.len() <= MAX_TERRAIN_CHUNKS);
         assert!(
@@ -238,7 +258,8 @@ mod tests {
         ] {
             world.set_block(cell, material).unwrap();
         }
-        let cells = decode(&world.chunks[&IVec3::ZERO]);
+        let mut cells = Vec::new();
+        decode(&world.chunks[&IVec3::ZERO], &mut cells);
         assert_eq!(cells.len(), CHUNK_VOLUME);
         assert_eq!(cells[1], 1);
         assert_eq!(cells[32], 2);
