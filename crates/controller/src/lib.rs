@@ -361,11 +361,12 @@ pub struct Dash {
 }
 
 /// Per-tick motor output: the horizontal velocity the character attempted, and
-/// the ability slots that resolved this tick for the host to apply effects to.
+/// the aim of each ability slot that resolved this tick for the host to apply
+/// effects to.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MotorOutput {
     pub attempted: Vec2,
-    pub fired: [bool; MAX_SLOTS],
+    pub fired: [Option<Vec2>; MAX_SLOTS],
 }
 
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.

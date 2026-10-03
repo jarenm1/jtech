@@ -464,7 +464,7 @@ fn instant_dash_moves_along_the_aim_and_starts_a_cooldown() {
         ..Default::default()
     };
     let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
-    assert!(output.fired[0], "slot 0 must fire");
+    assert!(output.fired[0].is_some(), "slot 0 must fire");
     assert!(state.cooldowns[0] > 0, "cooldown must start");
     assert!(state.dash.is_some(), "dash must be active");
     for _ in 0..20 {
@@ -489,7 +489,7 @@ fn root_cast_locks_movement_then_fires() {
         ..Default::default()
     };
     let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
-    assert!(!output.fired[0], "cast must not fire immediately");
+    assert!(output.fired[0].is_none(), "cast must not fire immediately");
     assert!(state.cast.is_some());
     for _ in 0..9 {
         step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
@@ -500,7 +500,7 @@ fn root_cast_locks_movement_then_fires() {
         state.motion.position
     );
     let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
-    assert!(output.fired[0], "cast must fire on completion");
+    assert!(output.fired[0].is_some(), "cast must fire on completion");
     assert!(state.cast.is_none());
 }
 
@@ -517,7 +517,7 @@ fn ability_on_cooldown_is_ignored() {
     step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
     let cooldown = state.cooldowns[0];
     let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
-    assert!(!output.fired[0], "cooldown must block the second press");
+    assert!(output.fired[0].is_none(), "cooldown must block the second press");
     assert!(state.cooldowns[0] < cooldown, "cooldown must tick down");
 }
 
