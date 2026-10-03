@@ -309,6 +309,42 @@ fn coyote_time_allows_a_jump_just_after_leaving_the_ground() {
 }
 
 #[test]
+fn grounded_actor_steps_over_a_low_obstruction() {
+    let world = tests::arena();
+    let body = CharacterBody::default();
+    let profile = MovementProfile::default();
+    // A loose cube in front whose top sits 0.5 m above the iso surface.
+    let bodies = [DynamicCollider::cube(1, Vec3::new(1.5, -0.5, 0.5), Vec3::ZERO)];
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut intent = CharacterIntent {
+        movement: Vec2::X,
+        ..Default::default()
+    };
+    let mut climbed = f32::MIN;
+    for _ in 0..60 {
+        step_character(
+            &world,
+            &mut state,
+            &body,
+            &profile,
+            &mut intent,
+            FIXED_DT,
+            &bodies,
+        );
+        climbed = climbed.max(state.motion.position.y);
+    }
+    assert!(
+        state.motion.position.x > 1.0,
+        "actor must pass the cube: {:?}",
+        state.motion.position
+    );
+    assert!(
+        climbed > -0.1,
+        "actor must climb onto the cube top: {climbed}"
+    );
+}
+
+#[test]
 fn replay_restores_complete_motor_state_and_matches_human_adapter() {
     let world = tests::arena();
     let mut authority = actor(Vec3::new(0.5, 0.0, 0.5));

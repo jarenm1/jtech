@@ -79,6 +79,8 @@ pub struct MovementProfile {
     pub coyote_ticks: u8,
     /// Ticks a jump request stays buffered while airborne.
     pub jump_buffer_ticks: u8,
+    /// Maximum rise the motor auto-steps over a blocked horizontal sweep.
+    pub step_height: f32,
     pub acceleration: f32,
     pub braking: f32,
     pub air_control: f32,
@@ -96,6 +98,7 @@ impl Default for MovementProfile {
             sprint_mult: 1.5,
             coyote_ticks: 6,
             jump_buffer_ticks: 6,
+            step_height: 0.6,
             acceleration: 10_000.0,
             braking: 10_000.0,
             air_control: 1.0,
@@ -115,6 +118,7 @@ impl MovementProfile {
             sprint_mult: finite(self.sprint_mult).clamp(1.0, 4.0),
             coyote_ticks: self.coyote_ticks.min(60),
             jump_buffer_ticks: self.jump_buffer_ticks.min(60),
+            step_height: finite(self.step_height).clamp(0.0, 2.0),
             acceleration: finite(self.acceleration).clamp(0.0, 10_000.0),
             braking: finite(self.braking).clamp(0.0, 10_000.0),
             air_control: finite(self.air_control).clamp(0.0, 1.0),
