@@ -29,6 +29,10 @@ pub struct CharacterIntent {
     pub sprint: bool,
     /// Held crouch request: lowers the body and scales target speed.
     pub crouch: bool,
+    /// One-tick ability edges, one per slot; the motor consumes and clears them.
+    pub ability: [bool; MAX_SLOTS],
+    /// Body-relative aim direction for abilities; zero means "facing".
+    pub aim: Vec2,
 }
 impl CharacterIntent {
     pub fn bounded(self) -> Self {
@@ -44,6 +48,12 @@ impl CharacterIntent {
             held_item: self.held_item,
             sprint: self.sprint,
             crouch: self.crouch,
+            ability: self.ability,
+            aim: Vec2::new(
+                finite(self.aim.x).clamp(-1.0, 1.0),
+                finite(self.aim.y).clamp(-1.0, 1.0),
+            )
+            .clamp_length_max(1.0),
         }
     }
 }
@@ -52,11 +62,22 @@ impl CharacterIntent {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct CharacterBody {
     pub shape: CollisionShape,
+    /// Per-species ability table; empty slots mean the species has no ability.
+    pub abilities: AbilityTable,
     mass: f32,
 }
 impl CharacterBody {
     pub fn new(shape: CollisionShape, mass: f32) -> Option<Self> {
-        (mass.is_finite() && (0.01..=100_000.0).contains(&mass)).then_some(Self { shape, mass })
+        (mass.is_finite() && (0.01..=100_000.0).contains(&mass)).then_some(Self {
+            shape,
+            abilities: AbilityTable::default(),
+            mass,
+        })
+    }
+    /// Attach an ability table to this body.
+    pub fn with_abilities(mut self, abilities: AbilityTable) -> Self {
+        self.abilities = abilities;
+        self
     }
     pub fn mass(self) -> f32 {
         self.mass
@@ -66,6 +87,7 @@ impl Default for CharacterBody {
     fn default() -> Self {
         Self {
             shape: CollisionShape::default(),
+            abilities: AbilityTable::default(),
             mass: physics::PLAYER_MASS,
         }
     }
@@ -261,6 +283,90 @@ pub struct Constraints {
     pub turn_mult: f32,
 }
 
+/// Number of ability slots per character.
+pub const MAX_SLOTS: usize = 3;
+
+/// What an ability does when it resolves. The host owns the effect; the motor
+/// owns the cast, the cooldown and the movement lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbilityKind {
+    /// Burst of movement along the aim that still collides with the world.
+    Dash,
+    /// Teleport to a clear point along the aim.
+    Blink,
+    /// Spawns a travelling projectile along the aim.
+    Projectile,
+    /// Applies an area effect at a point along the aim.
+    Area,
+}
+
+/// What the caster may do during the cast time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CastBehavior {
+    /// Rooted for the cast time: the default telegraph.
+    #[default]
+    Root,
+    /// Slowed for the cast time.
+    Slow,
+    /// No cast time; the ability resolves on the tick it is requested.
+    Instant,
+}
+
+/// Authored ability parameters. Data-driven so an `"ability"` package kind can
+/// author these later, exactly like `MeleeSpec`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AbilitySpec {
+    pub kind: AbilityKind,
+    pub behavior: CastBehavior,
+    /// Cast time in fixed ticks; zero for instant abilities.
+    pub cast_ticks: u16,
+    /// Cooldown in fixed ticks, started when the ability resolves.
+    pub cooldown_ticks: u16,
+    /// Dash speed (m/s) or blink range (m); unused by projectile and area.
+    pub magnitude: f32,
+}
+
+/// Per-species ability table: one optional spec per slot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AbilityTable {
+    slots: [Option<AbilitySpec>; MAX_SLOTS],
+}
+impl AbilityTable {
+    /// Build a table from per-slot specs; `None` leaves a slot empty.
+    pub fn new(slots: [Option<AbilitySpec>; MAX_SLOTS]) -> Self {
+        Self { slots }
+    }
+    /// The spec in `slot`, if the species has one.
+    pub fn get(&self, slot: usize) -> Option<AbilitySpec> {
+        self.slots.get(slot).copied().flatten()
+    }
+}
+
+/// In-progress cast: which slot, ticks remaining, and the aim captured at start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cast {
+    pub slot: u8,
+    pub remaining: u16,
+    pub aim: Vec2,
+}
+
+/// In-progress dash or blink.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Dash {
+    pub slot: u8,
+    pub remaining: u16,
+    pub aim: Vec2,
+    pub speed: f32,
+}
+
+/// Per-tick motor output: the horizontal velocity the character attempted, and
+/// the ability slots that resolved this tick for the host to apply effects to.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MotorOutput {
+    pub attempted: Vec2,
+    pub fired: [bool; MAX_SLOTS],
+}
+
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.
 /// `motion.noclip` is reserved for the human debug adapter, not a policy action.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -275,6 +381,12 @@ pub struct CharacterState {
     pub jump_buffer: u8,
     /// Whether the body is currently lowered by a crouch.
     pub crouching: bool,
+    /// Remaining cooldown ticks per ability slot.
+    pub cooldowns: [u16; MAX_SLOTS],
+    /// In-progress cast, if any.
+    pub cast: Option<Cast>,
+    /// In-progress dash or blink, if any.
+    pub dash: Option<Dash>,
 }
 impl CharacterState {
     pub fn apply_impulse(&mut self, body: &CharacterBody, impulse: Vec3) {

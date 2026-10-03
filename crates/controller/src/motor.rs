@@ -1,6 +1,6 @@
 use crate::{
-    CharacterBody, CharacterIntent, CharacterState, CollisionShape, Constraints, MovementProfile,
-    finite,
+    AbilityKind, Cast, CastBehavior, CharacterBody, CharacterIntent, CharacterState, CollisionShape,
+    Constraints, Dash, MAX_SLOTS, MotorOutput, MovementProfile, finite,
 };
 use glam::{Vec2, Vec3};
 use physics::DynamicCollider;
@@ -21,6 +21,8 @@ struct Motor<'a> {
     shape: CollisionShape,
     /// Movement and action gates derived from the active statuses.
     constraints: Constraints,
+    /// Ability slots that resolved this tick, for the host to apply effects to.
+    fired: [bool; MAX_SLOTS],
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -38,9 +40,12 @@ pub fn step_character(
     intent: &mut CharacterIntent,
     dt: f32,
     bodies: &[DynamicCollider],
-) -> Vec2 {
+) -> MotorOutput {
     if !dt.is_finite() || dt <= 0.0 {
-        return Vec2::new(character.motion.velocity.x, character.motion.velocity.z);
+        return MotorOutput {
+            attempted: Vec2::new(character.motion.velocity.x, character.motion.velocity.z),
+            fired: [false; MAX_SLOTS],
+        };
     }
     let profile = profile.bounded();
     let input = intent.bounded();
@@ -63,17 +68,22 @@ pub fn step_character(
             ..Default::default()
         },
         attempted: Vec2::ZERO,
+        fired: [false; MAX_SLOTS],
     };
     status(&mut motor, character);
     sanitize(&mut motor, character);
     stance(&mut motor, character);
     contact(&mut motor, character);
+    abilities(&mut motor, character);
     steer(&mut motor, character);
     gravity(&mut motor, character);
     sweep_horizontal(&mut motor, character);
     sweep_vertical(&mut motor, character);
     drag(&mut motor, character);
-    motor.attempted
+    MotorOutput {
+        attempted: motor.attempted,
+        fired: motor.fired,
+    }
 }
 
 /// Advance status timers and derive this tick's movement and action gates.
@@ -162,10 +172,135 @@ fn contact(motor: &mut Motor, character: &mut CharacterState) {
     };
 }
 
+/// Fixed duration of a dash in ticks.
+const DASH_TICKS: u16 = 12;
+/// Step size when searching for a clear blink destination.
+const BLINK_STEP: f32 = 0.5;
+
+/// Consume ability edges, advance casts and dashes, and tick cooldowns. A cast
+/// roots or slows the caster; a dash overrides movement; the host applies the
+/// effect when a slot reports `fired`.
+fn abilities(motor: &mut Motor, character: &mut CharacterState) {
+    for cooldown in character.cooldowns.iter_mut() {
+        *cooldown = cooldown.saturating_sub(1);
+    }
+    if let Some(cast) = character.cast {
+        if cast.remaining > 1 {
+            character.cast = Some(Cast {
+                remaining: cast.remaining - 1,
+                ..cast
+            });
+        } else {
+            character.cast = None;
+            resolve(motor, character, cast.slot, cast.aim);
+        }
+    }
+    if let Some(dash) = character.dash {
+        if dash.remaining > 1 {
+            character.dash = Some(Dash {
+                remaining: dash.remaining - 1,
+                ..dash
+            });
+        } else {
+            character.dash = None;
+        }
+    }
+    if character.cast.is_some() || character.dash.is_some() || motor.constraints.cast_locked {
+        return;
+    }
+    for slot in 0..MAX_SLOTS {
+        if !motor.input.ability[slot] || character.cooldowns[slot] > 0 {
+            continue;
+        }
+        let Some(spec) = motor.body.abilities.get(slot) else {
+            continue;
+        };
+        let aim = aim_vector(motor, character);
+        if spec.behavior == CastBehavior::Instant {
+            resolve(motor, character, slot as u8, aim);
+        } else {
+            character.cast = Some(Cast {
+                slot: slot as u8,
+                remaining: spec.cast_ticks.max(1),
+                aim,
+            });
+        }
+        break;
+    }
+}
+
+/// Resolve a slot: mark it fired, start its cooldown, and begin any movement.
+fn resolve(motor: &mut Motor, character: &mut CharacterState, slot: u8, aim: Vec2) {
+    let Some(spec) = motor.body.abilities.get(slot as usize) else {
+        return;
+    };
+    motor.fired[slot as usize] = true;
+    character.cooldowns[slot as usize] = spec.cooldown_ticks;
+    match spec.kind {
+        AbilityKind::Dash => {
+            character.dash = Some(Dash {
+                slot,
+                remaining: DASH_TICKS,
+                aim,
+                speed: spec.magnitude,
+            });
+        }
+        AbilityKind::Blink => {
+            let mut best = character.motion.position;
+            let mut step = BLINK_STEP;
+            while step <= spec.magnitude {
+                let candidate = character.motion.position + Vec3::new(aim.x, 0.0, aim.y) * step;
+                if !physics::clearance(motor.world, candidate, motor.shape, motor.bodies) {
+                    break;
+                }
+                best = candidate;
+                step += BLINK_STEP;
+            }
+            character.motion.position = best;
+        }
+        AbilityKind::Projectile | AbilityKind::Area => {}
+    }
+}
+
+/// World-space aim direction: the body-relative aim rotated by yaw, or forward
+/// when the aim is zero.
+fn aim_vector(motor: &Motor, character: &CharacterState) -> Vec2 {
+    let yaw = finite(character.yaw);
+    let (sy, cy) = yaw.sin_cos();
+    let right = Vec2::new(cy, -sy);
+    let forward = Vec2::new(-sy, -cy);
+    let world = right * motor.input.aim.x + forward * motor.input.aim.y;
+    if world.length_squared() > 1e-6 {
+        world.normalize()
+    } else {
+        forward
+    }
+}
+
 /// Turn held body-relative input into a target horizontal velocity and
 /// accelerate or brake toward it, keeping external momentum separate.
 fn steer(motor: &mut Motor, character: &mut CharacterState) {
     let state = &mut character.motion;
+    // A dash overrides input with its own velocity; a root cast holds position.
+    if let Some(dash) = character.dash {
+        let velocity = dash.aim * dash.speed;
+        motor.attempted = velocity;
+        state.velocity.x = velocity.x;
+        state.velocity.z = velocity.y;
+        return;
+    }
+    if character.cast.is_some_and(|cast| {
+        motor
+            .body
+            .abilities
+            .get(cast.slot as usize)
+            .is_some_and(|spec| spec.behavior == CastBehavior::Root)
+    }) {
+        motor.attempted = state.external_velocity;
+        state.velocity.x = state.external_velocity.x;
+        state.velocity.z = state.external_velocity.y;
+        return;
+    }
     let yaw = finite(character.yaw);
     let (sy, cy) = yaw.sin_cos();
     let right = Vec3::new(cy, 0.0, -sy);
@@ -190,7 +325,18 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
         } else {
             1.0
         }
-        * motor.constraints.speed_mult;
+        * motor.constraints.speed_mult
+        * if character.cast.is_some_and(|cast| {
+            motor
+                .body
+                .abilities
+                .get(cast.slot as usize)
+                .is_some_and(|spec| spec.behavior == CastBehavior::Slow)
+        }) {
+            0.5
+        } else {
+            1.0
+        };
     let horizontal = (right * movement.x + forward * movement.y) * speed;
     let target = Vec2::new(horizontal.x, horizontal.z);
     let previous = physics::bounded_horizontal(

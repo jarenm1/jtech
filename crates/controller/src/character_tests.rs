@@ -432,6 +432,95 @@ fn stun_locks_movement_and_jump() {
     );
 }
 
+fn ability_body(
+    kind: AbilityKind,
+    behavior: CastBehavior,
+    cast_ticks: u16,
+    cooldown_ticks: u16,
+    magnitude: f32,
+) -> CharacterBody {
+    CharacterBody::default().with_abilities(AbilityTable::new([
+        Some(AbilitySpec {
+            kind,
+            behavior,
+            cast_ticks,
+            cooldown_ticks,
+            magnitude,
+        }),
+        None,
+        None,
+    ]))
+}
+
+#[test]
+fn instant_dash_moves_along_the_aim_and_starts_a_cooldown() {
+    let world = tests::arena();
+    let body = ability_body(AbilityKind::Dash, CastBehavior::Instant, 0, 60, 12.0);
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut intent = CharacterIntent {
+        ability: [true, false, false],
+        aim: Vec2::X,
+        ..Default::default()
+    };
+    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    assert!(output.fired[0], "slot 0 must fire");
+    assert!(state.cooldowns[0] > 0, "cooldown must start");
+    assert!(state.dash.is_some(), "dash must be active");
+    for _ in 0..20 {
+        step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    }
+    assert!(
+        state.motion.position.x > 1.0,
+        "dash must move the actor: {:?}",
+        state.motion.position
+    );
+}
+
+#[test]
+fn root_cast_locks_movement_then_fires() {
+    let world = tests::arena();
+    let body = ability_body(AbilityKind::Projectile, CastBehavior::Root, 10, 30, 0.0);
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut intent = CharacterIntent {
+        movement: Vec2::X,
+        ability: [true, false, false],
+        ..Default::default()
+    };
+    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    assert!(!output.fired[0], "cast must not fire immediately");
+    assert!(state.cast.is_some());
+    for _ in 0..9 {
+        step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    }
+    assert!(
+        (state.motion.position.x - 0.5).abs() < 0.01,
+        "rooted caster must not move: {:?}",
+        state.motion.position
+    );
+    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    assert!(output.fired[0], "cast must fire on completion");
+    assert!(state.cast.is_none());
+}
+
+#[test]
+fn ability_on_cooldown_is_ignored() {
+    let world = tests::arena();
+    let body = ability_body(AbilityKind::Dash, CastBehavior::Instant, 0, 60, 12.0);
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut intent = CharacterIntent {
+        ability: [true, false, false],
+        ..Default::default()
+    };
+    step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    let cooldown = state.cooldowns[0];
+    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    assert!(!output.fired[0], "cooldown must block the second press");
+    assert!(state.cooldowns[0] < cooldown, "cooldown must tick down");
+}
+
 #[test]
 fn replay_restores_complete_motor_state_and_matches_human_adapter() {
     let world = tests::arena();
