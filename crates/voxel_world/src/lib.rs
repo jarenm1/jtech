@@ -796,6 +796,18 @@ impl VoxelWorld {
             chunks: OFFSETS.map(|offset| self.chunks.get(&(coord + offset)).cloned()),
         }
     }
+    /// The neighborhood chunk references and their revision stamp from a
+    /// single pass over the 27 chunk lookups, for callers that need both.
+    pub fn neighborhood_snapshot(&self, coord: IVec3) -> NeighborhoodSnapshot {
+        let neighborhood = ChunkNeighborhood {
+            coord,
+            chunks: OFFSETS.map(|offset| self.chunks.get(&(coord + offset)).cloned()),
+        };
+        NeighborhoodSnapshot {
+            stamp: neighborhood.stamp(),
+            neighborhood,
+        }
+    }
     pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
         if !origin.is_finite()
             || !direction.is_finite()
@@ -855,6 +867,12 @@ impl VoxelWorld {
         }
         None
     }
+}
+/// Owned chunk references plus the stamp derived from them, captured in one
+/// pass by [`VoxelWorld::neighborhood_snapshot`].
+pub struct NeighborhoodSnapshot {
+    pub neighborhood: ChunkNeighborhood,
+    pub stamp: [Option<u64>; 27],
 }
 pub struct ChunkNeighborhood {
     pub coord: IVec3,
@@ -924,6 +942,12 @@ impl ChunkNeighborhood {
         }
         let (slot, inner) = self.locate(local);
         self.chunks[slot].as_ref().is_some_and(|c| c.placed(inner))
+    }
+    /// Whether every loaded chunk in the neighborhood is empty.
+    pub fn all_empty(&self) -> bool {
+        self.chunks
+            .iter()
+            .all(|chunk| chunk.as_ref().map_or(true, |chunk| chunk.is_empty()))
     }
     pub fn stamp(&self) -> [Option<u64>; 27] {
         std::array::from_fn(|i| self.chunks[i].as_ref().map(|c| c.revision))

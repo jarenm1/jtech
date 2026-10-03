@@ -1244,20 +1244,11 @@ fn update_chunks(
         }
     }
     for &(_, coord) in &nearest[..nearest_len] {
-        let neighborhood = world.neighborhood(coord);
-        let stamp = neighborhood.stamp();
+        let snapshot = world.neighborhood_snapshot(coord);
+        let neighborhood = snapshot.neighborhood;
         // An all-air center still owns boundary quads against solid neighbors,
         // so meshing is skipped only when the whole neighborhood is empty.
-        let empty = (-1..=1).all(|dz| {
-            (-1..=1).all(|dy| {
-                (-1..=1).all(|dx| {
-                    world
-                        .chunks
-                        .get(&(coord + IVec3::new(dx, dy, dz)))
-                        .map_or(true, |chunk| chunk.is_empty())
-                })
-            })
-        });
+        let empty = neighborhood.all_empty();
         let task = AsyncComputeTaskPool::get().spawn(async move {
             if empty {
                 MeshData::default()
@@ -1267,7 +1258,7 @@ fn update_chunks(
         });
         renderer.jobs.push(MeshJob {
             coord,
-            stamp,
+            stamp: snapshot.stamp,
             task,
             ready: None,
         });
