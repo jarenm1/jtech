@@ -303,7 +303,112 @@ pub struct Snapshot {
 pub struct InputPacket {
     pub session: u64,
     pub life: u64,
-    pub inputs: Vec<PlayerInput>,
+    pub inputs: InputBatch,
+}
+
+/// Bounded redundant input tail: at most [`MAX_INPUT_BATCH`] unacknowledged
+/// inputs per datagram. Stored inline so neither the client send path nor the
+/// server decode path allocates a `Vec` for a payload bounded at 8 entries.
+pub const MAX_INPUT_BATCH: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InputBatch {
+    inputs: [PlayerInput; MAX_INPUT_BATCH],
+    len: u8,
+}
+
+impl InputBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn as_slice(&self) -> &[PlayerInput] {
+        &self.inputs[..self.len as usize]
+    }
+    /// Append one input; returns false when the batch is full.
+    pub fn push(&mut self, input: PlayerInput) -> bool {
+        if self.len as usize >= MAX_INPUT_BATCH {
+            return false;
+        }
+        self.inputs[self.len as usize] = input;
+        self.len += 1;
+        true
+    }
+}
+
+impl std::ops::Deref for InputBatch {
+    type Target = [PlayerInput];
+    fn deref(&self) -> &[PlayerInput] {
+        self.as_slice()
+    }
+}
+
+impl From<&[PlayerInput]> for InputBatch {
+    fn from(inputs: &[PlayerInput]) -> Self {
+        let mut batch = Self::default();
+        for &input in inputs.iter().take(MAX_INPUT_BATCH) {
+            batch.push(input);
+        }
+        batch
+    }
+}
+
+impl From<Vec<PlayerInput>> for InputBatch {
+    fn from(inputs: Vec<PlayerInput>) -> Self {
+        Self::from(inputs.as_slice())
+    }
+}
+
+impl FromIterator<PlayerInput> for InputBatch {
+    fn from_iter<I: IntoIterator<Item = PlayerInput>>(iter: I) -> Self {
+        let mut batch = Self::default();
+        for input in iter {
+            batch.push(input);
+        }
+        batch
+    }
+}
+
+// Serialized as a postcard sequence of the live prefix, identical to the
+// previous `Vec<PlayerInput>` wire encoding.
+impl Serialize for InputBatch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
+        for input in self.as_slice() {
+            seq.serialize_element(input)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for InputBatch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, SeqAccess, Visitor};
+        use std::fmt;
+        struct BatchVisitor;
+        impl<'de> Visitor<'de> for BatchVisitor {
+            type Value = InputBatch;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(formatter, "at most {MAX_INPUT_BATCH} player inputs")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<InputBatch, A::Error> {
+                let mut batch = InputBatch::default();
+                while let Some(input) = seq.next_element::<PlayerInput>()? {
+                    if !batch.push(input) {
+                        return Err(A::Error::custom("input batch exceeds limit"));
+                    }
+                }
+                Ok(batch)
+            }
+        }
+        deserializer.deserialize_seq(BatchVisitor)
+    }
 }
 
 pub fn encode<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>> {
@@ -463,7 +568,7 @@ mod tests {
         let packet = InputPacket {
             session: 7,
             life: 3,
-            inputs: vec![PlayerInput::default()],
+            inputs: vec![PlayerInput::default()].into(),
         };
         let bytes = encode(&packet, MAX_DATAGRAM).unwrap();
         let decoded: InputPacket = decode(&bytes, MAX_DATAGRAM).unwrap();

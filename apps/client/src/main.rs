@@ -29,8 +29,8 @@ use bevy::{
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerState, look_direction};
 use protocol::{
-    BowPower, ClientMessage, EXPLOSIVE_BOW_ITEM, EditRejection, Health, InputPacket, Inventory,
-    ServerMessage, Snapshot,
+    BowPower, ClientMessage, EXPLOSIVE_BOW_ITEM, EditRejection, Health, InputBatch, InputPacket,
+    Inventory, MAX_INPUT_BATCH, ServerMessage, Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{
@@ -302,7 +302,7 @@ impl ClientSession {
         }
     }
     /// Outgoing input packet tagged with the currently observed life counter.
-    fn input_packet(&self, inputs: Vec<PlayerInput>) -> InputPacket {
+    fn input_packet(&self, inputs: InputBatch) -> InputPacket {
         InputPacket {
             session: self.session,
             life: self.life,
@@ -321,7 +321,7 @@ impl ClientSession {
         Some(self.input_packet(vec![PlayerInput {
             sequence: self.sequence,
             ..Default::default()
-        }]))
+        }].into()))
     }
 
     /// Respawn request for the currently observed life. Repeating it is harmless;
@@ -1036,12 +1036,14 @@ fn predict(
         session.predict_input(&world, input, &colliders);
     }
     if !session.pending.is_empty() {
-        let inputs = session
+        let mut inputs = InputBatch::new();
+        for input in session
             .pending
             .iter()
-            .skip(session.pending.len().saturating_sub(8))
-            .copied()
-            .collect();
+            .skip(session.pending.len().saturating_sub(MAX_INPUT_BATCH))
+        {
+            inputs.push(*input);
+        }
         let packet = session.input_packet(inputs);
         if let Some(transport) = &mut session.transport
             && let Err(error) = transport.send_inputs(packet)
