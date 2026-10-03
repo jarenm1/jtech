@@ -164,33 +164,80 @@ fn gravity(motor: &mut Motor, character: &mut CharacterState) {
 }
 
 /// Resolve X then Z independently: a blocked axis stops and drops its external
-/// momentum while the other keeps sliding.
+/// momentum while the other keeps sliding. A grounded actor first tries to step
+/// over a low obstruction instead of stopping.
 fn sweep_horizontal(motor: &mut Motor, character: &mut CharacterState) {
     let state = &mut character.motion;
+    let dx = state.velocity.x * motor.dt;
     if physics::sweep_with_bodies(
         motor.world,
         &mut state.position,
         0,
-        state.velocity.x * motor.dt,
+        dx,
         motor.bodies,
         None,
         motor.body.shape,
-    ) {
+    ) && !try_step(motor, state, 0, dx)
+    {
         state.velocity.x = 0.0;
         state.external_velocity.x = 0.0;
     }
+    let dz = state.velocity.z * motor.dt;
     if physics::sweep_with_bodies(
         motor.world,
         &mut state.position,
         2,
-        state.velocity.z * motor.dt,
+        dz,
         motor.bodies,
         None,
         motor.body.shape,
-    ) {
+    ) && !try_step(motor, state, 2, dz)
+    {
         state.velocity.z = 0.0;
         state.external_velocity.y = 0.0;
     }
+}
+
+/// Step over a low obstruction: lift by the profile's step height, re-sweep the
+/// blocked axis, then settle back down. Only grounded actors step, and the
+/// lifted pose must be clear so a ceiling still blocks.
+fn try_step(
+    motor: &mut Motor,
+    state: &mut physics::KinematicState,
+    axis: usize,
+    distance: f32,
+) -> bool {
+    if !state.grounded || motor.profile.step_height <= 0.0 {
+        return false;
+    }
+    let lifted = state.position + Vec3::Y * motor.profile.step_height;
+    if !physics::clearance(motor.world, lifted, motor.body.shape, motor.bodies) {
+        return false;
+    }
+    let mut probe = lifted;
+    physics::sweep_with_bodies(
+        motor.world,
+        &mut probe,
+        axis,
+        distance,
+        motor.bodies,
+        None,
+        motor.body.shape,
+    );
+    if (probe[axis] - lifted[axis]).abs() < 1e-4 {
+        return false;
+    }
+    physics::sweep_with_bodies(
+        motor.world,
+        &mut probe,
+        1,
+        -motor.profile.step_height,
+        motor.bodies,
+        None,
+        motor.body.shape,
+    );
+    state.position = probe;
+    true
 }
 
 /// Resolve Y, snapping grounded actors down a full step so descending slopes
