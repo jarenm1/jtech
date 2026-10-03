@@ -31,7 +31,7 @@ use protocol::{
     ClientMessage, EditRejection, InputPacket, PlayerSnapshot, ServerMessage, Snapshot,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io,
     net::SocketAddr,
     time::Instant,
@@ -65,6 +65,12 @@ struct DamageState {
     material: u8,
     joules: f32,
     release: bool,
+}
+
+/// Ordering key for the release queue: `(y, z, x)`, matching the historical
+/// `releases.sort_unstable_by_key(|(p, _)| (p.y, p.z, p.x))`.
+fn release_key(pos: IVec3) -> (i32, i32, i32) {
+    (pos.y, pos.z, pos.x)
 }
 
 #[derive(Clone, Copy)]
@@ -185,6 +191,7 @@ impl Plugin for SimulationPlugin {
                 journal: HashMap::new(),
                 journal_blocks: 0,
                 damage: HashMap::new(),
+                release_queue: BTreeSet::new(),
                 strikes: VecDeque::new(),
                 arrows: Vec::new(),
                 detonations: VecDeque::new(),
@@ -370,6 +377,10 @@ pub struct Simulation {
     physics: Option<PhysicsSlice>,
     /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
     damage: HashMap<IVec3, DamageState>,
+    /// Targets whose [`DamageState::release`] is set, keyed `(y, z, x)` so
+    /// iteration matches the historical `(y, z, x)` release order without
+    /// scanning and sorting the whole damage map every tick.
+    release_queue: BTreeSet<(i32, i32, i32)>,
     strikes: VecDeque<QueuedStrike>,
     arrows: Vec<bow::Arrow>,
     detonations: VecDeque<(u32, Vec3, game_packages::BlastSpec, Option<SimEntity>)>,
@@ -706,6 +717,14 @@ impl Simulation {
         let journal_space = self.has_journal_space(target);
         let result =
             material_damage::apply_to_grid(world, &mut self.damage, contact, journal_space)?;
+        // Keep the release work set in step with the damage map: `release` is
+        // latched (never cleared while the entry lives), so this is a simple
+        // insert/remove rather than a per-tick rescan.
+        if result.release {
+            self.release_queue.insert(release_key(target));
+        } else {
+            self.release_queue.remove(&release_key(target));
+        }
         if let Some(edits) = result.destroyed_edits {
             for edit in &edits {
                 self.record_voxels(edit);
@@ -782,6 +801,7 @@ impl Simulation {
                 .is_some_and(|state| state.material != voxel.material)
             {
                 self.damage.remove(&pos);
+                self.release_queue.remove(&release_key(pos));
             }
             if let Some(physics) = &mut self.physics {
                 physics.set_voxel(pos, voxel.material);
@@ -849,15 +869,20 @@ impl Simulation {
             return;
         };
         // Attachment failure is latched, not a sum of old contact loads. Retry the
-        // ownership transaction when body capacity/readback permits it.
-        let mut releases: Vec<_> = self
-            .damage
-            .iter()
-            .filter(|(_, state)| state.release)
-            .map(|(&target, &state)| (target, state))
-            .collect();
-        releases.sort_unstable_by_key(|(p, _)| (p.y, p.z, p.x));
-        for (target, state) in releases {
+        // ownership transaction when body capacity/readback permits it. The work
+        // set holds only latched targets, in the historical (y, z, x) order, so
+        // no per-tick scan/sort of the whole damage map is needed.
+        let releases: Vec<(i32, i32, i32)> = self.release_queue.iter().copied().collect();
+        for key in releases {
+            let target = IVec3::new(key.2, key.0, key.1);
+            let Some(state) = self.damage.get(&target).copied() else {
+                self.release_queue.remove(&key);
+                continue;
+            };
+            if !state.release {
+                self.release_queue.remove(&key);
+                continue;
+            }
             if world.block(target) == Some(state.material)
                 && physics.can_detach(target)
                 && self.has_journal_space(target)
@@ -867,6 +892,7 @@ impl Simulation {
                 physics.release(target, state.material, state.joules, Vec3::ZERO);
                 physics.set_voxel(target, 0);
                 self.record_change(world, target, Voxel::AIR, from, to);
+                self.release_queue.remove(&key);
             }
         }
         // Stable body IDs establish deterministic order for competing cell claims.
@@ -927,6 +953,7 @@ impl Simulation {
                             release: false,
                         },
                     );
+                    self.release_queue.remove(&release_key(target));
                 }
                 break;
             }
