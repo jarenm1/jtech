@@ -84,7 +84,8 @@ pub fn step_player_with_bodies(
         &mut intent,
         dt,
         bodies,
-    );
+    )
+    .attempted;
     *state = character.motion;
     attempted
 }
