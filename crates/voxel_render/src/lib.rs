@@ -534,10 +534,13 @@ const GRASS_LOD_DENSITY: [f32; 3] = [1.0, 0.3, 0.12];
 /// Seconds between dependency-stamp scans; larger movement scans early.
 const GRASS_STAMP_SCAN_INTERVAL: f32 = 0.12;
 const GRASS_STAMP_SCAN_STEP: f32 = 4.0;
-/// Patch builds/uploads per update, plus backlog relief so the ~800-patch
+/// Patch builds dispatched per update, plus backlog relief so the ~800-patch
 /// field fills in tens of frames after a teleport instead of many seconds.
 const GRASS_BUILDS_PER_UPDATE: usize = 2;
 const GRASS_BUILDS_PER_DIRTY: usize = 64;
+/// In-flight async patch builds; bounds workers running `grass_patch_mesh`
+/// alongside terrain `MeshJob`s on the shared compute pool.
+const GRASS_MAX_JOBS: usize = 8;
 /// Most distinct surface-bearing chunks meshed for one patch; bounds the cost
 /// of a patch whose columns are shattered across many heights.
 const GRASS_CHUNKS_PER_PATCH: usize = 8;
@@ -599,25 +602,27 @@ struct GrassPatch {
     built: bool,
 }
 
-/// World-grid patches with throttled revision scans and budgeted rebuilds.
+/// World-grid patches with throttled revision scans and async rebuilds.
 #[derive(Resource, Default)]
 struct GrassField {
     patches: HashMap<IVec2, GrassPatch>,
-    /// Reuse contour meshes across patches; never contour the same unchanged
-    /// chunk once per patch. Entries are evicted with their dependent patches.
-    surfaces: HashMap<IVec3, GrassSurface>,
-    /// How many live patch stamps reference each chunk coordinate, so surface
-    /// eviction is one lookup per surface instead of rescanning every stamp.
-    surface_refs: HashMap<IVec3, u32>,
+    /// In-flight and ready-but-unuploaded patch builds, one per patch at most.
+    jobs: Vec<GrassJob>,
     /// Scratch candidate list, `clear()`ed each frame; the allocation persists.
     dirty: Vec<(f32, IVec2)>,
     checked_at: f32,
     scan_focus: Vec3,
 }
 
-struct GrassSurface {
-    stamp: Stamp,
-    mesh: MeshData,
+/// An in-flight patch build on the async compute pool, mirroring `MeshJob`:
+/// the worker remeshes from a frozen chunk snapshot and the result's stamp is
+/// validated against the live world's revisions before upload.
+struct GrassJob {
+    coord: IVec2,
+    ceiling: i32,
+    lod: usize,
+    task: Task<GrassPatchData>,
+    ready: Option<GrassPatchData>,
 }
 
 /// Bijective u64 mix (finaliser), the basis of all blade hashing.
@@ -757,7 +762,6 @@ fn grass_patch_mesh(
     patch: IVec2,
     ceiling: i32,
     lod: usize,
-    surfaces: &mut HashMap<IVec3, GrassSurface>,
 ) -> GrassPatchData {
     let mut deps: HashMap<IVec3, Option<u64>> = HashMap::new();
     let min = patch * GRASS_PATCH_SIZE;
@@ -799,16 +803,10 @@ fn grass_patch_mesh(
                 }
             }
         }
-        let stamp = world.mesh_stamp(coord);
-        let surface = surfaces.entry(coord).or_insert_with(|| GrassSurface {
-            stamp,
-            mesh: surface_nets(&world.neighborhood(coord)),
-        });
-        if surface.stamp != stamp {
-            surface.mesh = surface_nets(&world.neighborhood(coord));
-            surface.stamp = stamp;
-        }
-        let terrain = &surface.mesh;
+        // Each async job contours its own contributing chunks: the shared
+        // cross-patch cache cannot cross worker threads, and the per-patch
+        // `wanted` set already dedups within a build.
+        let terrain = surface_nets(&world.neighborhood(coord));
         let chunk_base = (coord * CHUNK_SIZE).as_vec3();
         for tri in terrain.indices.chunks_exact(3) {
             let (a, b, c) = (
@@ -918,23 +916,41 @@ fn grass_stamp_dirty(world: &VoxelWorld, stamp: &PatchStamp) -> bool {
     })
 }
 
+/// Freeze the chunks one patch build can read into a standalone [`VoxelWorld`]
+/// of `Arc` clones, so the build runs on a worker thread without borrowing the
+/// live world. The box covers the column scan (one column past each edge,
+/// `GRASS_SCAN_DEPTH` below the ceiling), the ±1 neighbourhoods of every
+/// contributing chunk, and the smother probes just above the surface; one
+/// chunk of margin on every side absorbs the remainder.
+fn grass_snapshot(world: &VoxelWorld, patch: IVec2, ceiling: i32) -> VoxelWorld {
+    let min = patch * GRASS_PATCH_SIZE;
+    let max = min + IVec2::splat(GRASS_PATCH_SIZE);
+    let x_lo = (min.x - 1).div_euclid(CHUNK_SIZE) - 1;
+    let x_hi = max.x.div_euclid(CHUNK_SIZE) + 1;
+    let z_lo = (min.y - 1).div_euclid(CHUNK_SIZE) - 1;
+    let z_hi = max.y.div_euclid(CHUNK_SIZE) + 1;
+    let y_lo = (ceiling - GRASS_SCAN_DEPTH).div_euclid(CHUNK_SIZE) - 1;
+    let y_hi = (ceiling + 2).div_euclid(CHUNK_SIZE) + 1;
+    let mut snapshot = VoxelWorld::default();
+    for cy in y_lo..=y_hi {
+        for cz in z_lo..=z_hi {
+            for cx in x_lo..=x_hi {
+                let coord = IVec3::new(cx, cy, cz);
+                if let Some(chunk) = world.chunks.get(&coord) {
+                    snapshot.chunks.insert(coord, chunk.clone());
+                }
+            }
+        }
+    }
+    snapshot
+}
+
 /// A patch square is in range while its nearest point is inside the radius.
 fn grass_patch_in_range(coord: IVec2, focus: Vec2) -> bool {
     let size = GRASS_PATCH_SIZE as f32;
     let min = (coord * GRASS_PATCH_SIZE).as_vec2();
     let nearest = focus.clamp(min, min + Vec2::splat(size));
     nearest.distance_squared(focus) <= GRASS_RADIUS * GRASS_RADIUS
-}
-
-/// Count one patch stamp's chunk references; drop counts reaching zero.
-fn unref_stamp(refs: &mut HashMap<IVec3, u32>, stamp: &PatchStamp) {
-    for &(coord, _) in stamp {
-        let count = refs.get_mut(&coord).expect("installed stamp coord");
-        *count -= 1;
-        if *count == 0 {
-            refs.remove(&coord);
-        }
-    }
 }
 
 fn update_grass(
@@ -952,8 +968,7 @@ fn update_grass(
     let ceiling = (focus.0.y.floor() as i32).div_euclid(8) * 8 + 16;
     let GrassField {
         patches,
-        surfaces,
-        surface_refs,
+        jobs,
         dirty,
         checked_at,
         scan_focus,
@@ -964,7 +979,6 @@ fn update_grass(
         if grass_patch_in_range(coord, focus_xz) {
             return true;
         }
-        unref_stamp(surface_refs, &patch.stamp);
         if let Some((entity, handle)) = patch.draw.take() {
             commands.entity(entity).despawn();
             meshes.remove(handle.id());
@@ -980,11 +994,59 @@ fn update_grass(
         *checked_at = time.elapsed_secs();
         *scan_focus = focus.0;
     }
-    // A surface lives while a patch stamp still references it; the refcount
-    // index answers that in one lookup instead of rescanning every stamp.
-    surfaces.retain(|coord, _| {
-        world.chunks.contains_key(coord) && surface_refs.contains_key(coord)
-    });
+    // Collect finished builds, discarding any whose snapshot the live world
+    // has since invalidated (revision change, or a ceiling/LOD band shift).
+    for job in jobs.iter_mut() {
+        if job.ready.is_none() {
+            job.ready = block_on(future::poll_once(&mut job.task));
+        }
+    }
+    let mut i = 0;
+    while i < jobs.len() {
+        let job = &jobs[i];
+        let Some(data) = job.ready.as_ref() else {
+            i += 1;
+            continue;
+        };
+        let desired_lod = grass_lod(job.coord, focus_xz);
+        if job.lod != desired_lod
+            || job.ceiling != ceiling
+            || grass_stamp_dirty(&world, &data.stamp)
+        {
+            jobs.remove(i);
+            continue;
+        }
+        let mut job = jobs.remove(i);
+        let data = job.ready.take().expect("ready result checked above");
+        let Some(patch) = patches.get_mut(&job.coord) else {
+            continue;
+        };
+        patch.stamp = data.stamp;
+        patch.blades = data.blades;
+        patch.built = true;
+        patch.ceiling = job.ceiling;
+        patch.lod = job.lod;
+        if let Some((entity, handle)) = patch.draw.take() {
+            commands.entity(entity).despawn();
+            meshes.remove(handle.id());
+        }
+        if !data.mesh.indices.is_empty() {
+            let handle = meshes.add(data.mesh.into_mesh());
+            let entity = commands
+                .spawn((
+                    Mesh3d(handle.clone()),
+                    MeshMaterial3d(renderer.grass_material.clone()),
+                    // Mesh positions are already world-space.
+                    Transform::default(),
+                    // Supplied bounds include the shader wind offset; the mesh
+                    // is RENDER_WORLD so Bevy cannot compute one itself.
+                    data.bounds,
+                    NotShadowCaster,
+                ))
+                .id();
+            patch.draw = Some((entity, handle));
+        }
+    }
 
     // Gather dirty in-range patches, nearest first. `dirty` is reused scratch:
     // clear() keeps the allocation, so an unchanged world allocates nothing.
@@ -1029,41 +1091,33 @@ fn update_grass(
             .then_with(|| a.1.y.cmp(&b.1.y))
     });
 
-    let builds = dirty.len().min(GRASS_BUILDS_PER_UPDATE + dirty.len() / GRASS_BUILDS_PER_DIRTY);
-    for index in 0..builds {
+    // Dispatch nearest-first, bounded by the per-frame build budget and the
+    // in-flight job cap. Patches left over stay dirty and retry next frame.
+    let builds = dirty
+        .len()
+        .min(GRASS_BUILDS_PER_UPDATE + dirty.len() / GRASS_BUILDS_PER_DIRTY);
+    let mut dispatched = 0;
+    for index in 0..dirty.len() {
+        if dispatched >= builds || jobs.len() >= GRASS_MAX_JOBS {
+            break;
+        }
         let coord = dirty[index].1;
+        if jobs.iter().any(|job| job.coord == coord) {
+            continue;
+        }
         let lod = grass_lod(coord, focus_xz);
-        let data = grass_patch_mesh(&world, coord, ceiling, lod, surfaces);
-        let patch = patches.get_mut(&coord).expect("in-range patch");
-        unref_stamp(surface_refs, &patch.stamp);
-        for &(dep, _) in &data.stamp {
-            *surface_refs.entry(dep).or_insert(0) += 1;
-        }
-        patch.stamp = data.stamp;
-        patch.blades = data.blades;
-        patch.built = true;
-        patch.ceiling = ceiling;
-        patch.lod = lod;
-        if let Some((entity, handle)) = patch.draw.take() {
-            commands.entity(entity).despawn();
-            meshes.remove(handle.id());
-        }
-        if !data.mesh.indices.is_empty() {
-            let handle = meshes.add(data.mesh.into_mesh());
-            let entity = commands
-                .spawn((
-                    Mesh3d(handle.clone()),
-                    MeshMaterial3d(renderer.grass_material.clone()),
-                    // Mesh positions are already world-space.
-                    Transform::default(),
-                    // Supplied bounds include the shader wind offset; the mesh
-                    // is RENDER_WORLD so Bevy cannot compute one itself.
-                    data.bounds,
-                    NotShadowCaster,
-                ))
-                .id();
-            patch.draw = Some((entity, handle));
-        }
+        let snapshot = grass_snapshot(&world, coord, ceiling);
+        let task = AsyncComputeTaskPool::get().spawn(async move {
+            grass_patch_mesh(&snapshot, coord, ceiling, lod)
+        });
+        jobs.push(GrassJob {
+            coord,
+            ceiling,
+            lod,
+            task,
+            ready: None,
+        });
+        dispatched += 1;
     }
     stats.grass_blades = patches.values().map(|patch| patch.blades).sum();
 }
@@ -1828,7 +1882,7 @@ mod tests {
     fn grass_roots_lie_on_surface_nets_triangles() {
         // Roots must sit on the emitted sloped triangles, not integer columns.
         let world = sloped_grass_world();
-        let data = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut HashMap::new());
+        let data = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
         assert!(data.blades > 10, "patch grew only {} blades", data.blades);
         assert_eq!(data.mesh.positions.len(), data.blades * 5);
         assert_eq!(data.mesh.indices.len(), data.blades * 9);
@@ -1863,9 +1917,8 @@ mod tests {
     #[test]
     fn grass_patch_rebuilds_only_when_consulted_chunks_change() {
         let mut world = sloped_grass_world();
-        let mut surfaces = HashMap::new();
-        let first = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces);
-        let second = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces);
+        let first = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
+        let second = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
         assert_eq!(first.mesh.positions, second.mesh.positions);
         assert_eq!(first.mesh.indices, second.mesh.indices);
         assert!(!grass_stamp_dirty(&world, &first.stamp));
@@ -1879,11 +1932,11 @@ mod tests {
 
         // A far patch that never consulted the edited chunk stays clean;
         // loading a chunk it *did* scan (as missing) dirties it.
-        let far = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &mut surfaces);
+        let far = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0);
         assert!(!grass_stamp_dirty(&world, &far.stamp));
         world.insert(IVec3::new(1, 0, 1), chunk_with(|_| AIR));
         assert!(grass_stamp_dirty(&world, &far.stamp));
-        let loaded = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &mut surfaces);
+        let loaded = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0);
 
         // Unloading a consulted chunk is as dirty as editing it.
         world.remove(IVec3::new(1, 0, 1));
@@ -1904,7 +1957,7 @@ mod tests {
                 },
             ),
         );
-        let grown = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut HashMap::new());
+        let grown = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
         let cell_roots = |mesh: &MeshData| {
             grass_roots(mesh)
                 .into_iter()
@@ -1917,7 +1970,7 @@ mod tests {
         );
 
         world.set_block(IVec3::new(4, 16, 4), STONE);
-        let smothered = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut HashMap::new());
+        let smothered = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
         assert_eq!(cell_roots(&smothered.mesh), 0);
         assert!(smothered.blades < grown.blades);
         assert!(smothered.blades > grown.blades - 20, "whole patch suppressed");
@@ -1928,9 +1981,8 @@ mod tests {
         // Same patch at full density vs the far tier: the far mesh is a strict
         // subset — rank is position-seeded, so blades return identically.
         let world = sloped_grass_world();
-        let mut surfaces = HashMap::new();
-        let near = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces);
-        let far = grass_patch_mesh(&world, IVec2::ZERO, 48, 2, &mut surfaces);
+        let near = grass_patch_mesh(&world, IVec2::ZERO, 48, 0);
+        let far = grass_patch_mesh(&world, IVec2::ZERO, 48, 2);
         assert!(far.blades > 0);
         assert!(far.blades < near.blades * 3 / 10);
         for i in (0..far.mesh.colors.len()).step_by(5) {
