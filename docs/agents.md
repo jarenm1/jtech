@@ -32,15 +32,17 @@ game packages later.
 | `ActorKind::{dummy, titan, decoy}` | Built-in species tables |
 
 `ActorObservation` deliberately exposes only what a policy may see: own
-kinematic state, own health/cooldown, and the nearest living player/actor with
-a terrain-occlusion `line_of_sight` flag. Scripted brains consume the same
-struct, so recorded heuristic play is valid imitation data for later
-behavior-cloning warm starts.
+kinematic state, own health/cooldown, own locomotion `mode`, active `statuses`,
+per-slot `cooldowns`, any in-progress `cast`, and the nearest living
+player/actor with a terrain-occlusion `line_of_sight` flag. Scripted brains
+consume the same struct, so recorded heuristic play is valid imitation data for
+later behavior-cloning warm starts.
 
-`CharacterIntent` is the shared action contract. `ActorCapabilities` gates
-fields a species lacks (e.g. `ITEM` for equipment users); gated fields are
-zeroed before the motor — one fixed action shape, per-species dims at the
-environment layer.
+`CharacterIntent` is the shared action contract: held movement/turn, one-tick
+`jump` and `attack` edges, held `sprint`/`crouch`, and one-tick `ability` edges
+with a body-relative `aim`. `ActorCapabilities` gates fields a species lacks
+(e.g. `ITEM` for equipment users); gated fields are zeroed before the motor —
+one fixed action shape, per-species dims at the environment layer.
 
 ## Species
 
