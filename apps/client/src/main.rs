@@ -664,7 +664,7 @@ fn setup(
     } else {
         RenderTarget::Window(WindowRef::Primary)
     };
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera3d::default(),
         Camera {
             target,
@@ -680,6 +680,11 @@ fn setup(
         Transform::from_translation(session.state.position + Vec3::Y * EYE_HEIGHT),
         PlayerCamera,
     ));
+    if options.headless {
+        // `DefaultUiCamera` only accepts window targets, so an offscreen camera
+        // is never picked implicitly and the HUD would not render at all.
+        camera.insert(IsDefaultUiCamera);
+    }
     commands.insert_resource(ActorAssets {
         mesh: meshes.add(Cuboid::new(0.6, PLAYER_HEIGHT, 0.6)),
         material: materials.add(StandardMaterial {
