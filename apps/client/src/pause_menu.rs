@@ -263,10 +263,7 @@ mod tests {
             .init_resource::<AccumulatedMouseMotion>()
             .insert_resource(Options {
                 server: "127.0.0.1:4000".parse().unwrap(),
-                bot: false,
-                frames: None,
-                screenshot: None,
-                lighting: crate::lighting::DayCycle::default(),
+                ..default()
             })
             .add_message::<AppExit>()
             .add_systems(Startup, |mut commands: Commands| spawn(&mut commands))

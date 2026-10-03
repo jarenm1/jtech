@@ -463,10 +463,7 @@ fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
     let mut app = App::new();
     app.insert_resource(Options {
         server: "127.0.0.1:4000".parse().unwrap(),
-        bot: false,
-        frames: None,
-        screenshot: None,
-        lighting: lighting::DayCycle::default(),
+        ..default()
     })
     .insert_resource(ClientSession {
         selected: 6,
@@ -867,10 +864,7 @@ fn controls_block_look_and_slot_changes_while_dead() {
     let mut app = App::new();
     app.insert_resource(Options {
         server: "127.0.0.1:4000".parse().unwrap(),
-        bot: false,
-        frames: None,
-        screenshot: None,
-        lighting: lighting::DayCycle::default(),
+        ..default()
     })
     .insert_resource(ClientSession {
         selected: 3,

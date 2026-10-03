@@ -33,6 +33,29 @@ agent work happens in a dedicated jj workspace under `~/workspaces/`.
 - Long-running processes bind ephemeral ports (`--bind 127.0.0.1:0`), never
   the default port — it collides with other agents' servers and the human's.
 
+### Resource governance
+
+Agents share one workstation (8 cores, one GPU). Cap every long build, test,
+or render through `scripts/agent-scope.sh` so one agent cannot saturate the
+CPU or open a competing GPU context:
+
+```sh
+scripts/agent-scope.sh -- cargo test -p simulation
+scripts/agent-scope.sh --cpu-quota 200% -- cargo build
+scripts/agent-scope.sh --gpu -- cargo run -p voxel-client -- --headless --frames 300 --screenshot /tmp/shot.png
+```
+
+- Defaults: `CPUQuota=400%` (half the cores), `MemoryMax=8G`, swap disabled.
+  Override with `--cpu-quota`/`--memory-max` or `AGENT_CPU_QUOTA`/
+  `AGENT_MEMORY_MAX`.
+- `CARGO_BUILD_JOBS` is derived from the quota, so a capped scope does not
+  spawn more compilers than it can run.
+- `--gpu` takes an exclusive `flock` so only one agent touches the GPU at a
+  time. CPU-only work — including `--headless --render-backend software` —
+  does not need it.
+- Prefer the headless software renderer for visual checks (see "Visual
+  evidence"); it uses no GPU at all.
+
 ### Commits
 
 - This repo uses jj (colocated with git). Use `jj` exclusively — never
@@ -127,9 +150,15 @@ first:
 - **Headless asserts** — `cargo run -p server --bin smoke` already runs a
   scripted client in-process; add assertions and paste the output. Preferred
   for logic; not visual.
+- **Headless captures** — `voxel-client --headless --render-backend software
+  --frames N --screenshot out.png` renders offscreen on the CPU (lavapipe), so
+  it needs no display server and no GPU. Use it for visual evidence when the
+  host display is busy or you want zero GPU impact. Slower than the real GPU:
+  fine for stills, not for frame-time numbers.
 - **Screenshots** — run the client on the host display
   (`DISPLAY=:0`/`WAYLAND_DISPLAY=wayland-1` are set in this environment),
   capture with `grim` (wayland) or `import -window root`, and link the file.
+  Wrap GPU runs in `scripts/agent-scope.sh --gpu --` so they serialize.
 - **Clips** — `ffmpeg -f x11grab` / `wl-screenrec` can record the running
   client window. Works, but flaky under load; budget a few retries.
 

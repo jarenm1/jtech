@@ -363,10 +363,7 @@ mod tests {
             .init_resource::<ButtonInput<MouseButton>>()
             .insert_resource(crate::Options {
                 server: "127.0.0.1:4000".parse().unwrap(),
-                bot: false,
-                frames: None,
-                screenshot: None,
-                lighting: crate::lighting::DayCycle::default(),
+                ..default()
             })
             .add_systems(Startup, |mut commands: Commands| {
                 spawn(&mut commands);
