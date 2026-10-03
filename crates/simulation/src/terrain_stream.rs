@@ -37,8 +37,17 @@ pub(super) struct TerrainStream {
     results: Mutex<mpsc::Receiver<Completed>>,
     pending_columns: HashSet<IVec2>,
     pending_chunks: HashSet<IVec3>,
+    /// Surveyed column bounds, retained to current interest. Only `poll`
+    /// inserts here; it flags `bounds_stale` when a completion lands outside
+    /// `wanted` so `survey` knows a retain pass is owed.
     pub bounds: HashMap<IVec2, (i32, i32)>,
     pub revision: u64,
+    /// Last `survey` inputs that produced `wanted`: column coords and radius.
+    survey_centers: Vec<IVec2>,
+    survey_radius: i32,
+    wanted: HashSet<IVec2>,
+    missing: Vec<IVec3>,
+    bounds_stale: bool,
 }
 
 impl TerrainStream {
@@ -93,6 +102,11 @@ impl TerrainStream {
             pending_chunks: HashSet::new(),
             bounds: HashMap::new(),
             revision: 0,
+            survey_centers: Vec::new(),
+            survey_radius: 0,
+            wanted: HashSet::new(),
+            missing: Vec::new(),
+            bounds_stale: false,
         })
     }
 
@@ -112,6 +126,7 @@ impl TerrainStream {
                 Completed::Survey(column, bounds) => {
                     self.pending_columns.remove(&column);
                     self.bounds.insert(column, bounds);
+                    self.bounds_stale |= !self.wanted.contains(&column);
                     self.revision += 1;
                 }
                 Completed::Generate(coord, chunk, scatter) => {
@@ -144,36 +159,62 @@ impl TerrainStream {
     }
 
     pub fn survey(&mut self, centers: &[IVec3], radius: i32) {
-        let mut wanted = HashSet::new();
-        for center in centers {
-            for z in -radius..=radius {
-                for x in -radius..=radius {
-                    let column = IVec2::new(center.x + x, center.z + z);
-                    if column.x.abs_diff(0) <= 1_000_000 && column.y.abs_diff(0) <= 1_000_000 {
-                        wanted.insert(column);
+        // Interest moves with chunk-crossing players, not ticks; rebuild the
+        // wanted set only when a center or the radius actually changed.
+        let changed = self.survey_radius != radius
+            || self.survey_centers.len() != centers.len()
+            || self
+                .survey_centers
+                .iter()
+                .zip(centers)
+                .any(|(cached, center)| cached.x != center.x || cached.y != center.z);
+        if changed {
+            self.survey_radius = radius;
+            self.survey_centers.clear();
+            self.survey_centers
+                .extend(centers.iter().map(|center| IVec2::new(center.x, center.z)));
+            self.wanted.clear();
+            for center in centers {
+                for z in -radius..=radius {
+                    for x in -radius..=radius {
+                        let column = IVec2::new(center.x + x, center.z + z);
+                        if column.x.abs_diff(0) <= 1_000_000 && column.y.abs_diff(0) <= 1_000_000
+                        {
+                            self.wanted.insert(column);
+                        }
                     }
                 }
             }
+            self.bounds_stale = true;
         }
-        // Bound cache memory to current interest, including requests still in flight.
-        self.bounds.retain(|column, _| wanted.contains(column));
-        let missing = wanted
-            .into_iter()
-            .filter(|column| {
-                !self.bounds.contains_key(column) && !self.pending_columns.contains(column)
-            })
-            .map(|column| IVec3::new(column.x, 0, column.y))
-            .collect();
-        for coord in nearest_chunks(missing, SURVEYS_PER_TICK.min(self.capacity()), |coord| {
+        // Bound cache memory to current interest, including requests still in
+        // flight. While inputs are steady only a stale `poll` completion can
+        // leave an out-of-interest entry behind.
+        if self.bounds_stale {
+            self.bounds.retain(|column, _| self.wanted.contains(column));
+            self.bounds_stale = false;
+        }
+        let limit = SURVEYS_PER_TICK.min(self.capacity());
+        if limit == 0 {
+            return;
+        }
+        self.missing.clear();
+        self.missing.extend(self.wanted.iter().filter_map(|column| {
+            (!self.bounds.contains_key(column) && !self.pending_columns.contains(column))
+                .then(|| IVec3::new(column.x, 0, column.y))
+        }));
+        self.missing = nearest_chunks(std::mem::take(&mut self.missing), limit, |coord| {
             centers
                 .iter()
                 .map(|center| {
-                    let delta = coord.as_i64vec3() - IVec3::new(center.x, 0, center.z).as_i64vec3();
+                    let delta =
+                        coord.as_i64vec3() - IVec3::new(center.x, 0, center.z).as_i64vec3();
                     delta.length_squared()
                 })
                 .min()
                 .unwrap_or(0)
-        }) {
+        });
+        for coord in self.missing.drain(..) {
             let column = IVec2::new(coord.x, coord.z);
             self.requests
                 .try_send(Work::Survey(column))
