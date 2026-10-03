@@ -641,6 +641,143 @@ pub fn separate_bodies(
     }
 }
 
+/// Result of a ground support probe.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Support {
+    /// Unit surface normal pointing up out of the ground.
+    pub normal: Vec3,
+    /// Dynamic body providing support, when the ground is a loose body.
+    pub body: Option<u32>,
+}
+
+/// How far below the feet the support probe reaches.
+const SUPPORT_PROBE: f32 = 0.05;
+
+/// Worst density over a box's eight corners, six face centers and center:
+/// `Some(max)` or `None` when every sample is unloaded. Clearance tests must
+/// catch a thin feature anywhere inside the volume, not just on one face, so
+/// this samples the whole shell rather than a single face.
+fn box_density(world: &VoxelWorld, min: Vec3, max: Vec3) -> Option<f32> {
+    let mid = (min + max) * 0.5;
+    let mut points = [Vec3::ZERO; 15];
+    for (i, point) in points.iter_mut().take(8).enumerate() {
+        *point = Vec3::new(
+            if i & 1 == 0 { min.x } else { max.x },
+            if i & 2 == 0 { min.y } else { max.y },
+            if i & 4 == 0 { min.z } else { max.z },
+        );
+    }
+    points[8] = mid;
+    for axis in 0..3 {
+        let mut lo = mid;
+        lo[axis] = min[axis];
+        points[9 + axis * 2] = lo;
+        let mut hi = mid;
+        hi[axis] = max[axis];
+        points[10 + axis * 2] = hi;
+    }
+    points
+        .iter()
+        .filter_map(|p| world.density_at(*p))
+        .reduce(f32::max)
+}
+
+/// True when a feet-anchored shape at `position` is clear of smooth terrain,
+/// discrete solids, and observed dynamic bodies. Blink targets, crouch/uncrouch
+/// and step-up trials all need this; the axis sweeps only answer "did I hit".
+pub fn clearance(
+    world: &VoxelWorld,
+    position: Vec3,
+    shape: CollisionShape,
+    bodies: &BodyBroadphase<'_>,
+) -> bool {
+    if !position.is_finite() {
+        return false;
+    }
+    let (min, max) = bounds(position, shape);
+    if box_density(world, min, max).is_some_and(|d| d > 0.0) {
+        return false;
+    }
+    let first = (min + Vec3::splat(EPSILON)).floor().as_ivec3();
+    let last = (max - Vec3::splat(EPSILON)).floor().as_ivec3();
+    if (first.y..=last.y).any(|y| {
+        (first.z..=last.z).any(|z| (first.x..=last.x).any(|x| solid(world, IVec3::new(x, y, z))))
+    }) {
+        return false;
+    }
+    let mut candidates = Vec::new();
+    bodies.query(min, max, &mut candidates);
+    for &index in &candidates {
+        let body = &bodies.bodies()[index as usize];
+        if !body.position.is_finite() {
+            continue;
+        }
+        let (lo, hi) = body.aabb();
+        if min.cmplt(hi - Vec3::splat(EPSILON)).all() && max.cmpgt(lo + Vec3::splat(EPSILON)).all() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Downward support probe at the feet. Returns the ground normal and the
+/// supporting dynamic body, or `None` when nothing is within probe reach.
+/// Smooth terrain reports the iso-surface normal; discrete solids and loose
+/// bodies report their axis-aligned top face.
+pub fn support(
+    world: &VoxelWorld,
+    position: Vec3,
+    shape: CollisionShape,
+    bodies: &BodyBroadphase<'_>,
+) -> Option<Support> {
+    if !position.is_finite() {
+        return None;
+    }
+    let mut probe = position;
+    if !sweep_with_bodies(world, &mut probe, 1, -SUPPORT_PROBE, bodies, None, shape) {
+        return None;
+    }
+    let (min, max) = bounds(position, shape);
+    // A loose body whose top face sits under the feet is the support.
+    let mut candidates = Vec::new();
+    bodies.query(min - Vec3::Y * SUPPORT_PROBE, max, &mut candidates);
+    for &index in &candidates {
+        let body = &bodies.bodies()[index as usize];
+        if !body.position.is_finite() {
+            continue;
+        }
+        let (lo, hi) = body.aabb();
+        if max.x > lo.x + EPSILON
+            && min.x < hi.x - EPSILON
+            && max.z > lo.z + EPSILON
+            && min.z < hi.z - EPSILON
+            && hi.y <= min.y + EPSILON
+            && hi.y >= min.y - SUPPORT_PROBE - EPSILON
+        {
+            return Some(Support {
+                normal: Vec3::Y,
+                body: Some(body.id),
+            });
+        }
+    }
+    // A placed cube or unloaded cell under the feet is an axis-aligned top face.
+    let below = (position - Vec3::Y * SUPPORT_PROBE).floor().as_ivec3();
+    if solid(world, below) {
+        return Some(Support {
+            normal: Vec3::Y,
+            body: None,
+        });
+    }
+    // Smooth terrain: the normal is opposite the density gradient, sampled
+    // just below the feet where the field is inside terrain.
+    let normal = world
+        .density_gradient(position - Vec3::Y * SUPPORT_PROBE)
+        .filter(|g| g.length_squared() > EPSILON)
+        .map(|g| -g.normalize())
+        .unwrap_or(Vec3::Y);
+    Some(Support { normal, body: None })
+}
+
 /// Compatibility name for the human network state.
 pub type PlayerState = KinematicState;
 
@@ -690,6 +827,25 @@ impl Default for CollisionShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voxel_world::{AIR, Chunk, STONE};
+
+    /// Two stone chunks under two air chunks: the iso surface rests near y = -0.5.
+    fn arena() -> VoxelWorld {
+        let mut world = VoxelWorld::default();
+        for x in -1..=0 {
+            for z in -1..=0 {
+                world.insert(
+                    IVec3::new(x, 0, z),
+                    Chunk::from_runs(0, &[(32768, AIR)]).unwrap(),
+                );
+                world.insert(
+                    IVec3::new(x, -1, z),
+                    Chunk::from_runs(0, &[(32768, STONE)]).unwrap(),
+                );
+            }
+        }
+        world
+    }
 
     #[test]
     fn raycast_body_reports_entry_distance_and_misses() {
@@ -709,5 +865,41 @@ mod tests {
         // Non-finite inputs miss rather than panic.
         assert!(raycast_body(Vec3::ZERO, Vec3::ZERO, feet, shape).is_none());
         assert!(raycast_body(Vec3::splat(f32::NAN), Vec3::NEG_Z, feet, shape).is_none());
+    }
+
+    #[test]
+    fn clearance_rejects_terrain_solids_and_bodies() {
+        let mut world = arena();
+        let shape = CollisionShape::default();
+        let empty = BodyBroadphase::new(&[]);
+        // Standing on the iso surface is clear.
+        assert!(clearance(&world, Vec3::new(0.5, -0.5, 0.5), shape, &empty));
+        // Buried in the stone layer is not.
+        assert!(!clearance(&world, Vec3::new(0.5, -1.0, 0.5), shape, &empty));
+        // A placed cube inside the volume blocks it.
+        world.set_block(IVec3::new(0, 0, 0), STONE);
+        assert!(!clearance(&world, Vec3::new(0.5, 0.0, 0.5), shape, &empty));
+        // An observed loose body overlapping the volume blocks it.
+        let bodies = [DynamicCollider::cube(7, Vec3::new(0.5, 1.0, 0.5), Vec3::ZERO)];
+        let broadphase = BodyBroadphase::new(&bodies);
+        assert!(!clearance(&world, Vec3::new(0.5, 0.0, 0.5), shape, &broadphase));
+    }
+
+    #[test]
+    fn support_reports_ground_normal_and_body() {
+        let world = arena();
+        let shape = CollisionShape::default();
+        let empty = BodyBroadphase::new(&[]);
+        // On the iso surface: supported, normal points up.
+        let ground = support(&world, Vec3::new(0.5, -0.5, 0.5), shape, &empty).unwrap();
+        assert!(ground.normal.y > 0.9, "{:?}", ground.normal);
+        assert_eq!(ground.body, None);
+        // Mid-air: nothing within probe reach.
+        assert!(support(&world, Vec3::new(0.5, 10.0, 0.5), shape, &empty).is_none());
+        // A loose body under the feet is the support.
+        let bodies = [DynamicCollider::cube(3, Vec3::new(0.5, -1.0, 0.5), Vec3::ZERO)];
+        let broadphase = BodyBroadphase::new(&bodies);
+        let ground = support(&world, Vec3::new(0.5, -0.5, 0.5), shape, &broadphase).unwrap();
+        assert_eq!(ground.body, Some(3));
     }
 }
