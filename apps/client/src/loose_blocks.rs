@@ -1,5 +1,8 @@
 //! Presentation of authoritative GPU bodies. Clients interpolate; they do not solve physics.
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use bevy::prelude::*;
 use protocol::PhysicsBodySnapshot;
@@ -25,6 +28,8 @@ pub struct LooseBlocks {
     bodies: HashMap<u32, BodyVisual>,
     tick: Option<u64>,
     colliders: Vec<physics::DynamicCollider>,
+    /// Scratch: ids in the latest snapshot, for despawn reconciliation.
+    scratch_ids: HashSet<u32>,
 }
 
 #[derive(Resource)]
@@ -74,21 +79,24 @@ impl LooseBlocks {
             return;
         }
         self.tick = Some(tick);
-        self.colliders = bodies
-            .iter()
-            .filter(|body| {
-                body.position.is_finite()
-                    && body.velocity.is_finite()
-                    && body.material > 0
-                    && body.material <= voxel_world::WOOD
-            })
-            .map(|body| physics::DynamicCollider::cube(body.id, body.position, body.velocity))
-            .collect();
+        self.colliders.clear();
+        self.colliders.extend(
+            bodies
+                .iter()
+                .filter(|body| {
+                    body.position.is_finite()
+                        && body.velocity.is_finite()
+                        && body.material > 0
+                        && body.material <= voxel_world::WOOD
+                })
+                .map(|body| physics::DynamicCollider::cube(body.id, body.position, body.velocity)),
+        );
         self.colliders.sort_unstable_by_key(|body| body.id);
         let now = Instant::now();
-        let ids: std::collections::HashSet<_> = bodies.iter().map(|body| body.id).collect();
+        self.scratch_ids.clear();
+        self.scratch_ids.extend(bodies.iter().map(|body| body.id));
         self.bodies.retain(|id, visual| {
-            if ids.contains(id) {
+            if self.scratch_ids.contains(id) {
                 true
             } else {
                 commands.entity(visual.entity).despawn();
