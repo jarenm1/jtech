@@ -7,7 +7,11 @@ use physics::{PLAYER_HEIGHT, PLAYER_MASS, PlayerState};
 #[cfg(test)]
 use protocol::BowPower;
 use protocol::PhysicsBodySnapshot;
-use voxel_world::{CHUNK_SIZE, MIN_CHUNK_Y, VoxelWorld};
+use voxel_world::{AIR, CHUNK_SIZE, MIN_CHUNK_Y, VoxelWorld};
+
+// Occupancy-grid sentinel for cells in unloaded chunks. Stored `u8` materials
+// never reach `u8::MAX` (block ids stay within `AIR..=WOOD`).
+const UNLOADED: u8 = u8::MAX;
 
 // A full-health player survives one blast at any preset. Larger radii extend
 // the dangerous area; repeated close shots are lethal without sacrificing jumps.
@@ -88,6 +92,36 @@ pub(super) fn plan_blast(
         .iter()
         .filter(|body| (body.position - center).length_squared() <= reach_limit * reach_limit)
         .collect();
+    // Snapshot the blast volume once: candidate scan, blast-side neighbour
+    // tests, and sight-line marches then read a flat array instead of the
+    // chunk HashMap. `UNLOADED` preserves `block()?` short-circuit semantics.
+    let extent = max - min + IVec3::ONE;
+    let row = extent.x as usize;
+    let slab = (extent.x * extent.z) as usize;
+    let mut blocks = vec![UNLOADED; (extent.x * extent.y * extent.z) as usize];
+    for y in min.y..=max.y {
+        for z in min.z..=max.z {
+            for x in min.x..=max.x {
+                if let Some(material) = world.block(IVec3::new(x, y, z)) {
+                    blocks[(y - min.y) as usize * slab
+                        + (z - min.z) as usize * row
+                        + (x - min.x) as usize] = material;
+                }
+            }
+        }
+    }
+    let block_at = |cell: IVec3| -> Option<u8> {
+        let local = cell - min;
+        if local.cmpge(IVec3::ZERO).all() && local.cmplt(extent).all() {
+            match blocks[local.y as usize * slab + local.z as usize * row + local.x as usize]
+            {
+                UNLOADED => None,
+                material => Some(material),
+            }
+        } else {
+            world.block(cell)
+        }
+    };
     let span = (max - min + IVec3::ONE).max(IVec3::ZERO);
     let cells = (span.x as usize) * (span.y as usize) * (span.z as usize);
     let mut candidates = Vec::with_capacity(cells + nearby.len());
@@ -98,7 +132,11 @@ pub(super) fn plan_blast(
         for z in min.z..=max.z {
             for x in min.x..=max.x {
                 let cell = IVec3::new(x, y, z);
-                if let Some(material @ 1..=5) = world.block(cell) {
+                if let material @ 1..=5 = blocks
+                    [(y - min.y) as usize * slab
+                        + (z - min.z) as usize * row
+                        + (x - min.x) as usize]
+                {
                     candidates.push((
                         Target::Grid(cell),
                         cell.as_vec3() + Vec3::splat(0.5),
@@ -130,13 +168,23 @@ pub(super) fn plan_blast(
             }
             let mut normal = Vec3::ZERO;
             normal[axis] = -offset[axis].signum();
+            if let Target::Grid(cell) = target {
+                // The sight-line's last interior cell is the voxel across this
+                // face toward the blast. Solid: it is hit first. Unloaded: the
+                // march ends there. Either way this face is never the first hit.
+                let mut step = IVec3::ZERO;
+                step[axis] = -offset[axis].signum() as i32;
+                if block_at(cell + step) != Some(AIR) {
+                    continue;
+                }
+            }
             let face = position + normal * 0.5;
             let ray = face - center;
             let reach = ray.length();
             let aim = ray / reach;
-            let terrain_hit = world.raycast(center, aim, reach + 0.0001);
+            let terrain_hit = raycast_block(&block_at, center, aim, reach + 0.0001);
             let terrain_clear = match target {
-                Target::Grid(cell) => terrain_hit.is_some_and(|hit| hit.block == cell),
+                Target::Grid(cell) => terrain_hit == Some(cell),
                 Target::Body(_) | Target::Player(_) => terrain_hit.is_none(),
             };
             if terrain_clear
@@ -179,7 +227,7 @@ pub(super) fn plan_blast(
             .into_iter()
             .filter(|height| {
                 let sample = state.position + Vec3::Y * (PLAYER_HEIGHT * height);
-                player_ray_clear(world, &nearby, center, sample)
+                player_ray_clear(&block_at, &nearby, center, sample)
             })
             .count() as f32
             / 3.0;
@@ -237,8 +285,57 @@ pub(super) fn plan_blast(
         .collect()
 }
 
+/// `VoxelWorld::raycast` marching caller-supplied occupancy (`None` = unloaded,
+/// which ends the march). Returns the first solid cell, matching `RayHit.block`.
+fn raycast_block(
+    block_at: &impl Fn(IVec3) -> Option<u8>,
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+) -> Option<IVec3> {
+    if !origin.is_finite()
+        || !direction.is_finite()
+        || !max_distance.is_finite()
+        || max_distance < 0.0
+        || origin.abs().max_element() > 32_000_000.0
+    {
+        return None;
+    }
+    let direction = direction.try_normalize()?;
+    let mut cell = origin.floor().as_ivec3();
+    let step = direction.signum().as_ivec3();
+    let mut next = Vec3::splat(f32::INFINITY);
+    let mut delta = Vec3::splat(f32::INFINITY);
+    for axis in 0..3 {
+        if direction[axis] != 0.0 {
+            let boundary = cell[axis] as f32 + if direction[axis] > 0.0 { 1.0 } else { 0.0 };
+            next[axis] = (boundary - origin[axis]) / direction[axis];
+            delta[axis] = direction[axis].abs().recip();
+        }
+    }
+
+    for _ in 0..4096 {
+        if block_at(cell)? != AIR {
+            return Some(cell);
+        }
+        let axis = if next.x <= next.y && next.x <= next.z {
+            0
+        } else if next.y <= next.z {
+            1
+        } else {
+            2
+        };
+        if next[axis] > max_distance {
+            return None;
+        }
+        cell[axis] += step[axis];
+        next[axis] += delta[axis];
+    }
+    None
+}
+
 fn player_ray_clear(
-    world: &VoxelWorld,
+    block_at: &impl Fn(IVec3) -> Option<u8>,
     bodies: &[&PhysicsBodySnapshot],
     center: Vec3,
     sample: Vec3,
@@ -246,9 +343,9 @@ fn player_ray_clear(
     let ray = sample - center;
     let reach = ray.length();
     let Some(aim) = ray.try_normalize() else {
-        return world.block(center.floor().as_ivec3()) == Some(0);
+        return block_at(center.floor().as_ivec3()) == Some(AIR);
     };
-    world.raycast(center, aim, reach).is_none()
+    raycast_block(block_at, center, aim, reach).is_none()
         && !bodies
             .iter()
             .any(|body| super::bow::ray_cube(center, aim, body.position, reach).is_some())
