@@ -1,5 +1,5 @@
 use super::*;
-use controller::step_player;
+use controller::{CharacterState, step_player};
 use protocol::PlayerSnapshot;
 use voxel_world::{AIR, STONE};
 fn arena() -> VoxelWorld {
@@ -48,9 +48,8 @@ fn reconciliation_preserves_blast_momentum_through_input_replay() {
             id: 1,
             last_input: 4,
             life: 0,
-            state: authoritative,
+            state: CharacterState { motion: authoritative, ..Default::default() },
             health: Health::default(),
-            yaw: 0.0,
         },
         players: vec![],
         actors: vec![],
@@ -96,9 +95,8 @@ fn reconciliation_copies_authoritative_health_without_predicting_damage() {
             id: 1,
             last_input: 0,
             life: 0,
-            state: start,
+            state: CharacterState { motion: start, ..Default::default() },
             health,
-            yaw: 0.0,
         },
         players: vec![],
         actors: vec![],
@@ -207,9 +205,8 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
             id: 1,
             last_input: 10,
             life: 0,
-            state: acknowledged,
+            state: CharacterState { motion: acknowledged, ..Default::default() },
             health: Health::default(),
-            yaw: 0.0,
         },
         players: vec![],
         actors: vec![],
@@ -230,9 +227,8 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
                 id: 1,
                 last_input: 30,
                 life: 0,
-                state: expected,
+                state: CharacterState { motion: expected, ..Default::default() },
                 health: Health::default(),
-                yaw: 0.0,
             },
             players: vec![],
         actors: vec![],
@@ -277,9 +273,8 @@ fn terrain_changes_are_used_when_replaying_prediction() {
                 id: 1,
                 last_input: 0,
                 life: 0,
-                state: start,
+                state: CharacterState { motion: start, ..Default::default() },
                 health: Health::default(),
-                yaw: 0.0,
             },
             players: vec![],
         actors: vec![],
@@ -321,9 +316,8 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
                 id: 1,
                 last_input: 0,
                 life: 0,
-                state: start,
+                state: CharacterState { motion: start, ..Default::default() },
                 health: Health::default(),
-                yaw: 0.0,
             },
             players: vec![],
         actors: vec![],
@@ -597,9 +591,8 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
             id: 1,
             last_input: 5,
             life: 0,
-            state: acknowledged,
+            state: CharacterState { motion: acknowledged, ..Default::default() },
             health: Health::default(),
-            yaw: 0.0,
         },
         players: vec![],
         actors: vec![],
@@ -619,11 +612,11 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
     // Replaying an older flying snapshot includes the later exit command.
     snapshot.tick = 10;
     snapshot.you.last_input = 10;
-    snapshot.you.state = acknowledged;
+    snapshot.you.state.motion = acknowledged;
     for sequence in 6..=10 {
         step_player(
             &world,
-            &mut snapshot.you.state,
+            &mut snapshot.you.state.motion,
             &PlayerInput {
                 sequence,
                 noclip: true,
@@ -658,10 +651,9 @@ fn snapshot(tick: u64, life: u64, state: PlayerState, health: Health) -> Snapsho
         you: PlayerSnapshot {
             id: 1,
             last_input: 0,
-            state: state,
+            state: CharacterState { motion: state, ..Default::default() },
             health,
             life,
-            yaw: 0.0,
         },
         players: vec![],
         actors: vec![],

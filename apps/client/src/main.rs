@@ -1043,7 +1043,7 @@ fn reconcile(
     let life_changed = snapshot.you.life != session.life;
     session.life = snapshot.you.life;
     session.health = snapshot.you.health;
-    session.state = snapshot.you.state;
+    session.state = snapshot.you.state.motion;
     while session
         .pending
         .front()
@@ -1058,7 +1058,7 @@ fn reconcile(
         session.pending.clear();
         session.correction = Vec3::ZERO;
         session.accumulator = 0.0;
-        session.noclip_requested = snapshot.you.state.noclip;
+        session.noclip_requested = snapshot.you.state.motion.noclip;
         session.jump_pending = false;
         return;
     }

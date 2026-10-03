@@ -27,7 +27,8 @@ use networking::ServerTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PlayerState, look_direction, overlaps_block};
 use physics_slice::PhysicsSlice;
 use protocol::{
-    ActorSnapshot, ClientMessage, EditRejection, InputPacket, PlayerSnapshot, ServerMessage, Snapshot,
+    ActorSnapshot, ClientMessage, EditRejection, InputPacket, PlayerSnapshot,
+    RemotePlayerSnapshot, ServerMessage, Snapshot,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -319,6 +320,14 @@ impl Player {
         PlayerSnapshot {
             id,
             last_input: self.last_input,
+            state: self.state,
+            health: self.health,
+            life: self.life,
+        }
+    }
+    fn remote_snapshot(&self, id: u64) -> RemotePlayerSnapshot {
+        RemotePlayerSnapshot {
+            id,
             state: self.state.motion,
             health: self.health,
             life: self.life,
@@ -1494,18 +1503,18 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         // interest set covers instead of rescanning all entities. The bucket
         // map costs one allocation per occupied chunk rather than a filtered
         // scan plus a Vec per recipient.
-        let mut player_buckets: HashMap<IVec3, Vec<PlayerSnapshot>> = HashMap::new();
+        let mut player_buckets: HashMap<IVec3, Vec<RemotePlayerSnapshot>> = HashMap::new();
         for (&id, player) in &sim.players {
             let chunk = chunk_coord(player.state.motion.position.floor().as_ivec3());
             player_buckets
                 .entry(chunk)
                 .or_default()
-                .push(player.snapshot(id));
+                .push(player.remote_snapshot(id));
         }
         let actor_buckets = sim.actor_snapshot_buckets();
         // Scratch buffers are handed to each Snapshot, then reclaimed for the
         // next recipient, so capacity persists across the whole loop.
-        let mut player_scratch: Vec<PlayerSnapshot> = Vec::new();
+        let mut player_scratch: Vec<RemotePlayerSnapshot> = Vec::new();
         let mut actor_scratch: Vec<ActorSnapshot> = Vec::new();
         for id in ids {
             let Some(player) = sim.players.get(&id) else {
