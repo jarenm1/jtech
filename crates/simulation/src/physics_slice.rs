@@ -373,21 +373,26 @@ impl PhysicsSlice {
     }
 
     pub fn dynamic_colliders(&self) -> Vec<physics::DynamicCollider> {
-        self.ids
-            .iter()
-            .zip(&self.bodies)
-            .map(|(&id, body)| {
-                physics::DynamicCollider::cube(
-                    id,
-                    Vec3::from_array(body.position),
-                    if self.failed {
-                        Vec3::ZERO
-                    } else {
-                        Vec3::from_array(body.velocity)
-                    },
-                )
-            })
-            .collect()
+        let mut out = Vec::new();
+        self.dynamic_colliders_into(&mut out);
+        out
+    }
+
+    /// Fill `out` with the current dynamic colliders, reusing its capacity so
+    /// per-tick callers do not allocate a fresh `Vec` each time.
+    pub fn dynamic_colliders_into(&self, out: &mut Vec<physics::DynamicCollider>) {
+        out.clear();
+        out.extend(self.ids.iter().zip(&self.bodies).map(|(&id, body)| {
+            physics::DynamicCollider::cube(
+                id,
+                Vec3::from_array(body.position),
+                if self.failed {
+                    Vec3::ZERO
+                } else {
+                    Vec3::from_array(body.velocity)
+                },
+            )
+        }));
     }
 
     pub fn step(&mut self, world: &VoxelWorld) {
