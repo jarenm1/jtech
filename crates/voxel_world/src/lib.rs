@@ -7,7 +7,7 @@ use std::{
 };
 
 pub mod terrain;
-pub use terrain::{Biome, TerrainGenerator, TerrainSample};
+pub use terrain::{Biome, PreparedColumn, TerrainGenerator, TerrainSample};
 
 pub const CHUNK_SIZE: i32 = 32;
 pub const CHUNK_VOLUME: usize = 32768;
@@ -413,6 +413,14 @@ impl Chunk {
     /// Generate this chunk from a compiled terrain graph.
     pub fn generate_with(coord: IVec3, seed: u64, generator: &TerrainGenerator) -> Self {
         crate::terrain::generate_chunk(coord, seed, generator)
+    }
+
+    /// Generate this chunk's slice of a column already prepared with
+    /// [`TerrainGenerator::prepare_column`]. Identical output to
+    /// [`Self::generate_with`], but all column-scoped sampling is shared
+    /// across the column's chunks instead of repeated per chunk.
+    pub fn generate_with_column(coord: IVec3, seed: u64, column: &PreparedColumn) -> Self {
+        crate::terrain::generate_chunk_from_column(coord, seed, column)
     }
 
     /// Collapse to the cheapest storage tier that preserves the voxel state.

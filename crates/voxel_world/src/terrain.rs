@@ -16,7 +16,7 @@ use crate::{
     WORLD_MAX_Y, WORLD_MIN_Y,
 };
 use glam::IVec3;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Version of the Scheme authoring surface accepted by the loader.
 pub const TERRAIN_API_VERSION: u32 = 1;
@@ -811,16 +811,29 @@ impl TerrainGenerator {
     /// the rendered surface height less the species sink, so a model authored
     /// with its base at the origin sits on the ground.
     pub fn scatter_chunk(&self, coord: IVec3, seed: u64) -> Vec<ScatterInstance> {
-        let scatter = &self.inner.scatter;
-        if scatter.species.is_empty() {
+        if self.inner.scatter.species.is_empty() {
             return Vec::new();
         }
-        let base_x = i64::from(coord.x) * i64::from(CHUNK_SIZE);
-        let base_z = i64::from(coord.z) * i64::from(CHUNK_SIZE);
+        self.scatter_column(coord.x, coord.z, seed)
+            .remove(&coord.y)
+            .unwrap_or_default()
+    }
+
+    /// Every deterministic scatter instance anchored in chunk column
+    /// `(cx, cz)`, grouped by the chunk row holding its surface block. Same
+    /// candidates and per-chunk ordering as [`Self::scatter_chunk`], but the
+    /// shared column work is paid once instead of per row.
+    fn scatter_column(&self, cx: i32, cz: i32, seed: u64) -> BTreeMap<i32, Vec<ScatterInstance>> {
+        let scatter = &self.inner.scatter;
+        let mut by_row = BTreeMap::new();
+        if scatter.species.is_empty() {
+            return by_row;
+        }
+        let base_x = i64::from(cx) * i64::from(CHUNK_SIZE);
+        let base_z = i64::from(cz) * i64::from(CHUNK_SIZE);
         let end_x = base_x + i64::from(CHUNK_SIZE);
         let end_z = base_z + i64::from(CHUNK_SIZE);
         let mut scratch = [0.0f64; MAX_GRAPH_NODES];
-        let mut out = Vec::new();
         for (index, species) in scatter.species.iter().enumerate() {
             let spacing = f64::from(species.spacing);
             // One cell of slack: a cell whose origin sits just outside the
@@ -860,9 +873,7 @@ impl TerrainGenerator {
                     // several chunks per column. Assign each instance to the
                     // chunk holding its surface block so the vertical stack
                     // emits it exactly once.
-                    if sample.height.div_euclid(CHUNK_SIZE) != coord.y {
-                        continue;
-                    }
+                    let row = sample.height.div_euclid(CHUNK_SIZE);
                     let allowed = scatter
                         .biomes
                         .get(sample.biome.0 as usize)
@@ -884,7 +895,7 @@ impl TerrainGenerator {
                     let scale = species.scale.0
                         + (species.scale.1 - species.scale.0) * hash01(cx, cz, salt ^ 0x55) as f32;
                     let yaw = (hash01(cx, cz, salt ^ 0x66) * std::f64::consts::TAU) as f32;
-                    out.push(ScatterInstance {
+                    by_row.entry(row).or_insert_with(Vec::new).push(ScatterInstance {
                         species: index as u16,
                         x: wx as f32,
                         // The mesher contours the density field, whose ramp
@@ -900,7 +911,7 @@ impl TerrainGenerator {
                 }
             }
         }
-        out
+        by_row
     }
 
     /// Largest absolute height delta to the four axis neighbours, in blocks.
@@ -978,6 +989,20 @@ impl TerrainGenerator {
             }
         }
         ColumnGrid { samples }
+    }
+
+    /// Prepare one chunk column for repeated use: the sampled column grid
+    /// (surface bounds plus the margins chunk generation needs), the cave
+    /// shelter field, and every scatter instance grouped by destination chunk
+    /// row. Producing one [`PreparedColumn`] per `(cx, cz)` lets a survey and
+    /// several stacked chunk fills share all column-scoped work.
+    pub fn prepare_column(&self, cx: i32, cz: i32, seed: u64) -> PreparedColumn {
+        PreparedColumn {
+            grid: self.column_grid(cx, cz, seed),
+            shelter: shelter_field(cx, cz, self, seed),
+            scatter: self.scatter_column(cx, cz, seed),
+            stone_slope: self.stone_slope(),
+        }
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -1446,33 +1471,118 @@ struct Column {
     subsurface: u8,
 }
 
-/// Fill one chunk from a compiled generator. Chunks whose density is provably
-/// saturated and uncarved collapse to uniform storage without touching
-/// individual cells; everything else writes full voxel state.
-pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerator) -> Chunk {
+// Shelter field: the lowest raw surface within ~20 blocks, sampled on a
+// stride-4 lattice. Caves measure depth from this, not the column's own
+// surface, so tunnels under high ground cannot open through lower slopes.
+// The 3-block margin covers the strided sample missing the true minimum.
+const SHELTER_RADIUS: i64 = 20;
+const SHELTER_STRIDE: i64 = 4;
+const SHELTER_MARGIN: f32 = 3.0;
+const SHELTER_W: usize = (2 * SHELTER_RADIUS / SHELTER_STRIDE + 1) as usize;
+
+/// Raw surface height on the stride-4 shelter lattice covering the column's
+/// ±SHELTER_RADIUS neighborhood. Column-scoped: it depends only on
+/// `(cx, cz, seed, generator)`.
+fn shelter_field(
+    cx: i32,
+    cz: i32,
+    generator: &TerrainGenerator,
+    seed: u64,
+) -> [f32; SHELTER_W * SHELTER_W] {
+    let base_x = i64::from(cx) * i64::from(CHUNK_SIZE);
+    let base_z = i64::from(cz) * i64::from(CHUNK_SIZE);
+    let mut shelter_grid = [f32::INFINITY; SHELTER_W * SHELTER_W];
+    for sz in 0..SHELTER_W {
+        for sx in 0..SHELTER_W {
+            shelter_grid[sz * SHELTER_W + sx] = generator
+                .sample(
+                    base_x + (sx as i64 * SHELTER_STRIDE - SHELTER_RADIUS),
+                    base_z + (sz as i64 * SHELTER_STRIDE - SHELTER_RADIUS),
+                    seed,
+                )
+                .raw_height;
+        }
+    }
+    shelter_grid
+}
+
+/// Lowest raw surface within `SHELTER_RADIUS` of `(x, z)` — the column's own
+/// surface included — less `SHELTER_MARGIN`.
+fn shelter_at(
+    shelter_grid: &[f32; SHELTER_W * SHELTER_W],
+    x: i64,
+    z: i64,
+    own: f32,
+) -> f32 {
+    let mut low = own;
+    for sz in 0..SHELTER_W {
+        for sx in 0..SHELTER_W {
+            let dx = sx as i64 * SHELTER_STRIDE - SHELTER_RADIUS - x;
+            let dz = sz as i64 * SHELTER_STRIDE - SHELTER_RADIUS - z;
+            if dx * dx + dz * dz <= SHELTER_RADIUS * SHELTER_RADIUS {
+                low = low.min(shelter_grid[sz * SHELTER_W + sx]);
+            }
+        }
+    }
+    low - SHELTER_MARGIN
+}
+
+/// All column-scoped generation state for chunk column `(cx, cz)`: the
+/// sampled surface grid, the cave shelter field, the scatter instances
+/// grouped by destination chunk row, and the generator's stone slope.
+/// Prepare it once with [`TerrainGenerator::prepare_column`] and reuse it for
+/// the column's survey and every interested chunk row.
+pub struct PreparedColumn {
+    grid: ColumnGrid,
+    shelter: [f32; SHELTER_W * SHELTER_W],
+    scatter: BTreeMap<i32, Vec<ScatterInstance>>,
+    stone_slope: f32,
+}
+
+impl PreparedColumn {
+    /// Exact minimum and maximum generated surface heights across the
+    /// column's 32x32 interior.
+    pub fn bounds(&self) -> (i32, i32) {
+        self.grid.interior_bounds()
+    }
+
+    /// Deterministic scatter instances whose surface block sits in chunk row
+    /// `y`, in the same order [`TerrainGenerator::scatter_chunk`] emits them.
+    pub fn scatter(&self, y: i32) -> Vec<ScatterInstance> {
+        self.scatter.get(&y).map_or_else(Vec::new, |v| v.to_vec())
+    }
+}
+
+/// Rows outside the generated world collapse to uniform storage without
+/// sampling the column.
+fn boundary_chunk(coord: IVec3) -> Option<Chunk> {
     if coord.y < crate::MIN_CHUNK_Y {
-        return Chunk {
+        return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(STONE),
-        };
+        });
     }
     if coord.y > crate::MAX_CHUNK_Y {
-        return Chunk {
+        return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(AIR),
-        };
+        });
     }
-    let grid = generator.column_grid(coord.x, coord.z, seed);
-    let (min_height, max_height) = grid.interior_bounds();
+    None
+}
+
+/// Chunks whose density is provably saturated and uncarved collapse to
+/// uniform storage without touching individual cells.
+fn saturated_chunk(coord: IVec3, seed: u64, min_height: i32, max_height: i32) -> Option<Chunk> {
     let base_y = coord.y * CHUNK_SIZE;
     let top_y = base_y + CHUNK_SIZE - 1;
     // raw_height < height + 0.5, so three blocks above the tallest column the
     // density ramp has saturated at DENSITY_AIR and caves never reach.
     if base_y >= max_height + 3 {
-        return Chunk {
+        return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(AIR),
-        };
+        });
     }
     // Uniform stone requires every voxel saturated solid (top_y at least two
     // below the lowest raw surface), below every soil band, and beyond the
@@ -1486,12 +1596,23 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
             seed,
         ) <= CAVE_LO
     {
-        return Chunk {
+        return Some(Chunk {
             revision: 0,
             storage: Storage::Uniform(STONE),
-        };
+        });
     }
-    let stone_slope = generator.stone_slope();
+    None
+}
+
+/// Write every voxel of `coord`'s chunk from prepared column state.
+fn fill_chunk(
+    coord: IVec3,
+    seed: u64,
+    grid: &ColumnGrid,
+    shelter_grid: &[f32; SHELTER_W * SHELTER_W],
+    stone_slope: f32,
+) -> Chunk {
+    let base_y = coord.y * CHUNK_SIZE;
     let mut columns = [Column {
         raw_height: 0.0,
         cap: 0,
@@ -1523,39 +1644,6 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
     }
     let base_x = i64::from(coord.x) * i64::from(CHUNK_SIZE);
     let base_z = i64::from(coord.z) * i64::from(CHUNK_SIZE);
-    // Shelter field: the lowest raw surface within ~20 blocks, sampled on a
-    // stride-4 lattice. Caves measure depth from this, not the column's own
-    // surface, so tunnels under high ground cannot open through lower slopes.
-    // The 3-block margin covers the strided sample missing the true minimum.
-    const SHELTER_RADIUS: i64 = 20;
-    const SHELTER_STRIDE: i64 = 4;
-    const SHELTER_MARGIN: f32 = 3.0;
-    const SHELTER_W: usize = (2 * SHELTER_RADIUS / SHELTER_STRIDE + 1) as usize;
-    let mut shelter_grid = [f32::INFINITY; SHELTER_W * SHELTER_W];
-    for sz in 0..SHELTER_W {
-        for sx in 0..SHELTER_W {
-            shelter_grid[sz * SHELTER_W + sx] = generator
-                .sample(
-                    base_x + (sx as i64 * SHELTER_STRIDE - SHELTER_RADIUS),
-                    base_z + (sz as i64 * SHELTER_STRIDE - SHELTER_RADIUS),
-                    seed,
-                )
-                .raw_height;
-        }
-    }
-    let shelter = |x: i64, z: i64, own: f32| -> f32 {
-        let mut low = own;
-        for sz in 0..SHELTER_W {
-            for sx in 0..SHELTER_W {
-                let dx = sx as i64 * SHELTER_STRIDE - SHELTER_RADIUS - x;
-                let dz = sz as i64 * SHELTER_STRIDE - SHELTER_RADIUS - z;
-                if dx * dx + dz * dz <= SHELTER_RADIUS * SHELTER_RADIUS {
-                    low = low.min(shelter_grid[sz * SHELTER_W + sx]);
-                }
-            }
-        }
-        low - SHELTER_MARGIN
-    };
     // The shelter value depends only on (x, z, column height), not y, so
     // compute one value per column instead of rescanning the lattice for
     // every voxel in the chunk.
@@ -1563,7 +1651,8 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
     for local_z in 0..CHUNK_SIZE {
         for local_x in 0..CHUNK_SIZE {
             let idx = (local_z * CHUNK_SIZE + local_x) as usize;
-            shelter_columns[idx] = shelter(
+            shelter_columns[idx] = shelter_at(
+                shelter_grid,
                 i64::from(local_x),
                 i64::from(local_z),
                 columns[idx].raw_height,
@@ -1609,6 +1698,45 @@ pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerat
     }
     chunk.compact();
     chunk
+}
+
+/// Fill one chunk from a compiled generator.
+pub(crate) fn generate_chunk(coord: IVec3, seed: u64, generator: &TerrainGenerator) -> Chunk {
+    if let Some(chunk) = boundary_chunk(coord) {
+        return chunk;
+    }
+    let grid = generator.column_grid(coord.x, coord.z, seed);
+    let (min_height, max_height) = grid.interior_bounds();
+    if let Some(chunk) = saturated_chunk(coord, seed, min_height, max_height) {
+        return chunk;
+    }
+    let shelter = shelter_field(coord.x, coord.z, generator, seed);
+    fill_chunk(coord, seed, &grid, &shelter, generator.stone_slope())
+}
+
+/// Fill one chunk of a column already prepared with
+/// [`TerrainGenerator::prepare_column`]. Chunks whose density is provably
+/// saturated and uncarved collapse to uniform storage without touching
+/// individual cells; everything else writes full voxel state.
+pub(crate) fn generate_chunk_from_column(
+    coord: IVec3,
+    seed: u64,
+    column: &PreparedColumn,
+) -> Chunk {
+    if let Some(chunk) = boundary_chunk(coord) {
+        return chunk;
+    }
+    let (min_height, max_height) = column.bounds();
+    if let Some(chunk) = saturated_chunk(coord, seed, min_height, max_height) {
+        return chunk;
+    }
+    fill_chunk(
+        coord,
+        seed,
+        &column.grid,
+        &column.shelter,
+        column.stone_slope,
+    )
 }
 
 // ---------------------------------------------------------------------------
