@@ -711,9 +711,19 @@ impl VoxelWorld {
         }
         let mut adjacent = cell;
         let mut distance = 0.0;
+        // Cache the chunk under the ray: consecutive DDA cells almost always
+        // share it, so the map is hashed once per chunk crossing instead of
+        // once per cell (rays can span thousands of cells).
+        let mut cached_coord = chunk_coord(cell);
+        let mut cached_chunk = self.chunks.get(&cached_coord);
         // Hard work bound even for an untrusted enormous distance through loaded air.
         for _ in 0..4096 {
-            if self.block(cell)? != AIR {
+            let coord = chunk_coord(cell);
+            if coord != cached_coord {
+                cached_coord = coord;
+                cached_chunk = self.chunks.get(&coord);
+            }
+            if cached_chunk?.get(local_coord(cell)) != AIR {
                 return Some(RayHit {
                     block: cell,
                     adjacent,
