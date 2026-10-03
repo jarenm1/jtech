@@ -5,7 +5,7 @@ pub use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
 use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io;
+use std::{io, sync::Arc};
 
 pub const PROTOCOL_VERSION: u32 = 21;
 pub const MAX_PHYSICS_BODIES: usize = 128;
@@ -129,9 +129,10 @@ pub enum ServerMessage {
     Chunk {
         coord: IVec3,
         revision: u64,
-        /// Material runs with the placed flag packed into the high bit.
-        material_runs: Vec<(u16, u8)>,
-        density_runs: Vec<(u16, i8)>,
+        /// Material runs with the placed flag packed into the high bit. Shared
+        /// across recipients of the same chunk revision; serializes as a Vec.
+        material_runs: Arc<Vec<(u16, u8)>>,
+        density_runs: Arc<Vec<(u16, i8)>>,
         /// Organic scatter anchored inside this chunk, sent once with it.
         scatter: Vec<ScatterInstance>,
     },
@@ -536,8 +537,8 @@ mod tests {
         let chunk = ServerMessage::Chunk {
             coord: IVec3::new(-1, 2, 3),
             revision: 41,
-            material_runs: vec![(32760, 3), (1, 0x80 | 5), (7, 0)],
-            density_runs: vec![(32760, 127), (8, -128)],
+            material_runs: Arc::new(vec![(32760, 3), (1, 0x80 | 5), (7, 0)]),
+            density_runs: Arc::new(vec![(32760, 127), (8, -128)]),
             scatter: vec![ScatterInstance {
                 species: 2,
                 x: 1.5,
@@ -558,7 +559,7 @@ mod tests {
             panic!("wrong message")
         };
         assert_eq!(material_runs[1], (1, 0x85));
-        assert_eq!(density_runs, vec![(32760, 127), (8, -128)]);
+        assert_eq!(*density_runs, vec![(32760, 127), (8, -128)]);
         assert_eq!(scatter.len(), 1);
         assert_eq!(scatter[0].species, 2);
         assert_eq!(scatter[0].z, -3.25);
