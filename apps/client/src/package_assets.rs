@@ -271,6 +271,9 @@ pub struct PackageAssets {
     /// `receive_chunk` patches it, so `uri`/`bytes` are hash lookups instead
     /// of a manifest scan plus filesystem stat/read per call.
     resolved: HashMap<String, HashMap<String, Resolved>>,
+    /// Bumped on every manifest sync and completed download so consumers can
+    /// compare generations instead of polling `uri`/`bytes` every frame.
+    version: u64,
 }
 
 /// One manifest file's local state. `file` is content-addressed by the
@@ -294,6 +297,12 @@ impl PackageAssets {
 
     fn resolved(&self, package: &str, path: &str) -> Option<&Resolved> {
         self.resolved.get(package)?.get(path)
+    }
+
+    /// Content generation, bumped whenever a file may have become newly
+    /// readable: a manifest sync or a completed download.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// `pkg://` URI usable by `AssetServer`, present once the file is local.
@@ -321,6 +330,7 @@ impl PackageAssets {
     /// Replace the manifest; returns requests for files not yet cached or
     /// already in flight.
     pub fn sync(&mut self, manifest: Vec<PackageAssetInfo>) -> Vec<ClientMessage> {
+        self.version += 1;
         // Resolve every manifest entry once: local path, on-disk presence and
         // pkg:// URI, carrying cached bytes over when the content-addressed
         // file is unchanged.
@@ -444,5 +454,6 @@ impl PackageAssets {
             }
             Err(error) => warn!("package asset {}: {error}", resolved.file.display()),
         }
+        self.version += 1;
     }
 }
