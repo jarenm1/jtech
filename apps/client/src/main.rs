@@ -359,6 +359,14 @@ struct RemoteActors(HashMap<u32, RemoteActor>);
 #[derive(Resource, Default)]
 struct RemotePlayers(HashMap<u64, RemotePlayer>);
 
+// Scratch id sets rebuilt per snapshot so retains stay O(existing + snapshot)
+// instead of scanning the snapshot for every tracked remote.
+#[derive(Default)]
+struct SnapshotIds {
+    players: HashSet<u64>,
+    actors: HashSet<u32>,
+}
+
 #[derive(Resource)]
 struct ActorAssets {
     mesh: Handle<Mesh>,
@@ -554,6 +562,7 @@ fn receive_network(
     drop_assets: Res<drops::DropAssets>,
     mut package_assets: ResMut<package_assets::PackageAssets>,
     mut scatter: ResMut<scatter::ScatterWorld>,
+    mut snapshot_ids: Local<SnapshotIds>,
 ) {
     let Some(transport) = &mut session.transport else {
         return;
@@ -753,8 +762,16 @@ fn receive_network(
         let colliders: Vec<_> = loose.colliders().to_vec();
         reconcile(&mut session, &world, &snapshot, &colliders);
         let now = Instant::now();
+        snapshot_ids.players.clear();
+        snapshot_ids
+            .players
+            .extend(snapshot.players.iter().map(|player| player.id));
+        snapshot_ids.actors.clear();
+        snapshot_ids
+            .actors
+            .extend(snapshot.actors.iter().map(|actor| actor.id));
         remotes.0.retain(|id, remote| {
-            if snapshot.players.iter().any(|player| player.id == *id) {
+            if snapshot_ids.players.contains(id) {
                 true
             } else {
                 commands.entity(remote.entity).despawn();
@@ -798,7 +815,7 @@ fn receive_network(
                 });
         }
         actors.0.retain(|id, actor| {
-            if snapshot.actors.iter().any(|a| a.id == *id) {
+            if snapshot_ids.actors.contains(id) {
                 true
             } else {
                 commands.entity(actor.entity).despawn();
