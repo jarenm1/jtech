@@ -2,7 +2,7 @@ use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::Resource;
 use glam::{IVec3, Vec3};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock, Mutex},
 };
 
@@ -627,6 +627,10 @@ impl Chunk {
 
 #[derive(Resource, Default)]
 pub struct VoxelWorld {
+    /// Resident chunks. Mutate only through [`Self::insert`], [`Self::remove`],
+    /// [`Self::ensure_chunk`], and the voxel edit methods so mesh-dirty
+    /// tracking stays accurate; direct writes must be followed by
+    /// [`Self::mark_dirty`].
     pub chunks: HashMap<IVec3, Arc<Chunk>>,
     pub seed: u64,
     /// Compiled terrain graph shared by streaming generation.
@@ -636,6 +640,14 @@ pub struct VoxelWorld {
     /// caches of derived geometry can tell a player edit from a chunk load and
     /// invalidate immediately instead of polling every chunk revision.
     edits: u64,
+    /// Mesh-owner coordinates whose 27-chunk stamp may have changed: every
+    /// mutation dirties the touched chunk's whole neighborhood. Consumers
+    /// drain it via [`Self::take_dirty`].
+    pub dirty: HashSet<IVec3>,
+    /// Whether mutations record into `dirty`. Off by default so headless
+    /// worlds (servers) never accumulate the set; a renderer enables it via
+    /// [`Self::set_dirty_tracking`] and drains it every frame.
+    pub dirty_tracking: bool,
 }
 pub struct WorldPlugin;
 impl Plugin for WorldPlugin {
@@ -649,11 +661,34 @@ impl VoxelWorld {
             .get(&chunk_coord(pos))
             .map(|c| c.get(local_coord(pos)))
     }
+    /// Records that `coord`'s chunk was inserted, removed, or edited: all 27
+    /// meshes sampling it are stale. Every mutating method calls this; code
+    /// writing `chunks` directly must call it too. A no-op unless dirty
+    /// tracking is enabled (see [`Self::set_dirty_tracking`]).
+    pub fn mark_dirty(&mut self, coord: IVec3) {
+        if !self.dirty_tracking {
+            return;
+        }
+        self.dirty.extend(OFFSETS.map(|offset| coord + offset));
+    }
+    /// Enables or disables mesh-dirty recording. A renderer turns it on once
+    /// it has adopted the resident chunks; worlds that never render leave it
+    /// off so `dirty` cannot grow without bound.
+    pub fn set_dirty_tracking(&mut self, on: bool) {
+        self.dirty_tracking = on;
+    }
+    /// Drains the accumulated dirty mesh-owner coordinates.
+    pub fn take_dirty(&mut self) -> HashSet<IVec3> {
+        std::mem::take(&mut self.dirty)
+    }
     pub fn insert(&mut self, coord: IVec3, chunk: Chunk) {
         self.chunks.insert(coord, Arc::new(chunk));
+        self.mark_dirty(coord);
     }
     pub fn remove(&mut self, coord: IVec3) {
-        self.chunks.remove(&coord);
+        if self.chunks.remove(&coord).is_some() {
+            self.mark_dirty(coord);
+        }
     }
     /// Monotonic count of voxel edits applied to this world. Streaming chunk
     /// loads and unloads do not bump it; only [`Self::set_voxel`] and the
@@ -663,9 +698,11 @@ impl VoxelWorld {
         self.edits
     }
     pub fn ensure_chunk(&mut self, coord: IVec3) {
-        self.chunks
-            .entry(coord)
-            .or_insert_with(|| Arc::new(Chunk::generate_with(coord, self.seed, &self.generator)));
+        if !self.chunks.contains_key(&coord) {
+            let chunk = Chunk::generate_with(coord, self.seed, &self.generator);
+            self.chunks.insert(coord, Arc::new(chunk));
+            self.mark_dirty(coord);
+        }
     }
     /// Discrete-cube edit used by player placement and legacy callers.
     /// `block == AIR` clears the voxel entirely (material, density, placed);
@@ -688,7 +725,8 @@ impl VoxelWorld {
         if voxel.material > WOOD {
             return None;
         }
-        let chunk = self.chunks.get_mut(&chunk_coord(pos))?;
+        let coord = chunk_coord(pos);
+        let chunk = self.chunks.get_mut(&coord)?;
         let i = index(local_coord(pos));
         if chunk.voxel(local_coord(pos)) == voxel {
             return None;
@@ -699,6 +737,7 @@ impl VoxelWorld {
         chunk.set_voxel(i, voxel);
         chunk.revision = new;
         self.edits = self.edits.wrapping_add(1);
+        self.mark_dirty(coord);
         Some((old, new))
     }
     /// Signed density at a world voxel; `None` for unloaded chunks.
@@ -863,6 +902,10 @@ impl VoxelWorld {
         }
         if !edits.is_empty() {
             self.edits = self.edits.wrapping_add(1);
+        }
+
+        for edit in &edits {
+            self.mark_dirty(edit.coord);
         }
         edits
     }

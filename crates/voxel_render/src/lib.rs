@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -492,6 +492,16 @@ struct Renderer {
     grass_material: Handle<GrassMaterial>,
     chunks: HashMap<IVec3, RenderedChunk>,
     jobs: Vec<MeshJob>,
+    /// Dirty mesh-owner coords drained from [`VoxelWorld`] but not yet
+    /// re-queued for meshing (job slots were full or checks pending).
+    pending: HashSet<IVec3>,
+    /// Set once the first frame has adopted every resident chunk and enabled
+    /// [`VoxelWorld::set_dirty_tracking`]; before that, scheduling is a full
+    /// scan so nothing resident is missed.
+    initialized: bool,
+    /// Running totals kept in sync with `chunks` so stats are O(1).
+    visible: usize,
+    triangles: usize,
 }
 
 struct RenderedChunk {
@@ -1279,19 +1289,35 @@ fn remove_draw(chunk: &mut RenderedChunk, commands: &mut Commands, meshes: &mut 
 
 fn update_chunks(
     mut commands: Commands,
-    world: Res<VoxelWorld>,
+    mut world: ResMut<VoxelWorld>,
     focus: Res<RenderFocus>,
     mut renderer: ResMut<Renderer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut stats: ResMut<VoxelRenderStats>,
 ) {
+    // First frame adopts every resident chunk, then mutations are tracked
+    // incrementally so idle frames do no per-chunk work at all.
+    if !renderer.initialized {
+        renderer.initialized = true;
+        world.set_dirty_tracking(true);
+        renderer.pending.extend(world.chunks.keys().copied());
+    }
+    renderer.pending.extend(world.take_dirty());
+
+    // Drop draws whose source chunk vanished, keeping the running totals in sync.
+    let mut removed_visible = 0usize;
+    let mut removed_triangles = 0usize;
     renderer.chunks.retain(|coord, chunk| {
         if world.chunks.contains_key(coord) {
             return true;
         }
+        removed_visible += usize::from(chunk.draw.is_some());
+        removed_triangles += chunk.triangles;
         remove_draw(chunk, &mut commands, &mut meshes);
         false
     });
+    renderer.visible = renderer.visible.saturating_sub(removed_visible);
+    renderer.triangles = renderer.triangles.saturating_sub(removed_triangles);
 
     // Keep obsolete running tasks in their slots until they finish. Dropping a task that is
     // already computing synchronously cannot immediately stop it, so replacing it early
@@ -1329,6 +1355,8 @@ fn update_chunks(
         let mut job = renderer.jobs.remove(i);
         let data = job.ready.take().expect("ready result checked above");
         if let Some(mut old) = renderer.chunks.remove(&job.coord) {
+            renderer.visible = renderer.visible.saturating_sub(usize::from(old.draw.is_some()));
+            renderer.triangles = renderer.triangles.saturating_sub(old.triangles);
             remove_draw(&mut old, &mut commands, &mut meshes);
         }
         let triangles = data.indices.len() / 3;
@@ -1345,6 +1373,8 @@ fn update_chunks(
                 .id();
             Some((entity, handle))
         };
+        renderer.visible += usize::from(draw.is_some());
+        renderer.triangles += triangles;
         renderer.chunks.insert(
             job.coord,
             RenderedChunk {
@@ -1358,32 +1388,43 @@ fn update_chunks(
     }
     stats.uploaded_bytes = stats.uploaded_bytes.saturating_add(bytes as u64);
 
-    // Bounded nearest-candidate selection, not a full allocation/sort of the world's chunks.
+    // Bounded nearest-candidate selection over only the dirty coords, not the
+    // whole world: idle frames touch nothing, and edits touch 27 coords each.
     let slots = STARTS_PER_FRAME.min(MAX_JOBS - renderer.jobs.len());
     let mut nearest = [(f32::INFINITY, IVec3::ZERO); STARTS_PER_FRAME];
     let mut nearest_len = 0;
-    if slots > 0 {
-        for &coord in world.chunks.keys() {
-            if renderer.jobs.iter().any(|job| job.coord == coord) {
-                continue;
-            }
-            let stamp = world.mesh_stamp(coord);
-            if renderer
-                .chunks
-                .get(&coord)
-                .is_some_and(|chunk| chunk.stamp == stamp)
-            {
-                continue;
-            }
-            let priority = distance(coord, focus.0);
-            let at =
-                nearest[..nearest_len].partition_point(|&(d, _)| d.total_cmp(&priority).is_le());
-            if at < slots {
-                let end = nearest_len.min(slots - 1);
-                nearest.copy_within(at..end, at + 1);
-                nearest[at] = (priority, coord);
-                nearest_len = (nearest_len + 1).min(slots);
-            }
+    let dirty = std::mem::take(&mut renderer.pending);
+    for &coord in &dirty {
+        // Non-resident coords are re-dirtied when their chunk streams in.
+        if !world.chunks.contains_key(&coord) {
+            continue;
+        }
+        if renderer.jobs.iter().any(|job| job.coord == coord) {
+            renderer.pending.insert(coord);
+            continue;
+        }
+        let stamp = world.mesh_stamp(coord);
+        if renderer
+            .chunks
+            .get(&coord)
+            .is_some_and(|chunk| chunk.stamp == stamp)
+        {
+            continue;
+        }
+        if slots == 0 {
+            renderer.pending.insert(coord);
+            continue;
+        }
+        let priority = distance(coord, focus.0);
+        let at =
+            nearest[..nearest_len].partition_point(|&(d, _)| d.total_cmp(&priority).is_le());
+        if at < slots {
+            let end = nearest_len.min(slots - 1);
+            nearest.copy_within(at..end, at + 1);
+            nearest[at] = (priority, coord);
+            nearest_len = (nearest_len + 1).min(slots);
+        } else {
+            renderer.pending.insert(coord);
         }
     }
     for &(_, coord) in &nearest[..nearest_len] {
@@ -1406,12 +1447,8 @@ fn update_chunks(
             ready: None,
         });
     }
-    stats.visible_chunks = renderer
-        .chunks
-        .values()
-        .filter(|chunk| chunk.draw.is_some())
-        .count();
-    stats.triangles = renderer.chunks.values().map(|chunk| chunk.triangles).sum();
+    stats.visible_chunks = renderer.visible;
+    stats.triangles = renderer.triangles;
     stats.pending_jobs = renderer.jobs.len();
 }
 
