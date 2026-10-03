@@ -61,6 +61,9 @@ pub(super) fn response(contact: &TerrainContact, previous: f32, attached_area: f
 
 pub(super) struct GridContactResult {
     pub fraction: f32,
+    /// Whether the target is now latched for release (attachment failed), so
+    /// the caller can maintain its release work set without rescanning.
+    pub release: bool,
     /// Per-chunk brush edits from the destruction write, for journal + delta.
     pub destroyed_edits: Option<Vec<BrushEdit>>,
 }
@@ -118,6 +121,7 @@ pub(super) fn apply_to_grid(
         damage.remove(&target);
         return Ok(GridContactResult {
             fraction: 1.0,
+            release: false,
             destroyed_edits: Some(edits),
         });
     }
@@ -137,6 +141,7 @@ pub(super) fn apply_to_grid(
     }
     Ok(GridContactResult {
         fraction: result.damage / material(contact.material).fracture_limit(1.0),
+        release,
         destroyed_edits: None,
     })
 }
