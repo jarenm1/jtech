@@ -16,7 +16,16 @@ would require server replication.
 Sun and moon alternate as shadow-casting directional lights, fading out at the
 horizon. Four shadow cascades cover 192 metres, with the first ending at 16
 metres to retain detail near the player. Shadow distance is independent of
-terrain render distance. The sky is a changing background color.
+terrain render distance.
 
-Implementation: `apps/client/src/lighting.rs`. Night lighting is intentionally
-stylized for visibility: 350-lux blue moonlight and a low ambient fill.
+The sky is a procedural dome, not a flat color: a horizon-to-zenith gradient
+that warms at dawn and dusk, a sun glow and disk, a moon disk, and a star field
+that fades in as the sun sets. A camera-centred sphere scaled to the camera's
+far distance renders `sky.wgsl` behind all terrain, so the dome never occludes
+world geometry. The flat `ClearColor` remains only as the fallback for the
+frame before the dome spawns.
+
+Implementation: `apps/client/src/lighting.rs` owns the day cycle and the sky
+palette; `apps/client/src/sky.rs` and `sky.wgsl` render the dome. Night
+lighting is intentionally stylized for visibility: 350-lux blue moonlight and a
+low ambient fill.

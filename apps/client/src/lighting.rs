@@ -72,39 +72,80 @@ fn color(a: Vec3, b: Vec3, t: f32) -> Color {
     Color::srgb(c.x, c.y, c.z)
 }
 
-struct Lighting {
-    sun: Vec3,
-    daylight: f32,
-    sun_strength: f32,
-    moon_strength: f32,
-    sun_color: Color,
-    sky: Color,
+/// Converts an sRGB triple to linear, matching how Bevy interprets `Color::srgb`.
+fn linear(c: Vec3) -> Vec3 {
+    linear_color(Color::srgb(c.x, c.y, c.z))
 }
 
-fn sample(hour: f64) -> Lighting {
+fn linear_color(c: Color) -> Vec3 {
+    let l = c.to_linear();
+    Vec3::new(l.red, l.green, l.blue)
+}
+
+/// Sky and light state for one instant of the day cycle.
+pub struct Lighting {
+    pub sun: Vec3,
+    pub daylight: f32,
+    pub sun_strength: f32,
+    pub moon_strength: f32,
+    pub sun_color: Color,
+    pub sky: Color,
+    /// Linear horizon color for the sky dome.
+    pub horizon: Vec3,
+    /// Linear zenith color for the sky dome.
+    pub zenith: Vec3,
+    /// Linear sun tint for the sky dome.
+    pub sun_tint: Vec3,
+    /// Sun disk visibility, 0 below the horizon .. 1 overhead.
+    pub sun_visibility: f32,
+    /// Sun glow strength, persisting slightly past sunset.
+    pub sun_glow: f32,
+    /// Star intensity, 0 by day .. 1 at night.
+    pub stars: f32,
+}
+
+pub fn sample(hour: f64) -> Lighting {
     let angle = ((hour.rem_euclid(24.0) - 6.0) / 24.0 * std::f64::consts::TAU) as f32;
     // Tilt the orbit so even noon produces angled shadows (maximum elevation 60 degrees).
     let sun = Vec3::new(angle.cos(), angle.sin() * 0.8660254, angle.sin() * 0.5);
     let daylight = smooth(-0.16, 0.22, sun.y);
     let high_sun = smooth(0.0, 0.5, sun.y);
-    let dusk = Vec3::new(0.55, 0.24, 0.16);
+    let dusk = Vec3::new(0.9, 0.5, 0.22);
     let day = Vec3::new(0.48, 0.69, 0.88);
+    let sun_color = color(
+        Vec3::new(1.0, 0.43, 0.18),
+        Vec3::new(1.0, 0.97, 0.9),
+        high_sun,
+    );
+    // Sky-dome palette, authored in sRGB and converted to linear for the shader.
+    // The horizon keeps its color further past sunset than the zenith, so dusk
+    // reads as a warm band under a deepening blue rather than a uniform dim,
+    // and it stays warm through the golden hour instead of washing out early.
+    let sky = smooth(-0.12, 0.06, sun.y);
+    let warm = smooth(0.2, 0.55, sun.y);
+    let horizon = linear(Vec3::new(0.02, 0.04, 0.09))
+        .lerp(linear(dusk.lerp(Vec3::new(0.62, 0.78, 0.95), warm)), sky);
+    let zenith = linear(Vec3::new(0.01, 0.02, 0.06))
+        .lerp(linear(Vec3::new(0.22, 0.42, 0.82)), daylight);
     Lighting {
         sun,
         daylight,
         // Fade before crossing the horizon, avoiding light through terrain from below.
         sun_strength: smooth(0.0, 0.18, sun.y),
         moon_strength: smooth(0.0, 0.25, -sun.y),
-        sun_color: color(
-            Vec3::new(1.0, 0.43, 0.18),
-            Vec3::new(1.0, 0.97, 0.9),
-            high_sun,
-        ),
+        sun_color,
         sky: color(
             Vec3::new(0.008, 0.014, 0.035),
             dusk.lerp(day, high_sun),
             daylight,
         ),
+        horizon,
+        zenith,
+        sun_tint: linear_color(sun_color),
+        sun_visibility: smooth(-0.02, 0.05, sun.y),
+        // Kept below the disk's brightness so the disk reads as a core.
+        sun_glow: 0.5 * smooth(-0.12, 0.10, sun.y),
+        stars: smooth(0.0, 0.4, -sun.y),
     }
 }
 
@@ -171,6 +212,25 @@ mod tests {
         assert_eq!(sample(12.0).daylight, 1.0);
         assert_eq!(sample(0.0).daylight, 0.0);
         assert!(sample(12.0).sun.y < 0.9);
+    }
+
+    #[test]
+    fn sky_palette_tracks_the_day() {
+        let noon = sample(12.0);
+        let midnight = sample(0.0);
+        // Day sky is far brighter than night sky at both ends of the gradient.
+        assert!(noon.horizon.length() > midnight.horizon.length() * 4.0);
+        assert!(noon.zenith.length() > midnight.zenith.length() * 4.0);
+        // A gradient, not a flat fill: the zenith is darker than the horizon.
+        assert!(noon.zenith.length() < noon.horizon.length());
+        // Stars only come out once the sun is down.
+        assert_eq!(noon.stars, 0.0);
+        assert!(midnight.stars > 0.9);
+        // The sun disk is visible at noon and hidden at midnight; the moon is opposite.
+        assert!(noon.sun_visibility > 0.99);
+        assert_eq!(midnight.sun_visibility, 0.0);
+        assert_eq!(noon.moon_strength, 0.0);
+        assert!(midnight.moon_strength > 0.99);
     }
 
     #[test]

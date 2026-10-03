@@ -13,6 +13,7 @@ mod package_assets;
 mod pause_menu;
 mod projectiles;
 mod scatter;
+mod sky;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
@@ -595,6 +596,7 @@ fn main() {
             WorldPlugin,
             VoxelRenderPlugin,
             lighting::LightingPlugin,
+            sky::SkyPlugin,
             ClientPlugin,
             loose_blocks::LooseBlocksPlugin,
             projectiles::ProjectilesPlugin,
