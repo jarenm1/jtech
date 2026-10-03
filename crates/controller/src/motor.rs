@@ -36,6 +36,9 @@ pub fn step_character(
     state.external_velocity = physics::bounded_horizontal(state.external_velocity);
     // Bounded catch-up prevents pathological caller timesteps and unbounded collision work.
     let dt = dt.min(0.25);
+    // One grid build amortizes this tick's separation pass and every sweep.
+    let broadphase = physics::BodyBroadphase::new(bodies);
+    let bodies = &broadphase;
     physics::separate_bodies(world, state, bodies, body.shape);
     let mut probe = state.position;
     state.grounded = state.velocity.y <= 0.0

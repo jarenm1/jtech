@@ -38,6 +38,100 @@ impl DynamicCollider {
         (self.position - self.half_extents, self.position + self.half_extents)
     }
 }
+
+/// Bodies spanning more cells than this on an axis bypass the grid buckets and
+/// are always reported, so a pathological extent cannot flood the map.
+const MAX_CELL_SPAN: f32 = 16.0;
+/// Query boxes wider than this degrade to a full index list rather than
+/// walking an unbounded cell range.
+const MAX_QUERY_SPAN: i32 = 64;
+
+/// Uniform voxel grid over a `&[DynamicCollider]` snapshot. Build once per
+/// motor step and share it across that tick's sweeps and separation passes,
+/// replacing a full `bodies` scan per query. Cells are integer voxels keyed by
+/// each box's overlapped range; unit cubes occupy one or two cells per axis.
+pub struct BodyBroadphase<'a> {
+    bodies: &'a [DynamicCollider],
+    /// Cell coordinate -> head index into `links`.
+    cells: std::collections::HashMap<IVec3, u32>,
+    /// Intrusive linked list per cell: (body index, next link) with u32::MAX
+    /// terminating. One flat allocation for every bucketed body.
+    links: Vec<(u32, u32)>,
+    /// Oversized boxes tested by every query regardless of cells.
+    large: Vec<u32>,
+}
+impl<'a> BodyBroadphase<'a> {
+    /// Index every finite-bodied box by the cells its AABB overlaps. Bodies
+    /// with non-finite extents are skipped exactly as the narrowphase skips
+    /// them; oversized boxes land in the always-tested fallback list.
+    pub fn new(bodies: &'a [DynamicCollider]) -> Self {
+        let mut grid = Self {
+            bodies,
+            cells: std::collections::HashMap::new(),
+            links: Vec::new(),
+            large: Vec::new(),
+        };
+        for (index, body) in bodies.iter().enumerate() {
+            let (lo, hi) = body.aabb();
+            if !lo.is_finite() || !hi.is_finite() {
+                continue;
+            }
+            if (hi - lo).max_element() > MAX_CELL_SPAN {
+                grid.large.push(index as u32);
+                continue;
+            }
+            let first = lo.floor().as_ivec3();
+            let last = hi.floor().as_ivec3();
+            for z in first.z..=last.z {
+                for y in first.y..=last.y {
+                    for x in first.x..=last.x {
+                        let head = grid
+                            .cells
+                            .entry(IVec3::new(x, y, z))
+                            .or_insert(u32::MAX);
+                        grid.links.push((index as u32, *head));
+                        *head = (grid.links.len() - 1) as u32;
+                    }
+                }
+            }
+        }
+        grid
+    }
+    /// Append the index of every body whose cell range intersects `[min, max]`,
+    /// sorted ascending and deduplicated so callers see the original slice
+    /// order. Boundary-touching boxes may appear as false positives; run the
+    /// narrowphase per candidate. Non-finite or very wide query boxes degrade
+    /// to a full index list rather than walking an unbounded cell range.
+    pub fn query(&self, min: Vec3, max: Vec3, out: &mut Vec<u32>) {
+        out.clear();
+        let span = (max - min).floor().as_ivec3();
+        if !min.is_finite() || !max.is_finite() || span.max_element() > MAX_QUERY_SPAN {
+            out.extend(0..self.bodies.len() as u32);
+            return;
+        }
+        let first = min.floor().as_ivec3();
+        let last = max.floor().as_ivec3();
+        for z in first.z..=last.z {
+            for y in first.y..=last.y {
+                for x in first.x..=last.x {
+                    let mut link = self.cells.get(&IVec3::new(x, y, z)).copied();
+                    while let Some(entry) = link {
+                        let (index, next) = self.links[entry as usize];
+                        out.push(index);
+                        link = if next == u32::MAX { None } else { Some(next) };
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(&self.large);
+        out.sort_unstable();
+        out.dedup();
+    }
+    /// The indexed snapshot; narrowphase checks read colliders through this.
+    pub fn bodies(&self) -> &'a [DynamicCollider] {
+        self.bodies
+    }
+}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct KinematicState {
     pub position: Vec3,
@@ -372,15 +466,43 @@ fn sweep_axis(
     hit || touched || smooth != distance
 }
 
-/// Sweep against terrain and observed loose cubes without extrapolating snapshots.
+/// Sweep against terrain and observed loose cubes without extrapolating
+/// snapshots. `bodies` is a `BodyBroadphase` over the observed snapshot; share
+/// one build across every sweep a tick performs.
 pub fn sweep_with_bodies(
     world: &VoxelWorld,
     position: &mut Vec3,
     axis: usize,
     distance: f32,
-    bodies: &[DynamicCollider],
+    bodies: &BodyBroadphase<'_>,
     ignore: Option<usize>,
     shape: CollisionShape,
+) -> bool {
+    let mut candidates = Vec::new();
+    sweep_with_bodies_in(
+        world,
+        position,
+        axis,
+        distance,
+        bodies,
+        ignore,
+        shape,
+        &mut candidates,
+    )
+}
+
+/// `sweep_with_bodies` with caller-provided scratch so tight loops
+/// (depenetration tries up to six translations per overlap) avoid a heap
+/// allocation per candidate translation.
+fn sweep_with_bodies_in(
+    world: &VoxelWorld,
+    position: &mut Vec3,
+    axis: usize,
+    distance: f32,
+    bodies: &BodyBroadphase<'_>,
+    ignore: Option<usize>,
+    shape: CollisionShape,
+    candidates: &mut Vec<u32>,
 ) -> bool {
     if distance == 0.0 {
         return false;
@@ -389,10 +511,18 @@ pub fn sweep_with_bodies(
     let mut hit = sweep_axis(world, position, axis, distance, shape);
     let mut allowed = position[axis] - start[axis];
     let (min, max) = bounds(start, shape);
+    // Only bodies whose box reaches the swept region can bind the clamp: one
+    // grid query over the swept AABB replaces the full snapshot scan.
+    let mut qmin = min - Vec3::splat(EPSILON);
+    let mut qmax = max + Vec3::splat(EPSILON);
+    qmin[axis] = min[axis] + allowed.min(0.0) - EPSILON;
+    qmax[axis] = max[axis] + allowed.max(0.0) + EPSILON;
+    bodies.query(qmin, qmax, candidates);
     let a = (axis + 1) % 3;
     let b = (axis + 2) % 3;
-    for (index, body) in bodies.iter().enumerate() {
-        if ignore == Some(index) || !body.position.is_finite() {
+    for &index in candidates.iter() {
+        let body = &bodies.bodies()[index as usize];
+        if ignore == Some(index as usize) || !body.position.is_finite() {
             continue;
         }
         let (lo, hi) = body.aabb();
@@ -422,10 +552,12 @@ pub fn sweep_with_bodies(
 
 /// Correct snapshot overlap using bounded, terrain-swept translations. If crushed
 /// with no clear escape, tolerate body overlap rather than crossing solid terrain.
+/// `bodies` is a `BodyBroadphase` over the observed snapshot; each pass resolves
+/// overlaps in original slice order, one grid query per pass.
 pub fn separate_bodies(
     world: &VoxelWorld,
     state: &mut PlayerState,
-    bodies: &[DynamicCollider],
+    bodies: &BodyBroadphase<'_>,
     shape: CollisionShape,
 ) {
     // Keep correction bounded while allowing a larger actor to escape a cube
@@ -437,9 +569,20 @@ pub fn separate_bodies(
             .max(shape.height())
             + 0.5,
     );
+    let mut candidates = Vec::new();
+    // Scratch for the sweep's own candidate list so each depenetration probe
+    // reuses one allocation instead of allocating per translation tried.
+    let mut sweep_scratch = Vec::new();
     for _ in 0..4 {
         let mut corrected = false;
-        for (index, body) in bodies.iter().enumerate() {
+        let (min, max) = bounds(state.position, shape);
+        bodies.query(min, max, &mut candidates);
+        // Candidate order matches the snapshot slice, so corrections apply in
+        // the same order a full scan would. A correction that pushes the actor
+        // into a later body resolves on the next pass.
+        for &index in &candidates {
+            let index = index as usize;
+            let body = &bodies.bodies()[index];
             if !body.position.is_finite() {
                 continue;
             }
@@ -457,7 +600,7 @@ pub fn separate_bodies(
                         continue;
                     }
                     let mut candidate = state.position;
-                    sweep_with_bodies(
+                    sweep_with_bodies_in(
                         world,
                         &mut candidate,
                         axis,
@@ -465,6 +608,7 @@ pub fn separate_bodies(
                         bodies,
                         Some(index),
                         shape,
+                        &mut sweep_scratch,
                     );
                     if (candidate[axis] - state.position[axis] - distance).abs() > EPSILON {
                         continue;
