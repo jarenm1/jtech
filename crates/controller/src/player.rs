@@ -41,15 +41,17 @@ pub fn step_player(world: &VoxelWorld, state: &mut PlayerState, input: &PlayerIn
 
 /// Stateless conversion used by authority, prediction, and reconciliation.
 /// `jump` requests one tick on the ground, but is held ascent in debug flight.
+/// Returns the horizontal velocity the character attempted this tick, before
+/// terrain or loose bodies clamped it; the server feeds it to GPU body push.
 pub fn step_player_with_bodies(
     world: &VoxelWorld,
     state: &mut PlayerState,
     input: &PlayerInput,
     dt: f32,
     bodies: &[DynamicCollider],
-) {
+) -> Vec2 {
     if !dt.is_finite() || dt <= 0.0 {
-        return;
+        return Vec2::new(state.velocity.x, state.velocity.z);
     }
     if !state.position.is_finite() || state.position.abs().max_element() > 32_000_000.0 {
         *state = PlayerState::default();
@@ -59,7 +61,7 @@ pub fn step_player_with_bodies(
     }
     state.external_velocity = physics::bounded_horizontal(state.external_velocity);
     if noclip::step(world, state, input, dt.min(0.25), bodies) {
-        return;
+        return Vec2::new(state.velocity.x, state.velocity.z);
     }
     let mut character = CharacterState {
         motion: *state,
@@ -72,7 +74,7 @@ pub fn step_player_with_bodies(
         attack: input.attack,
         held_item: 0,
     };
-    step_character(
+    let attempted = step_character(
         world,
         &mut character,
         &CharacterBody::default(),
@@ -82,4 +84,5 @@ pub fn step_player_with_bodies(
         bodies,
     );
     *state = character.motion;
+    attempted
 }

@@ -789,9 +789,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..60 {
-            let mut intended = player;
-            controller::step_player(&world, &mut intended, &input, physics::FIXED_DT);
-            controller::step_player_with_bodies(
+            let attempted = controller::step_player_with_bodies(
                 &world,
                 &mut player,
                 &input,
@@ -801,7 +799,7 @@ mod tests {
             slice.player_colliders(vec![PlayerCollider {
                 position: player.position.to_array(),
                 id: 0,
-                velocity: [intended.velocity.x, player.velocity.y, intended.velocity.z],
+                velocity: [attempted.x, player.velocity.y, attempted.y],
                 padding: 0,
             }]);
             slice.step(&world);
