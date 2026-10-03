@@ -208,6 +208,7 @@ impl Plugin for SimulationPlugin {
                 needed: HashSet::new(),
                 physics_needed: HashSet::new(),
                 physics,
+                collider_scratch: Vec::new(),
                 terrain: self.terrain.lock().take().expect("plugin built once"),
                 scatter,
                 spawn,
@@ -378,6 +379,9 @@ pub struct Simulation {
     // Reused per tick so body-footprint residency keeps its capacity.
     physics_needed: HashSet<IVec3>,
     physics: Option<PhysicsSlice>,
+    /// Reused buffer for the per-tick dynamic-collider snapshot handed to the
+    /// character motor, so the hot path does not allocate a fresh `Vec`.
+    collider_scratch: Vec<physics::DynamicCollider>,
     /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
     damage: HashMap<IVec3, DamageState>,
     /// Targets whose [`DamageState::release`] is set, keyed `(y, z, x)` so
@@ -1215,11 +1219,14 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         sim.accept_inputs(id, packet);
     }
     // Only one command advances each actor per server tick, regardless of packet rate.
-    let bodies = sim
-        .physics
-        .as_ref()
-        .map(|p| p.dynamic_colliders())
-        .unwrap_or_default();
+    // The collider snapshot is taken out of the resource so the borrow does not
+    // conflict with the `&mut sim` calls below; it is restored at the end.
+    let mut colliders = std::mem::take(&mut sim.collider_scratch);
+    match sim.physics.as_ref() {
+        Some(physics) => physics.dynamic_colliders_into(&mut colliders),
+        None => colliders.clear(),
+    }
+    let bodies = &colliders;
     for player in sim.players.values_mut() {
         if player.health.is_depleted() {
             // Dead players are frozen: no input movement, noclip, or GPU body push
@@ -1294,6 +1301,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
         }
     }
     sim.advance_actors(&world, &bodies);
+    sim.collider_scratch = colliders;
     sim.resolve_attacks(&world);
     for (id, message) in incoming.reliable {
         match message {
@@ -1552,11 +1560,10 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
 }
 
 fn observe_character_bodies(sim: Res<Simulation>, mut bodies: ResMut<controller::ObservedBodies>) {
-    bodies.0 = sim
-        .physics
-        .as_ref()
-        .map(|p| p.dynamic_colliders())
-        .unwrap_or_default();
+    match sim.physics.as_ref() {
+        Some(physics) => physics.dynamic_colliders_into(&mut bodies.0),
+        None => bodies.0.clear(),
+    }
 }
 
 #[cfg(test)]
