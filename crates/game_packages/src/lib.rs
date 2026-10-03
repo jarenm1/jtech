@@ -17,6 +17,7 @@ use gameplay::combat::MeleeSpec;
 use parking_lot::Mutex;
 use protocol::{BowPower, PackageState, PackageStatus};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::Read,
@@ -553,6 +554,10 @@ type LoadResult = Result<Package, String>;
 struct PackageSlot {
     path: PathBuf,
     observed: Result<String, String>,
+    /// (len, mtime) captured just before the read that produced `observed`.
+    /// An equal stamp means `observed` still matches the file, so polls skip
+    /// re-reading `server.scm` until the file moves again.
+    stamp: Option<(u64, std::time::SystemTime)>,
     pending: Option<Mutex<mpsc::Receiver<LoadResult>>>,
     pending_since: Option<Instant>,
     active: Option<Package>,
@@ -564,6 +569,7 @@ impl PackageSlot {
         Self {
             path,
             observed: Err("not read yet".into()),
+            stamp: None,
             pending: None,
             pending_since: None,
             active: None,
@@ -657,8 +663,13 @@ pub struct PackageHost {
     revision: u64,
     active_bow: Option<Arc<BowPackage>>,
     melee: MeleeTable,
-    /// (package, path) -> content fingerprint for every file under `assets/`.
-    assets: BTreeMap<(String, String), AssetEntry>,
+    /// Asset manifest, package id -> relative path -> content fingerprint.
+    /// Updated in place so rescans reuse key allocations.
+    assets: BTreeMap<String, BTreeMap<String, AssetEntry>>,
+    /// Generation counter marking which entries the latest scan touched.
+    scan_epoch: u64,
+    /// Reusable buffer for the discovered package ids of one poll.
+    ids: Vec<String>,
 }
 
 struct AssetEntry {
@@ -666,6 +677,8 @@ struct AssetEntry {
     hash: u64,
     /// Cheap change detector: rehash only when size or mtime moved.
     stamp: Option<(u64, std::time::SystemTime)>,
+    /// Scan generation that last saw this entry; older entries are swept.
+    seen: u64,
 }
 
 const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
@@ -690,15 +703,21 @@ impl PackageHost {
             melee: MeleeTable::default(),
             active_bow: None,
             assets: BTreeMap::new(),
+            scan_epoch: 0,
+            ids: Vec::new(),
         };
-        for id in discover(directory) {
+        let mut ids = Vec::new();
+        discover(directory, &mut ids);
+        for id in ids {
             let path = directory.join(&id).join("server.scm");
+            let stamp = source_stamp(&path);
             let observed = read_source(&path);
             let result = observed
                 .clone()
                 .and_then(|source| Package::compile(source, path.clone(), 1));
             let mut slot = PackageSlot::new(path, id);
             slot.observed = observed;
+            slot.stamp = stamp;
             host.install_slot(slot, result);
         }
         host.scan_assets();
@@ -727,18 +746,22 @@ impl PackageHost {
     pub fn asset_manifest(&self) -> Vec<protocol::PackageAssetInfo> {
         self.assets
             .iter()
-            .filter(|((package, _), _)| {
-                package == TERRAIN_PACKAGE
+            .filter(|(package, _)| {
+                package.as_str() == TERRAIN_PACKAGE
                     || self
                         .slots
-                        .get(package)
+                        .get(package.as_str())
                         .is_some_and(|slot| slot.active.is_some())
             })
-            .map(|((package, path), entry)| protocol::PackageAssetInfo {
-                package: package.clone(),
-                path: path.clone(),
-                size: entry.size,
-                hash: entry.hash,
+            .flat_map(|(package, files)| {
+                files.iter().map(move |(path, entry)| {
+                    protocol::PackageAssetInfo {
+                        package: package.clone(),
+                        path: path.clone(),
+                        size: entry.size,
+                        hash: entry.hash,
+                    }
+                })
             })
             .collect()
     }
@@ -782,7 +805,9 @@ impl PackageHost {
     /// Rehash `assets/` contents; bumps the manifest revision on any change so
     /// clients re-sync and re-download what moved.
     fn scan_assets(&mut self) {
-        let mut found = BTreeMap::new();
+        self.scan_epoch += 1;
+        let epoch = self.scan_epoch;
+        let mut changed = false;
         // The startup-only terrain package ships scatter models but has no slot.
         let ids = self
             .slots
@@ -790,15 +815,26 @@ impl PackageHost {
             .map(String::as_str)
             .chain(std::iter::once(TERRAIN_PACKAGE));
         for id in ids {
+            if !self.assets.contains_key(id) {
+                self.assets.insert(id.to_string(), BTreeMap::new());
+            }
+            let entries = self.assets.get_mut(id).unwrap();
             let root = self.directory.join(id).join("assets");
-            scan_asset_dir(&root, &root, id, &self.assets, &mut found);
+            scan_asset_dir(&root, &root, entries, epoch, &mut changed);
         }
-        if found.len() != self.assets.len()
-            || found
-                .iter()
-                .any(|(key, entry)| self.assets.get(key).is_none_or(|old| old.hash != entry.hash))
-        {
-            self.assets = found;
+        // Sweep files that vanished or stopped scanning since the last pass.
+        let mut removed = 0usize;
+        self.assets.retain(|_, files| {
+            files.retain(|_, entry| {
+                let keep = entry.seen == epoch;
+                if !keep {
+                    removed += 1;
+                }
+                keep
+            });
+            !files.is_empty()
+        });
+        if changed || removed > 0 {
             self.revision += 1;
         }
     }
@@ -836,7 +872,15 @@ impl PackageHost {
                 slot.pending = None;
                 slot.pending_since = None;
                 // A second save during compilation supersedes this candidate.
+                // Stat first: an unchanged stamp still means `observed` matches
+                // the file, so most completions skip the read entirely.
+                let stamp = source_stamp(&slot.path);
+                if stamp == slot.stamp && slot.observed.is_ok() {
+                    ready.push((id.clone(), result));
+                    continue;
+                }
                 let current = read_source(&slot.path);
+                slot.stamp = stamp;
                 if current == slot.observed {
                     ready.push((id.clone(), result));
                 } else {
@@ -850,28 +894,30 @@ impl PackageHost {
         if Instant::now() >= self.next_poll {
             self.next_poll = Instant::now() + POLL_INTERVAL;
             self.scan_assets();
-            for id in discover(&self.directory) {
-                if !self.slots.contains_key(&id) {
-                    let path = self.directory.join(&id).join("server.scm");
+            self.ids.clear();
+            discover(&self.directory, &mut self.ids);
+            for id in &self.ids {
+                if !self.slots.contains_key(id.as_str()) {
+                    let path = self.directory.join(id).join("server.scm");
                     let mut slot = PackageSlot::new(path.clone(), id.clone());
+                    slot.stamp = source_stamp(&path);
                     slot.begin_reload(read_source(&path));
                     self.revision += 1;
-                    self.slots.insert(id, slot);
+                    self.slots.insert(id.clone(), slot);
                 }
             }
-            let removed: Vec<String> = self
-                .slots
-                .keys()
-                .filter(|id| !self.directory.join(id).is_dir())
-                .cloned()
-                .collect();
-            for id in removed {
-                self.slots.remove(&id);
-                self.revision += 1;
-            }
+            let slots = self.slots.len();
+            self.slots
+                .retain(|id, _| self.directory.join(id).is_dir());
+            self.revision += (slots - self.slots.len()) as u64;
             for slot in self.slots.values_mut() {
                 if slot.pending.is_none() {
+                    let stamp = source_stamp(&slot.path);
+                    if stamp == slot.stamp && slot.observed.is_ok() {
+                        continue;
+                    }
                     let source = read_source(&slot.path);
+                    slot.stamp = stamp;
                     if source != slot.observed {
                         slot.begin_reload(source);
                     }
@@ -994,24 +1040,27 @@ impl PackageHost {
     }
 }
 
-/// Recursively collect `assets/` files into `(package, relative-path)` entries.
+/// Recursively refresh `entries` with the files under one package's `assets/`
+/// directory. Entries keep their keys and hashes between scans: a file is only
+/// re-read when its (len, mtime) stamp moved, and entries not seen this epoch
+/// are swept by the caller.
 fn scan_asset_dir(
     root: &Path,
     dir: &Path,
-    package: &str,
-    old: &BTreeMap<(String, String), AssetEntry>,
-    out: &mut BTreeMap<(String, String), AssetEntry>,
+    entries: &mut BTreeMap<String, AssetEntry>,
+    epoch: u64,
+    changed: &mut bool,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(iter) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    for entry in iter.flatten() {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else {
             continue;
         };
         if meta.is_dir() {
-            scan_asset_dir(root, &path, package, old, out);
+            scan_asset_dir(root, &path, entries, epoch, changed);
             continue;
         }
         if !meta.is_file() || meta.len() > MAX_ASSET_BYTES {
@@ -1021,41 +1070,71 @@ fn scan_asset_dir(
             continue;
         };
         let stamp = meta.modified().ok().map(|mtime| (meta.len(), mtime));
-        let key = (
-            package.to_string(),
-            relative.to_string_lossy().replace('\\', "/"),
-        );
-        let hash = match old.get(&key) {
-            Some(old) if old.stamp == stamp => old.hash,
-            _ => match std::fs::read(&path) {
-                Ok(bytes) => fnv1a(&bytes),
-                Err(_) => continue,
-            },
+        // Keys store '/' separators; borrow the name when it needs no fixups.
+        let name = relative.to_string_lossy();
+        let key: Cow<str> = if name.contains('\\') {
+            Cow::Owned(name.replace('\\', "/"))
+        } else {
+            name
         };
-        out.insert(
-            key,
-            AssetEntry {
-                size: meta.len() as u32,
+        if let Some(old) = entries.get_mut(key.as_ref()) {
+            if old.stamp == stamp {
+                old.seen = epoch;
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let size = meta.len() as u32;
+            let hash = fnv1a(&bytes);
+            if old.size != size || old.hash != hash {
+                *changed = true;
+            }
+            *old = AssetEntry {
+                size,
                 hash,
                 stamp,
+                seen: epoch,
+            };
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        entries.insert(
+            key.into_owned(),
+            AssetEntry {
+                size: meta.len() as u32,
+                hash: fnv1a(&bytes),
+                stamp,
+                seen: epoch,
             },
         );
+        *changed = true;
     }
 }
 
 /// Package directories eligible for live hosting: every subdirectory except the
 /// startup-only terrain package.
-fn discover(directory: &Path) -> Vec<String> {
-    let mut ids: Vec<String> = std::fs::read_dir(directory)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|id| id != TERRAIN_PACKAGE)
-        .collect();
-    ids.sort();
-    ids
+fn discover(directory: &Path, out: &mut Vec<String>) {
+    out.extend(
+        std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|id| id != TERRAIN_PACKAGE),
+    );
+    out.sort();
+}
+
+/// (len, mtime) of a `server.scm`, or `None` when it cannot be statted. The
+/// stamp is taken *before* reading so a mid-read save still compares unequal on
+/// the next poll instead of leaving `observed` ahead of its stamp.
+fn source_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 fn read_source(path: &Path) -> Result<String, String> {
