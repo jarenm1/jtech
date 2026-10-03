@@ -5,7 +5,7 @@
 //! error against the motor convention: yaw zero faces -Z, positive turn
 //! rotates left.
 use crate::actors::{ActorObservation, BrainKind, ObservedEntity};
-use controller::CharacterIntent;
+use controller::{CharacterIntent, MAX_SLOTS, Mode, StatusList};
 use glam::{Vec2, Vec3};
 
 /// Distance at which a `FleeBrain` treats an entity as a threat.
@@ -157,6 +157,11 @@ mod tests {
             melee_range: 2.0,
             nearest_player: None,
             nearest_actor: None,
+            mode: Mode::default(),
+            statuses: StatusList::default(),
+            cooldowns: [0; MAX_SLOTS],
+            cast: None,
+            crouching: false,
         }
     }
 
