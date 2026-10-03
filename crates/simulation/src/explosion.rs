@@ -79,7 +79,18 @@ pub(super) fn plan_blast(
     let radius = blast.radius;
     let min = (center - Vec3::splat(radius)).floor().as_ivec3();
     let max = (center + Vec3::splat(radius)).floor().as_ivec3();
-    let mut candidates = Vec::new();
+    // Bodies outside the blast sphere cannot be receivers, and a unit-cube body
+    // can only occlude a ray ending within `radius` if its centre is within
+    // `radius + 1`. Filter once so the per-face occlusion scans below touch only
+    // nearby bodies instead of every body in the world (was O(candidates·bodies)).
+    let reach_limit = radius + 1.0;
+    let nearby: Vec<&PhysicsBodySnapshot> = bodies
+        .iter()
+        .filter(|body| (body.position - center).length_squared() <= reach_limit * reach_limit)
+        .collect();
+    let span = (max - min + IVec3::ONE).max(IVec3::ZERO);
+    let cells = (span.x as usize) * (span.y as usize) * (span.z as usize);
+    let mut candidates = Vec::with_capacity(cells + nearby.len());
     for y in min.y..=max.y {
         if y <= MIN_CHUNK_Y * CHUNK_SIZE {
             continue;
@@ -97,10 +108,10 @@ pub(super) fn plan_blast(
             }
         }
     }
-    for body in bodies {
+    for body in &nearby {
         candidates.push((Target::Body(body.id), body.position, body.material as u32));
     }
-    let mut visible = Vec::new();
+    let mut visible = Vec::with_capacity(candidates.len());
     for (target, position, mat) in candidates {
         let offset = position - center;
         let distance = offset.length();
@@ -129,7 +140,7 @@ pub(super) fn plan_blast(
                 Target::Body(_) | Target::Player(_) => terrain_hit.is_none(),
             };
             if terrain_clear
-                && !bodies.iter().any(|body| {
+                && !nearby.iter().any(|body| {
                     target != Target::Body(body.id)
                         && super::bow::ray_cube(center, aim, body.position, reach).is_some()
                 })
@@ -168,7 +179,7 @@ pub(super) fn plan_blast(
             .into_iter()
             .filter(|height| {
                 let sample = state.position + Vec3::Y * (PLAYER_HEIGHT * height);
-                player_ray_clear(world, bodies, center, sample)
+                player_ray_clear(world, &nearby, center, sample)
             })
             .count() as f32
             / 3.0;
@@ -228,7 +239,7 @@ pub(super) fn plan_blast(
 
 fn player_ray_clear(
     world: &VoxelWorld,
-    bodies: &[PhysicsBodySnapshot],
+    bodies: &[&PhysicsBodySnapshot],
     center: Vec3,
     sample: Vec3,
 ) -> bool {
