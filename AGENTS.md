@@ -1,5 +1,22 @@
 # Agent instructions
 
+## Non-negotiables
+
+Enforced, not advisory: a pre-tool hook rewrites heavy commands to comply, and
+the human reviews violations.
+
+1. **One task = one workspace = one agent.** Never write, build, or test in
+   `default` (`/home/jaren/jtech`). Create `~/workspaces/<slug>` from
+   `main@origin` first — see "Workspace isolation".
+2. **Wrap every heavy command in `scripts/agent-scope.sh`.** Builds, tests,
+   clippy, and any client/server run MUST execute inside the scope so CPU,
+   memory, and the single GPU stay bounded across parallel agents — see
+   "Resource governance". Bare `cargo`/`voxel-client`/`server` is a violation
+   even when it works.
+3. **Never touch the GPU without `--gpu`.** Windowed client runs serialize
+   behind `scripts/agent-scope.sh --gpu --`; prefer headless software
+   rendering, which opens no Vulkan device at all.
+
 ## Workspace isolation
 
 The `default` workspace is `/home/jaren/jtech` — the human works there. All
@@ -35,19 +52,28 @@ agent work happens in a dedicated jj workspace under `~/workspaces/`.
 
 ### Resource governance
 
-Agents share one workstation (8 cores, one GPU). Cap every long build, test,
-or render through `scripts/agent-scope.sh` so one agent cannot saturate the
-CPU or open a competing GPU context:
+Agents share one workstation (8 cores, one GPU). **Every** build, test,
+clippy, or client/server run MUST go through `scripts/agent-scope.sh` — it is
+the only thing keeping N parallel agents from saturating the machine. Running
+`cargo`/`voxel-client`/`server` bare is a violation even when it "works".
+
+Canonical forms (the wrapper goes outermost, so the whole tree — direnv, nix,
+rustc, the game — is capped):
 
 ```sh
-scripts/agent-scope.sh -- cargo test -p simulation
+scripts/agent-scope.sh -- direnv exec ~/workspaces/<slug> cargo check -p <crate>
+scripts/agent-scope.sh -- direnv exec ~/workspaces/<slug> cargo test -p <crate>
 scripts/agent-scope.sh --cpu-quota 200% -- cargo build
-scripts/agent-scope.sh --gpu -- cargo run -p voxel-client -- --headless --frames 300 --screenshot /tmp/shot.png
+scripts/agent-scope.sh --gpu -- direnv exec ~/workspaces/<slug> cargo run -p voxel-client -- --frames 300 --screenshot /tmp/shot.png
 ```
 
-- Defaults: `CPUQuota=400%` (half the cores), `MemoryMax=8G`, swap disabled.
-  Override with `--cpu-quota`/`--memory-max` or `AGENT_CPU_QUOTA`/
+- Per-scope defaults: `CPUQuota=400%` (half the cores), `MemoryMax=8G`, swap
+  disabled. Override with `--cpu-quota`/`--memory-max` or `AGENT_CPU_QUOTA`/
   `AGENT_MEMORY_MAX`.
+- Every scope also joins one shared `agents.slice` with an aggregate cap
+  (`AGENT_SLICE_CPU_QUOTA`, default `600%`; `AGENT_SLICE_MEMORY_MAX`, default
+  `16G`), so the *total* across agents stays bounded no matter how many run.
+  `--no-slice` opts out; `--slice NAME` picks another slice.
 - `CARGO_BUILD_JOBS` is derived from the quota, so a capped scope does not
   spawn more compilers than it can run.
 - `--gpu` takes an exclusive `flock` so only one agent touches the GPU at a
@@ -55,6 +81,13 @@ scripts/agent-scope.sh --gpu -- cargo run -p voxel-client -- --headless --frames
   does not need it.
 - Prefer the headless software renderer for visual checks (see "Visual
   evidence"); it uses no GPU at all.
+- Light commands (`cargo fmt`, `cargo metadata`, `jj`, `rg`) do not need the
+  wrapper.
+
+The `.omp/hooks/pre/agent-scope.ts` pre-tool hook rewrites un-scoped heavy
+bash commands into the wrapped form automatically, so a forgotten wrapper is
+corrected rather than ignored. It is a backstop, not a licence to skip the
+wrapper.
 
 ### Commits
 
@@ -75,24 +108,26 @@ scripts/agent-scope.sh --gpu -- cargo run -p voxel-client -- --headless --frames
 
 ### Environment and verification
 
-- `.envrc` is tracked (`use flake` + per-workspace `CARGO_TARGET_DIR`). Agent
-  shells are not direnv-hooked, so run cargo/build/test through direnv:
+- `.envrc` is tracked (`use flake`); cargo's target dir defaults to
+  `<workspace>/target`, which is per-workspace. Agent shells are not
+  direnv-hooked, so run cargo/build/test through direnv, inside the scope:
   ```sh
   direnv allow ~/workspaces/<slug>   # once per workspace
-  direnv exec ~/workspaces/<slug> cargo check -p <crate>
+  scripts/agent-scope.sh -- direnv exec ~/workspaces/<slug> cargo check -p <crate>
   ```
   If the parent env is unknown or the allow isn't in place, use
-  `nix develop ~/workspaces/<slug> -c <cmd>` instead — no `allow` needed.
+  `nix develop ~/workspaces/<slug> -c <cmd>` instead — no `allow` needed —
+  still wrapped: `scripts/agent-scope.sh -- nix develop ~/workspaces/<slug> -c cargo check -p <crate>`.
 - `CARGO_TARGET_DIR` is per-workspace (`<ws>/target`): cargo keys path-dep
   artifacts by crate name, not workspace directory — a shared target dir lets
   divergent sibling workspaces poison each other's build artifacts (observed:
   phantom stale-API compile errors). Cold builds are the price of isolation;
   never point two workspaces at the same target dir.
-- Minimum gate before reporting done: `cargo check -p <touched crates>` (whole
-  workspace when crate boundaries are unclear) plus `cargo test -p` for
-  touched crates with tests. The compile gate is the agent's; gameplay/
-  behavioral sign-off is the human's — state in your report exactly what
-  needs manual verification and the command to run it.
+- Minimum gate before reporting done, both wrapped in `scripts/agent-scope.sh`:
+  `cargo check -p <touched crates>` (whole workspace when crate boundaries are
+  unclear) plus `cargo test -p` for touched crates with tests. The compile gate
+  is the agent's; gameplay/behavioral sign-off is the human's — state in your
+  report exactly what needs manual verification and the command to run it.
 
 ### Handoff to the human
 
@@ -152,17 +187,19 @@ first:
   for logic; not visual.
 - **Headless captures** — `voxel-client --headless --render-backend software
   --frames N --screenshot out.png` renders offscreen on the CPU (lavapipe), so
-  it needs no display server and no GPU. Use it for visual evidence when the
-  host display is busy or you want zero GPU impact. Slower than the real GPU:
-  fine for stills, not for frame-time numbers.
+  it needs no display server and no GPU. This is the default for visual
+  evidence; wrap it in `scripts/agent-scope.sh --` (CPU cap; no `--gpu`
+  needed). Slower than the real GPU: fine for stills, not for frame-time
+  numbers.
 - **Headless clips** — add `--clip out.gif --clip-fps N` for motion. The GIF is
   encoded in-process (no ffmpeg needed) and plays inline in a PR body, unlike a
   video file. Sampling is frame-counted, so the clip plays at `--clip-fps`
   regardless of how fast the renderer runs.
-- **Screenshots** — run the client on the host display
-  (`DISPLAY=:0`/`WAYLAND_DISPLAY=wayland-1` are set in this environment),
-  capture with `grim` (wayland) or `import -window root`, and link the file.
-  Wrap GPU runs in `scripts/agent-scope.sh --gpu --` so they serialize.
+- **Screenshots** — only when headless cannot show what you need. Run the
+  client on the host display (`DISPLAY=:0`/`WAYLAND_DISPLAY=wayland-1` are set
+  in this environment) and capture with `grim` (wayland) or
+  `import -window root`. Windowed runs MUST be wrapped in
+  `scripts/agent-scope.sh --gpu --` so they serialize on the one GPU.
 - **Clips** — `ffmpeg -f x11grab` / `wl-screenrec` can record the running
   client window. Works, but flaky under load; budget a few retries.
 
