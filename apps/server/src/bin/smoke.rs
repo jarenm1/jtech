@@ -258,7 +258,7 @@ impl Bot {
             self.snapshot_tick = snapshot.tick;
             self.acknowledged = snapshot.you.last_input;
             self.remotes = snapshot.players.len();
-            self.authority = snapshot.you.state;
+            self.authority = snapshot.you.state.motion;
             self.actors = snapshot
                 .actors
                 .iter()

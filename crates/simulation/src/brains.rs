@@ -5,7 +5,7 @@
 //! error against the motor convention: yaw zero faces -Z, positive turn
 //! rotates left.
 use crate::actors::{ActorObservation, BrainKind, ObservedEntity};
-use controller::{CharacterIntent, MAX_SLOTS, Mode, StatusList};
+use controller::CharacterIntent;
 use glam::{Vec2, Vec3};
 
 /// Distance at which a `FleeBrain` treats an entity as a threat.
@@ -132,6 +132,7 @@ impl Brain for FleeBrain {
 mod tests {
     use super::*;
     use crate::actors::SimEntity;
+    use controller::{MAX_SLOTS, Mode, StatusList};
     use gameplay::Health;
 
     fn observed(entity: SimEntity, position: Vec3, distance: f32, los: bool) -> ObservedEntity {

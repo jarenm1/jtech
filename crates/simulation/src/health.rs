@@ -206,7 +206,7 @@ mod tests {
         let snapshot = Snapshot {
             tick: sim.tick,
             you: sim.players[&1].snapshot(1),
-            players: vec![sim.players[&2].snapshot(2)],
+            players: vec![sim.players[&2].remote_snapshot(2)],
             actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();

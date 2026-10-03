@@ -31,7 +31,7 @@ fn flight_inputs_replicate_and_missing_input_hovers_without_body_push() {
     let snapshot = player.snapshot(1);
     let bytes = protocol::encode(&snapshot, protocol::MAX_DATAGRAM).unwrap();
     let received: PlayerSnapshot = protocol::decode(&bytes, protocol::MAX_DATAGRAM).unwrap();
-    assert!(received.state.noclip);
+    assert!(received.state.motion.noclip);
     for _ in 0..3 {
         app.update();
     }

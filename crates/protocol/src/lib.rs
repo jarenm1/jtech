@@ -1,6 +1,6 @@
 mod bow_power;
 pub use bow_power::BowPower;
-use controller::PlayerInput;
+use controller::{CharacterState, PlayerInput};
 pub use gameplay::{Health, Inventory};
 use glam::{IVec3, Vec3};
 use physics::PlayerState;
@@ -276,10 +276,21 @@ pub struct DropSnapshot {
     pub position: Vec3,
 }
 
+/// The local player's full state at 20 Hz: complete `CharacterState` so
+/// reconciliation can replay statuses, cooldowns, casts and dashes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub id: u64,
     pub last_input: u64,
+    pub state: CharacterState,
+    pub health: Health,
+    pub life: u64,
+}
+/// A remote player at 20 Hz: motion and facing only. Remote clients interpolate
+/// position and yaw, so the full controller state would not fit a datagram.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemotePlayerSnapshot {
+    pub id: u64,
     pub state: PlayerState,
     pub health: Health,
     pub life: u64,
@@ -297,7 +308,7 @@ pub struct ActorSnapshot {
 pub struct Snapshot {
     pub tick: u64,
     pub you: PlayerSnapshot,
-    pub players: Vec<PlayerSnapshot>,
+    pub players: Vec<RemotePlayerSnapshot>,
     pub actors: Vec<ActorSnapshot>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -480,6 +491,12 @@ mod tests {
         let player = PlayerSnapshot {
             id: 1,
             last_input: 3,
+            state: CharacterState::default(),
+            health,
+            life: 0,
+        };
+        let remote = RemotePlayerSnapshot {
+            id: 1,
             state: PlayerState::default(),
             health,
             life: 0,
@@ -487,8 +504,8 @@ mod tests {
         };
         let snapshot = Snapshot {
             tick: 9,
-            you: player.clone(),
-            players: vec![player],
+            you: player,
+            players: vec![remote],
             actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
@@ -517,6 +534,12 @@ mod tests {
         let player = PlayerSnapshot {
             id: u64::MAX,
             last_input: u64::MAX,
+            state: CharacterState::default(),
+            health: Health::new(u16::MAX).unwrap(),
+            life: u64::MAX,
+        };
+        let remote = RemotePlayerSnapshot {
+            id: u64::MAX,
             state: PlayerState::default(),
             health: Health::new(u16::MAX).unwrap(),
             life: u64::MAX,
@@ -524,8 +547,8 @@ mod tests {
         };
         let snapshot = Snapshot {
             tick: u64::MAX,
-            you: player.clone(),
-            players: vec![player; MAX_PLAYERS - 1],
+            you: player,
+            players: vec![remote; MAX_PLAYERS - 1],
             actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
@@ -565,6 +588,12 @@ mod tests {
         let player = PlayerSnapshot {
             id: 4,
             last_input: 9,
+            state: CharacterState::default(),
+            health: Health::default(),
+            life: 3,
+        };
+        let remote = RemotePlayerSnapshot {
+            id: 4,
             state: PlayerState::default(),
             health: Health::default(),
             life: 3,
@@ -572,8 +601,8 @@ mod tests {
         };
         let snapshot = Snapshot {
             tick: 12,
-            you: player.clone(),
-            players: vec![player],
+            you: player,
+            players: vec![remote],
             actors: vec![],
         };
         let bytes = encode(&snapshot, MAX_DATAGRAM).unwrap();
