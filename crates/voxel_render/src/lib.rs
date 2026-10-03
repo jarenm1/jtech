@@ -598,6 +598,14 @@ struct GrassPatch {
     /// but is dirty rather than "built over nothing".
     built: bool,
 }
+/// Cached `column_top` result for one world column at one ceiling band.
+struct ColumnScan {
+    ceiling: i32,
+    top: Option<i32>,
+    /// Revisions of the vertical chunks the scan consulted; `None` entries
+    /// were missing chunks whose arrival must invalidate the entry.
+    deps: PatchStamp,
+}
 
 /// World-grid patches with throttled revision scans and budgeted rebuilds.
 #[derive(Resource, Default)]
@@ -606,6 +614,9 @@ struct GrassField {
     /// Reuse contour meshes across patches; never contour the same unchanged
     /// chunk once per patch. Entries are evicted with their dependent patches.
     surfaces: HashMap<IVec3, GrassSurface>,
+    /// Top-solid scan per world column, shared across the overlapping patch
+    /// grid; reused while every chunk it consulted keeps its revision.
+    columns: HashMap<IVec2, ColumnScan>,
     /// Scratch candidate list, `clear()`ed each frame; the allocation persists.
     dirty: Vec<(f32, IVec2)>,
     checked_at: f32,
@@ -653,25 +664,61 @@ fn probe(deps: &mut HashMap<IVec3, Option<u64>>, world: &VoxelWorld, coord: IVec
 /// when only air (loaded or missing) was found above the scan floor. The
 /// smooth surface crosses the vertical edge between this voxel and the one
 /// above it; every consulted chunk is recorded in `deps`.
+///
+/// Results are cached per world column in `columns` and reused whenever the
+/// cached ceiling matches and every chunk the scan consulted still holds its
+/// revision; otherwise the column rescans and the entry is refreshed. A cache
+/// hit merges the recorded deps into `deps`, so the patch stamp keeps watching
+/// the same chunks as a live scan would.
 fn column_top(
     world: &VoxelWorld,
     deps: &mut HashMap<IVec3, Option<u64>>,
+    columns: &mut HashMap<IVec2, ColumnScan>,
     x: i32,
     z: i32,
     ceiling: i32,
 ) -> Option<i32> {
+    let column = IVec2::new(x, z);
+    if let Some(scan) = columns.get(&column).filter(|scan| {
+        scan.ceiling == ceiling
+            && scan.deps.iter().all(|&(coord, revision)| {
+                world.chunks.get(&coord).map(|chunk| chunk.revision) == revision
+            })
+    }) {
+        for &(coord, revision) in &scan.deps {
+            deps.entry(coord).or_insert(revision);
+        }
+        return scan.top;
+    }
+
+    // Cache miss: scan downward, recording consulted chunks for both the patch
+    // stamp and the new cache entry.
+    let mut column_deps: HashMap<IVec3, Option<u64>> = HashMap::new();
+    let mut top = None;
     for y in (ceiling - GRASS_SCAN_DEPTH..=ceiling).rev() {
-        probe(deps, world, chunk_coord(IVec3::new(x, y, z)));
+        probe(&mut column_deps, world, chunk_coord(IVec3::new(x, y, z)));
         // Missing chunks scan as air so unloaded sky cannot hide the terrain
         // below; the recorded dep rebuilds the patch when one streams in.
         let Some(density) = world.density(IVec3::new(x, y, z)) else {
             continue;
         };
         if density > 0 {
-            return Some(y);
+            top = Some(y);
+            break;
         }
     }
-    None
+    for (&coord, &revision) in &column_deps {
+        deps.entry(coord).or_insert(revision);
+    }
+    columns.insert(
+        column,
+        ColumnScan {
+            ceiling,
+            top,
+            deps: column_deps.into_iter().collect(),
+        },
+    );
+    top
 }
 
 /// Append one blade: a curved, tapered ribbon of five vertices and three
@@ -755,6 +802,7 @@ fn grass_patch_mesh(
     ceiling: i32,
     lod: usize,
     surfaces: &mut HashMap<IVec3, GrassSurface>,
+    columns: &mut HashMap<IVec2, ColumnScan>,
 ) -> GrassPatchData {
     let mut deps: HashMap<IVec3, Option<u64>> = HashMap::new();
     let min = patch * GRASS_PATCH_SIZE;
@@ -766,7 +814,7 @@ fn grass_patch_mesh(
     let mut wanted: HashMap<IVec3, u32> = HashMap::new();
     for z in min.y - 1..=max.y {
         for x in min.x - 1..=max.x {
-            if let Some(top) = column_top(world, &mut deps, x, z, ceiling) {
+            if let Some(top) = column_top(world, &mut deps, columns, x, z, ceiling) {
                 let coord = chunk_coord(IVec3::new(x, top, z));
                 *wanted.entry(coord).or_default() += 1;
             }
@@ -975,6 +1023,14 @@ fn update_grass(
         .floor()
         .as_ivec2()
         + IVec2::ONE;
+
+    // Cached column scans outside the streamed patch region (plus the
+    // one-column overlap) can never be queried again; drop them.
+    let column_lo = lo * GRASS_PATCH_SIZE - IVec2::ONE;
+    let column_hi = (hi + IVec2::ONE) * GRASS_PATCH_SIZE;
+    field
+        .columns
+        .retain(|column, _| column.cmpge(column_lo).all() && column.cmplt(column_hi).all());
     for z in lo.y..=hi.y {
         for x in lo.x..=hi.x {
             let coord = IVec2::new(x, z);
@@ -1007,10 +1063,19 @@ fn update_grass(
     });
 
     let builds = field.dirty.len().min(GRASS_BUILDS_PER_UPDATE + field.dirty.len() / GRASS_BUILDS_PER_DIRTY);
+    // Reborrow once so disjoint fields can be borrowed together in the loop.
+    let field = &mut *field;
     for index in 0..builds {
         let coord = field.dirty[index].1;
         let lod = grass_lod(coord, focus_xz);
-        let data = grass_patch_mesh(&world, coord, ceiling, lod, &mut field.surfaces);
+        let data = grass_patch_mesh(
+            &world,
+            coord,
+            ceiling,
+            lod,
+            &mut field.surfaces,
+            &mut field.columns,
+        );
         let patch = field.patches.get_mut(&coord).expect("in-range patch");
         patch.stamp = data.stamp;
         patch.blades = data.blades;
@@ -1801,7 +1866,14 @@ mod tests {
     fn grass_roots_lie_on_surface_nets_triangles() {
         // Roots must sit on the emitted sloped triangles, not integer columns.
         let world = sloped_grass_world();
-        let data = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut HashMap::new());
+        let data = grass_patch_mesh(
+            &world,
+            IVec2::ZERO,
+            48,
+            0,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert!(data.blades > 10, "patch grew only {} blades", data.blades);
         assert_eq!(data.mesh.positions.len(), data.blades * 5);
         assert_eq!(data.mesh.indices.len(), data.blades * 9);
@@ -1837,8 +1909,10 @@ mod tests {
     fn grass_patch_rebuilds_only_when_consulted_chunks_change() {
         let mut world = sloped_grass_world();
         let mut surfaces = HashMap::new();
-        let first = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces);
-        let second = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces);
+        let mut columns = HashMap::new();
+        let first = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces, &mut columns);
+        // The second build reuses every column scan from the shared cache.
+        let second = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces, &mut columns);
         assert_eq!(first.mesh.positions, second.mesh.positions);
         assert_eq!(first.mesh.indices, second.mesh.indices);
         assert!(!grass_stamp_dirty(&world, &first.stamp));
@@ -1852,11 +1926,11 @@ mod tests {
 
         // A far patch that never consulted the edited chunk stays clean;
         // loading a chunk it *did* scan (as missing) dirties it.
-        let far = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &mut surfaces);
+        let far = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &mut surfaces, &mut columns);
         assert!(!grass_stamp_dirty(&world, &far.stamp));
         world.insert(IVec3::new(1, 0, 1), chunk_with(|_| AIR));
         assert!(grass_stamp_dirty(&world, &far.stamp));
-        let loaded = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &mut surfaces);
+        let loaded = grass_patch_mesh(&world, IVec2::new(5, 5), 48, 0, &mut surfaces, &mut columns);
 
         // Unloading a consulted chunk is as dirty as editing it.
         world.remove(IVec3::new(1, 0, 1));
@@ -1877,7 +1951,14 @@ mod tests {
                 },
             ),
         );
-        let grown = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut HashMap::new());
+        let grown = grass_patch_mesh(
+            &world,
+            IVec2::ZERO,
+            48,
+            0,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         let cell_roots = |mesh: &MeshData| {
             grass_roots(mesh)
                 .into_iter()
@@ -1890,7 +1971,14 @@ mod tests {
         );
 
         world.set_block(IVec3::new(4, 16, 4), STONE);
-        let smothered = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut HashMap::new());
+        let smothered = grass_patch_mesh(
+            &world,
+            IVec2::ZERO,
+            48,
+            0,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert_eq!(cell_roots(&smothered.mesh), 0);
         assert!(smothered.blades < grown.blades);
         assert!(smothered.blades > grown.blades - 20, "whole patch suppressed");
@@ -1902,8 +1990,8 @@ mod tests {
         // subset — rank is position-seeded, so blades return identically.
         let world = sloped_grass_world();
         let mut surfaces = HashMap::new();
-        let near = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces);
-        let far = grass_patch_mesh(&world, IVec2::ZERO, 48, 2, &mut surfaces);
+        let near = grass_patch_mesh(&world, IVec2::ZERO, 48, 0, &mut surfaces, &mut HashMap::new());
+        let far = grass_patch_mesh(&world, IVec2::ZERO, 48, 2, &mut surfaces, &mut HashMap::new());
         assert!(far.blades > 0);
         assert!(far.blades < near.blades * 3 / 10);
         for i in (0..far.mesh.colors.len()).step_by(5) {
