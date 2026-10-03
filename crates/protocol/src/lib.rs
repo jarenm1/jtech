@@ -314,6 +314,21 @@ pub fn encode<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
+/// Serialize into `output` (appending) instead of allocating. On error `output`
+/// is restored to its original length so the buffer stays reusable.
+pub fn encode_into<T: Serialize>(value: &T, limit: usize, output: &mut Vec<u8>) -> io::Result<()> {
+    let start = output.len();
+    if let Err(error) = postcard::to_io(value, &mut *output) {
+        output.truncate(start);
+        return Err(invalid(error));
+    }
+    if output.len() - start > limit {
+        output.truncate(start);
+        return Err(invalid("encoded message exceeds limit"));
+    }
+    Ok(())
+}
 pub fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> io::Result<T> {
     if bytes.len() > limit {
         return Err(invalid("message exceeds limit"));

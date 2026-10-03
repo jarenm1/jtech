@@ -1,6 +1,6 @@
 use protocol::{
     ClientMessage, InputPacket, MAX_DATAGRAM, MAX_FRAME, MAX_PLAYERS, PROTOCOL_VERSION,
-    ServerMessage, Snapshot, decode, encode,
+    ServerMessage, Snapshot, decode, encode_into,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -55,16 +55,17 @@ impl Framed {
         }
     }
     fn queue(&mut self, message: &impl Serialize) -> io::Result<()> {
-        let bytes = encode(message, MAX_FRAME)?;
-        if self.pending + bytes.len() + 4 > MAX_PENDING {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0_u8; 4]);
+        encode_into(message, MAX_FRAME, &mut frame)?;
+        if self.pending + frame.len() > MAX_PENDING {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "reliable queue full",
             ));
         }
-        let mut frame = Vec::with_capacity(bytes.len() + 4);
-        frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&bytes);
+        let length = (frame.len() - 4) as u32;
+        frame[..4].copy_from_slice(&length.to_le_bytes());
         self.pending += frame.len();
         self.output.push_back(frame);
         Ok(())
@@ -151,6 +152,7 @@ pub struct Incoming {
 pub struct ClientTransport {
     tcp: Framed,
     udp: UdpSocket,
+    send_scratch: Vec<u8>,
     pub stats: TrafficStats,
 }
 impl ClientTransport {
@@ -170,6 +172,7 @@ impl ClientTransport {
         Ok(Self {
             tcp,
             udp,
+            send_scratch: Vec::new(),
             stats: TrafficStats::default(),
         })
     }
@@ -183,8 +186,9 @@ impl ClientTransport {
                 "input redundancy must be 1..=8",
             ));
         }
-        let bytes = encode(&packet, MAX_DATAGRAM)?;
-        match self.udp.send(&bytes) {
+        self.send_scratch.clear();
+        encode_into(&packet, MAX_DATAGRAM, &mut self.send_scratch)?;
+        match self.udp.send(&self.send_scratch) {
             Ok(n) => {
                 self.stats.sent_bytes += n as u64;
                 Ok(())
@@ -241,6 +245,7 @@ pub struct ServerTransport {
     listener: TcpListener,
     udp: UdpSocket,
     peers: HashMap<u64, Peer>,
+    send_scratch: Vec<u8>,
     next_id: u64,
     pub stats: TrafficStats,
 }
@@ -254,6 +259,7 @@ impl ServerTransport {
             listener,
             udp,
             peers: HashMap::new(),
+            send_scratch: Vec::new(),
             next_id: 1,
             stats: TrafficStats::default(),
         })
@@ -275,8 +281,9 @@ impl ServerTransport {
         let Some(address) = self.peers.get(&id).and_then(|peer| peer.udp) else {
             return Ok(());
         };
-        let bytes = encode(snapshot, MAX_DATAGRAM)?;
-        match self.udp.send_to(&bytes, address) {
+        self.send_scratch.clear();
+        encode_into(snapshot, MAX_DATAGRAM, &mut self.send_scratch)?;
+        match self.udp.send_to(&self.send_scratch, address) {
             Ok(n) => {
                 self.stats.sent_bytes += n as u64;
                 Ok(())
