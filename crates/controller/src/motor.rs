@@ -5,6 +5,8 @@ use voxel_world::VoxelWorld;
 
 /// Advance one bounded physics tick. Movement and turn persist; jump is consumed.
 /// Callers own observation timing, fixed tick scheduling, and snapshot selection.
+/// Returns the horizontal velocity the character attempted this tick: input
+/// acceleration plus external impulse, before terrain or bodies clamp motion.
 pub fn step_character(
     world: &VoxelWorld,
     character: &mut CharacterState,
@@ -13,9 +15,9 @@ pub fn step_character(
     intent: &mut CharacterIntent,
     dt: f32,
     bodies: &[DynamicCollider],
-) {
+) -> Vec2 {
     if !dt.is_finite() || dt <= 0.0 {
-        return;
+        return Vec2::new(character.motion.velocity.x, character.motion.velocity.z);
     }
     let input = intent.bounded();
     intent.jump = false;
@@ -65,6 +67,9 @@ pub fn step_character(
     let horizontal = previous
         + (target - previous).clamp_length_max(rate * control * dt)
         + state.external_velocity;
+    // Attempted horizontal velocity: what the character would move at if neither
+    // terrain nor loose bodies clamped the axis sweeps below.
+    let attempted = horizontal;
     state.velocity.x = horizontal.x;
     state.velocity.z = horizontal.y;
     if input.jump && profile.jump_speed > 0.0 && state.grounded {
@@ -133,4 +138,5 @@ pub fn step_character(
     let change = state.external_velocity - previous;
     state.velocity.x += change.x;
     state.velocity.z += change.y;
+    attempted + change
 }

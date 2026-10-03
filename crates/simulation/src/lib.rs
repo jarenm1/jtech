@@ -1,5 +1,4 @@
 use controller::PlayerInput;
-use controller::step_player;
 mod active_terrain;
 mod actors;
 #[cfg(test)]
@@ -1215,22 +1214,18 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 }
             };
             let previous = player.state;
-            let mut intended = previous;
-            step_player(&world, &mut intended, &input, FIXED_DT);
-            controller::step_player_with_bodies(
+            // The same pass reports the horizontal velocity attempted before
+            // loose bodies clamped the sweep; the GPU resolves that kinematic
+            // push against material mass and terrain.
+            let attempted = controller::step_player_with_bodies(
                 &world,
                 &mut player.state,
                 &input,
                 FIXED_DT,
                 &bodies,
             );
-            // Preserve attempted horizontal motion when a loose body blocks the character.
-            // The GPU resolves that kinematic push against material mass and terrain.
-            player.body_push_velocity = Vec3::new(
-                intended.velocity.x,
-                player.state.velocity.y,
-                intended.velocity.z,
-            );
+            player.body_push_velocity =
+                Vec3::new(attempted.x, player.state.velocity.y, attempted.y);
             if player.state.noclip {
                 player.body_push_velocity = Vec3::ZERO;
             }
