@@ -29,11 +29,12 @@ use bevy::{
         RenderPlugin,
         render_resource::{TextureFormat, TextureUsages},
         settings::{RenderCreation, WgpuSettings},
-        view::screenshot::{Screenshot, save_to_disk},
+        view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
     },
     window::{CursorGrabMode, CursorOptions, ExitCondition, PresentMode, WindowRef},
     winit::WinitPlugin,
 };
+use image::codecs::gif::{GifEncoder, Repeat};
 use networking::ClientTransport;
 use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerState, look_direction};
 use protocol::{
@@ -67,6 +68,9 @@ struct Options {
     width: u32,
     height: u32,
     backend: RenderBackend,
+    /// Animated GIF of the run, sampled at `clip_fps`.
+    clip: Option<String>,
+    clip_fps: u32,
 }
 
 impl Default for Options {
@@ -81,6 +85,8 @@ impl Default for Options {
             width: 1280,
             height: 800,
             backend: RenderBackend::Auto,
+            clip: None,
+            clip_fps: 20,
         }
     }
 }
@@ -128,6 +134,18 @@ impl Options {
                         _ => return Err("--render-backend expects auto|software|gpu".into()),
                     };
                 }
+                "--clip" => options.clip = Some(args.next().ok_or("--clip needs a .gif path")?),
+                "--clip-fps" => {
+                    let fps = args
+                        .next()
+                        .ok_or("--clip-fps needs a frame rate")?
+                        .parse::<u32>()
+                        .map_err(|_| "invalid frame rate")?;
+                    if !(1..=60).contains(&fps) {
+                        return Err("--clip-fps must be 1..=60".into());
+                    }
+                    options.clip_fps = fps;
+                }
                 "--frames" => {
                     let frames = args
                         .next()
@@ -171,7 +189,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--time-of-day HOUR] [--day-length SECONDS]\nHeadless capture: [--headless] [--width N] [--height N] [--render-backend auto|software|gpu]\n  --headless renders offscreen to an image (implies --bot) and needs no display server.\n  --render-backend software forces the CPU fallback adapter (lavapipe/llvmpipe): no GPU use.\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-0 hotbar | Tab inventory | Esc pause menu | F12 screenshot"
+                        "voxel-client [--server IP:PORT] [--bot] [--frames N] [--screenshot PATH.png] [--clip PATH.gif] [--clip-fps N] [--time-of-day HOUR] [--day-length SECONDS]\nHeadless capture: [--headless] [--width N] [--height N] [--render-backend auto|software|gpu]\n  --headless renders offscreen to an image (implies --bot) and needs no display server.\n  --render-backend software forces the CPU fallback adapter (lavapipe/llvmpipe): no GPU use.\n  --clip writes an animated GIF sampled at --clip-fps (default 20); it plays inline in a PR body.\nLighting: starts at 09:00, 1200 seconds/day; --day-length 0 freezes time.\nWASD move | mouse look | Space jump/up | V noclip flight | Ctrl descend | left/right click hit (bow: hold right to shoot, R cycle power) | F debug launch (GPU server) | 1-0 hotbar | Tab inventory | Esc pause menu | F12 screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -469,6 +487,7 @@ impl Plugin for ClientPlugin {
             .init_resource::<inventory_ui::InventoryUi>()
             .init_resource::<package_assets::PackageAssets>()
             .init_resource::<scatter::ScatterWorld>()
+            .init_resource::<ClipFrames>()
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
@@ -480,7 +499,7 @@ impl Plugin for ClientPlugin {
                     .chain()
                     .before(pause_menu::sync),
             )
-            .add_systems(Update, (capture_screenshot, record_metrics))
+            .add_systems(Update, (capture_frames, record_metrics))
             .add_systems(
                 Update,
                 (
@@ -1419,12 +1438,36 @@ fn present_players(
 }
 
 
-fn capture_screenshot(
+/// Frames to skip before the first clip sample: the scene has not rendered yet,
+/// so early frames come out black.
+const CLIP_WARMUP_FRAMES: u64 = 30;
+
+/// Frames sampled for `--clip`, encoded to an animated GIF when the run ends.
+#[derive(Resource, Default)]
+struct ClipFrames {
+    frames: Vec<image::RgbaImage>,
+    /// Next render frame to sample, so the clip plays at `--clip-fps` no matter
+    /// how fast the renderer actually runs.
+    next: u64,
+}
+
+/// The camera's render target: offscreen when `--headless`, else the window.
+fn screenshot_target(target: &Option<Res<HeadlessTarget>>) -> Screenshot {
+    match target {
+        Some(target) => Screenshot::image(target.0.clone()),
+        None => Screenshot::primary_window(),
+    }
+}
+
+/// One capture per render target per frame: the screenshot plugin drops
+/// duplicates, so the one-shot still wins over a clip sample.
+fn capture_frames(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     options: Res<Options>,
     target: Option<Res<HeadlessTarget>>,
     mut session: ResMut<ClientSession>,
+    mut clip: ResMut<ClipFrames>,
 ) {
     let auto_capture = !session.captured
         && options.screenshot.is_some()
@@ -1433,16 +1476,61 @@ fn capture_screenshot(
         let path = options
             .screenshot
             .clone()
-
             .unwrap_or_else(|| format!("/tmp/voxel-{}.png", session.frame));
-        let screenshot = match target {
-            Some(target) => Screenshot::image(target.0.clone()),
-            None => Screenshot::primary_window(),
-        };
-        commands.spawn(screenshot).observe(save_to_disk(path.clone()));
+        commands
+            .spawn(screenshot_target(&target))
+            .observe(save_to_disk(path.clone()));
         session.captured = true;
         info!("CAPTURE {path}");
+        return;
     }
+    if options.clip.is_some() && session.frame >= clip.next {
+        // Skip the first frames (nothing has rendered yet, they come out black)
+        // and the last few (the capture would land after the app exits).
+        let warmup = CLIP_WARMUP_FRAMES;
+        let end = options.frames.map(|frames| frames.saturating_sub(3));
+        if session.frame >= warmup && end.is_none_or(|end| session.frame < end) {
+            let stride = u64::from(60 / options.clip_fps.max(1)).max(1);
+            clip.next = session.frame + stride;
+            commands
+                .spawn(screenshot_target(&target))
+                .observe(collect_clip_frame);
+        }
+    }
+}
+
+/// Observer: append each sampled frame to the clip buffer.
+fn collect_clip_frame(captured: On<ScreenshotCaptured>, mut clip: ResMut<ClipFrames>) {
+    match captured.image.clone().try_into_dynamic() {
+        Ok(frame) => clip.frames.push(frame.to_rgba8()),
+        Err(error) => warn!("clip frame dropped: {error}"),
+    }
+}
+
+/// Encode the sampled frames as a looping GIF. GIF plays inline in a PR body,
+/// unlike a video file, which needs a browser upload.
+fn write_clip(path: &str, fps: u32, frames: &[image::RgbaImage]) {
+    let file = match std::fs::File::create(path) {
+        Ok(file) => file,
+        Err(error) => {
+            error!("clip: cannot create {path}: {error}");
+            return;
+        }
+    };
+    let mut encoder = GifEncoder::new(file);
+    if let Err(error) = encoder.set_repeat(Repeat::Infinite) {
+        error!("clip: cannot set repeat: {error}");
+        return;
+    }
+    for frame in frames {
+        let delay = image::Delay::from_numer_denom_ms(1000, fps);
+        let frame = image::Frame::from_parts(frame.clone(), 0, 0, delay);
+        if let Err(error) = encoder.encode_frame(frame) {
+            error!("clip: encode failed: {error}");
+            return;
+        }
+    }
+    info!("CLIP {path} frames={}", frames.len());
 }
 /// Granted equipment lands in empty hotbar slots so spawn loadouts are usable
 fn auto_hotbar(mut session: ResMut<ClientSession>, options: Res<Options>) {
@@ -1488,6 +1576,7 @@ fn record_metrics(
     world: Res<VoxelWorld>,
     stats: Res<VoxelRenderStats>,
     scatter: Res<scatter::ScatterWorld>,
+    clip: Res<ClipFrames>,
     mut session: ResMut<ClientSession>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1527,6 +1616,9 @@ fn record_metrics(
         session.next_metrics = Instant::now() + std::time::Duration::from_secs(10);
     }
     if ending {
+        if let Some(path) = &options.clip {
+            write_clip(path, options.clip_fps, &clip.frames);
+        }
         exit.write(AppExit::Success);
     }
 }

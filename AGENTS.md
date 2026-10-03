@@ -155,6 +155,10 @@ first:
   it needs no display server and no GPU. Use it for visual evidence when the
   host display is busy or you want zero GPU impact. Slower than the real GPU:
   fine for stills, not for frame-time numbers.
+- **Headless clips** — add `--clip out.gif --clip-fps N` for motion. The GIF is
+  encoded in-process (no ffmpeg needed) and plays inline in a PR body, unlike a
+  video file. Sampling is frame-counted, so the clip plays at `--clip-fps`
+  regardless of how fast the renderer runs.
 - **Screenshots** — run the client on the host display
   (`DISPLAY=:0`/`WAYLAND_DISPLAY=wayland-1` are set in this environment),
   capture with `grim` (wayland) or `import -window root`, and link the file.
