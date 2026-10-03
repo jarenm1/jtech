@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bevy::prelude::*;
+use bevy::{camera::visibility::RenderLayers, prelude::*};
 /// Spawn a root entity mirroring the glTF's node hierarchy: one child per
 /// node carrying its authored transform, one mesh grandchild per primitive.
 /// Parses the container's JSON chunk directly - loading the root `Gltf` asset
@@ -17,17 +17,23 @@ use bevy::prelude::*;
 /// Skips the scene spawner, which panics on unregistered reflect types under
 /// this client's reduced feature set. Returns `None` on unreadable or
 /// malformed input. glTF units are meters - model at real-world size.
+///
+/// `layers` is applied to every spawned entity: `RenderLayers` is not
+/// inherited, so an offscreen view (item icons) must tag the whole hierarchy.
 pub fn spawn_gltf(
     commands: &mut Commands,
     asset_server: &AssetServer,
     uri: &str,
     bytes: &[u8],
     transform: Transform,
+    layers: Option<&RenderLayers>,
 ) -> Option<Entity> {
     let doc = parse_gltf(bytes)?;
-    let root = commands
-        .spawn((transform, GlobalTransform::default(), Visibility::Inherited))
-        .id();
+    let mut root = commands.spawn((transform, GlobalTransform::default(), Visibility::Inherited));
+    if let Some(layers) = layers {
+        root.insert(layers.clone());
+    }
+    let root = root.id();
     let mut nested: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for node in &doc.nodes {
         nested.extend(node.children.iter().copied());
@@ -36,7 +42,7 @@ pub fn spawn_gltf(
         if nested.contains(&index) {
             continue;
         }
-        spawn_gltf_node(commands, asset_server, uri, &doc, index, root);
+        spawn_gltf_node(commands, asset_server, uri, &doc, index, root, layers);
     }
     Some(root)
 }
@@ -87,13 +93,20 @@ fn spawn_gltf_node(
     doc: &GltfDoc,
     index: usize,
     parent: Entity,
+    layers: Option<&RenderLayers>,
 ) {
     let Some(node) = doc.nodes.get(index) else {
         return;
     };
-    let entity = commands
-        .spawn((node.transform, GlobalTransform::default(), Visibility::Inherited))
-        .id();
+    let mut spawned = commands.spawn((
+        node.transform,
+        GlobalTransform::default(),
+        Visibility::Inherited,
+    ));
+    if let Some(layers) = layers {
+        spawned.insert(layers.clone());
+    }
+    let entity = spawned.id();
     commands.entity(parent).add_child(entity);
     if let Some(mesh) = node.mesh {
         let primitive_count = doc.meshes.get(mesh).copied().unwrap_or(0);
@@ -118,14 +131,19 @@ fn spawn_gltf_node(
                 )),
                 None => Handle::default(),
             };
-            commands.entity(entity).with_child((
+            let mut child = commands.spawn((
                 Mesh3d(mesh_handle),
                 MeshMaterial3d(material_handle),
             ));
+            if let Some(layers) = layers {
+                child.insert(layers.clone());
+            }
+            let child = child.id();
+            commands.entity(entity).add_child(child);
         }
     }
     for &child in &node.children {
-        spawn_gltf_node(commands, asset_server, uri, doc, child, entity);
+        spawn_gltf_node(commands, asset_server, uri, doc, child, entity, layers);
     }
 }
 

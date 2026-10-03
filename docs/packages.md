@@ -142,8 +142,10 @@ manifest, and the species table in the Welcome message names them. See
 A melee weapon's optional trailing `model` argument names a `.glb` under
 `assets/`; the loader fails the package if the file is missing, and clients
 render the model for dropped copies (a colored cube until the download lands,
-a neutral cube for weapons without a model). Models only affect drop
-presentation — hotbar tiles and held items still use swatches.
+a neutral cube for weapons without a model). The same model is rendered
+offscreen into the weapon's inventory row icon, so items mix 3D icons with the
+flat colour swatches used by everything else; hotbar tiles and held items still
+use swatches.
 
 ## Execution boundary
 
