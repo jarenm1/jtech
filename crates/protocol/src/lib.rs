@@ -7,7 +7,7 @@ use physics::PlayerState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{io, sync::Arc};
 
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const MAX_PHYSICS_BODIES: usize = 128;
 pub const MAX_PLAYERS: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
@@ -43,6 +43,8 @@ pub enum EditRejection {
     PackageUnavailable,
     Dead,
     OutOfStock,
+    /// A bow release claimed more power than the held draw earned.
+    NotCharged,
 }
 
 

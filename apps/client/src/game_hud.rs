@@ -29,8 +29,6 @@ pub(crate) mod palette {
     pub(crate) const PANEL: Color = Color::srgba(0.086, 0.090, 0.110, 0.74);
     pub(crate) const SLOT: Color = Color::srgba(0.130, 0.135, 0.160, 0.72);
     pub(crate) const SLOT_SELECTED: Color = Color::srgba(0.220, 0.190, 0.140, 0.94);
-    pub(crate) const HOVER: Color = Color::srgba(0.220, 0.200, 0.170, 0.92);
-    pub(crate) const PRESSED: Color = Color::srgba(0.310, 0.260, 0.190, 0.96);
     pub(crate) const BORDER: Color = Color::srgba(0.960, 0.930, 0.860, 0.12);
     pub(crate) const IVORY: Color = Color::srgb(0.960, 0.930, 0.860);
     pub(crate) const MUTED: Color = Color::srgba(0.960, 0.930, 0.860, 0.55);

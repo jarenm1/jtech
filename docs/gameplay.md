@@ -55,7 +55,7 @@ once the whole player fits in loaded empty space.
 
 Equip the bow with **6**, aim steeply down at the ground near your feet, and fire
 with **right click** to launch yourself. Shoot beside or behind you for a sideways
-boost. Press **R** to cycle power; higher presets give stronger, wider blasts.
+boost. Hold the draw longer for a stronger, wider blast; a full draw is **4x**.
 At standard power, a close ground shot can lift you several blocks.
 Press **V** to leave noclip before trying a blast jump.
 
@@ -149,6 +149,6 @@ it before the pause menu. Inventories are unbounded — new item kinds append to
 the grid and stack counts are uncapped.
 
 Press **Esc** to open the translucent pause menu. Choose **Resume** or press
-**Esc** again to return, adjust **Bow power**, or choose **Quit game** to exit.
+**Esc** again to return, or choose **Quit game** to exit.
 The menu blocks local movement, aiming and weapon input; multiplayer simulation
 and network updates continue. Switching window focus opens the menu too.

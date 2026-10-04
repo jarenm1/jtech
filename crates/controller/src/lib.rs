@@ -28,6 +28,9 @@ pub struct CharacterIntent {
     pub held_item: u32,
     /// Held sprint request: scales target speed by the profile's sprint multiplier.
     pub sprint: bool,
+    /// Held draw request: charges a bow while held and releases it when cleared.
+    /// The motor owns the charge; the host fires on the release edge.
+    pub draw: bool,
     /// Held crouch request: lowers the body and scales target speed.
     pub crouch: bool,
     /// One-tick ability edges, one per slot; the motor consumes and clears them.
@@ -48,6 +51,7 @@ impl CharacterIntent {
             attack: self.attack,
             held_item: self.held_item,
             sprint: self.sprint,
+            draw: self.draw,
             crouch: self.crouch,
             ability: self.ability,
             aim: Vec2::new(
@@ -122,6 +126,12 @@ pub struct MovementProfile {
     pub crouch_mult: f32,
     /// Body height while crouching, in metres.
     pub crouch_height: f32,
+    /// Ticks to a full bow draw.
+    pub charge_ticks: u16,
+    /// Minimum charge ticks a release must reach to fire; shorter taps cancel.
+    pub charge_min_ticks: u16,
+    /// Target-speed multiplier at a full draw; interpolated from 1.0 as it builds.
+    pub charge_mult: f32,
     pub acceleration: f32,
     pub braking: f32,
     pub air_control: f32,
@@ -143,6 +153,9 @@ impl Default for MovementProfile {
             max_slope_cos: std::f32::consts::FRAC_1_SQRT_2,
             crouch_mult: 0.5,
             crouch_height: 0.9,
+            charge_ticks: 60,
+            charge_min_ticks: 9,
+            charge_mult: 0.4,
             acceleration: 10_000.0,
             braking: 10_000.0,
             air_control: 1.0,
@@ -156,6 +169,17 @@ impl Default for MovementProfile {
     }
 }
 impl MovementProfile {
+    /// Draw fraction in 0..1 for a charge in ticks; a zero full draw reads as
+    /// fully charged.
+    pub fn charge_fraction(&self, charge: u16) -> f32 {
+        let full = self.charge_ticks;
+        if full == 0 {
+            1.0
+        } else {
+            (f32::from(charge) / f32::from(full)).clamp(0.0, 1.0)
+        }
+    }
+
     pub(crate) fn bounded(self) -> Self {
         Self {
             speed: finite(self.speed).clamp(0.0, 60.0),
@@ -166,6 +190,9 @@ impl MovementProfile {
             max_slope_cos: finite(self.max_slope_cos).clamp(0.0, 1.0),
             crouch_mult: finite(self.crouch_mult).clamp(0.0, 1.0),
             crouch_height: finite(self.crouch_height).clamp(0.01, 16.0),
+            charge_ticks: self.charge_ticks.min(600),
+            charge_min_ticks: self.charge_min_ticks.min(self.charge_ticks.min(600)),
+            charge_mult: finite(self.charge_mult).clamp(0.0, 1.0),
             acceleration: finite(self.acceleration).clamp(0.0, 10_000.0),
             braking: finite(self.braking).clamp(0.0, 10_000.0),
             air_control: finite(self.air_control).clamp(0.0, 1.0),
@@ -395,6 +422,11 @@ pub struct MotorOutput {
     pub attempted: Vec2,
     pub fired: [Option<Vec2>; MAX_SLOTS],
     pub basic_attack: bool,
+    /// Current bow draw as a 0..1 fraction of the profile's full draw.
+    pub charge: f32,
+    /// Set on the tick a draw is released with at least the minimum charge:
+    /// the fraction reached, for the host to fire with.
+    pub charge_release: Option<f32>,
 }
 
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.
@@ -419,6 +451,10 @@ pub struct CharacterState {
     pub dash: Option<Dash>,
     /// Remaining cooldown ticks of the held weapon's basic attack.
     pub basic_attack_cooldown: u16,
+    /// Bow draw charge in ticks, capped at the profile's full draw.
+    pub charge: u16,
+    /// Whether the draw was held last tick, for release-edge detection.
+    pub drawing: bool,
 }
 impl CharacterState {
     pub fn apply_impulse(&mut self, body: &CharacterBody, impulse: Vec3) {

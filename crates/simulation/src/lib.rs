@@ -355,6 +355,9 @@ struct Player {
     body_push_velocity: Vec3,
     // Deadline in 1/(60 * bow shots per second) seconds for fractional-tick cadence.
     next_bow_time: u64,
+    /// Peak draw charge seen recently, so a release and its fire request can
+    /// arrive in different ticks without rejecting a legitimate shot.
+    recent_charge: u16,
     arrow_revision: Option<u64>,
     package_revision: Option<u64>,
     inventory: Inventory,
@@ -392,6 +395,7 @@ impl Player {
             physics_revision: None,
             body_push_velocity: Vec3::ZERO,
             next_bow_time: 0,
+            recent_charge: 0,
             arrow_revision: None,
             package_revision: None,
             inventory: Inventory::default(),
@@ -1377,6 +1381,10 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 bodies,
             );
             let attempted = output.attempted;
+            player.recent_charge = player
+                .state
+                .charge
+                .max(player.recent_charge.saturating_sub(2));
             if output.basic_attack {
                 basic_attacks.push(id);
             }

@@ -22,6 +22,7 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
         }
     }
     let mut player = Player::new();
+    player.recent_charge = 60;
     player.state.motion.position = Vec3::new(16.5, 10.0, 16.5);
     player.state.motion.grounded = true;
     {
