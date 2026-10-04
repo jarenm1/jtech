@@ -133,6 +133,14 @@ enum Package {
 }
 
 impl Package {
+    /// Sounds this package authors, as `(event, path)` pairs.
+    fn sounds(&self) -> &[(String, String)] {
+        match self {
+            Package::Bow(package) => &package.sounds,
+            Package::Melee(package) => &package.sounds,
+        }
+    }
+
     fn compile(source: String, path: PathBuf, generation: u64) -> Result<Self, String> {
         let package_dir = path
             .parent()
@@ -187,6 +195,7 @@ pub struct BowPackage {
     shots_per_second: u32,
     projectiles: [ProjectileSpec; 4],
     blasts: [BlastSpec; 4],
+    sounds: Vec<(String, String)>,
 }
 
 impl BowPackage {
@@ -218,6 +227,7 @@ impl BowPackage {
             shots_per_second: rate as u32,
             projectiles,
             blasts,
+            sounds: sounds(vm)?,
         })
     }
 
@@ -236,6 +246,7 @@ impl Clone for BowPackage {
             shots_per_second: self.shots_per_second,
             projectiles: self.projectiles,
             blasts: self.blasts,
+            sounds: self.sounds.clone(),
         }
     }
 }
@@ -243,6 +254,38 @@ impl Clone for BowPackage {
 fn four<T>(values: [Result<T, String>; 4]) -> Result<[T; 4], String> {
     let [a, b, c, d] = values;
     Ok([a?, b?, c?, d?])
+}
+
+/// Parse the optional `sounds` list: `(event path)` pairs. Events are the fixed
+/// set the client knows how to trigger; paths are relative to the package's
+/// `assets/` dir. A missing list means the package ships no sounds.
+fn sounds(vm: &mut Vm) -> Result<Vec<(String, String)>, String> {
+    let Ok(value) = vm.engine.extract_value("sounds") else {
+        return Ok(Vec::new());
+    };
+    let SteelVal::ListV(entries) = value else {
+        return Err("sounds must be a list of (event path) pairs".into());
+    };
+    let mut sounds = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        let SteelVal::ListV(pair) = entry else {
+            return Err("each sound must be an (event path) pair".into());
+        };
+        if pair.len() != 2 {
+            return Err("each sound must be an (event path) pair".into());
+        }
+        let SteelVal::StringV(event) = &pair[0] else {
+            return Err("sound event must be a string".into());
+        };
+        let SteelVal::StringV(path) = &pair[1] else {
+            return Err("sound path must be a string".into());
+        };
+        if !matches!(event.as_str(), "draw" | "fire" | "hit") {
+            return Err(format!("unknown sound event {event}"));
+        }
+        sounds.push((event.to_string(), path.to_string()));
+    }
+    Ok(sounds)
 }
 
 fn projectile_spec(value: SteelVal) -> Result<ProjectileSpec, String> {
@@ -303,6 +346,7 @@ pub struct MeleePackage {
     generation: u64,
     weapons: Vec<MeleeWeapon>,
     spawn_items: Vec<(u32, u32)>,
+    sounds: Vec<(String, String)>,
 }
 
 impl MeleePackage {
@@ -343,6 +387,7 @@ impl MeleePackage {
             generation,
             weapons,
             spawn_items,
+            sounds: sounds(vm)?,
         })
     }
 }
@@ -768,6 +813,20 @@ impl PackageHost {
     /// Merged melee weapon table across loaded melee packages.
     pub fn melee_table(&self) -> MeleeTable {
         self.melee.clone()
+    }
+
+    /// Sounds every loaded package authors, as `(package, event, path)`.
+    pub fn sounds(&self) -> Vec<(String, String, String)> {
+        let mut sounds = Vec::new();
+        for slot in self.slots.values() {
+            let Some(package) = &slot.active else {
+                continue;
+            };
+            for (event, path) in package.sounds() {
+                sounds.push((slot.status.id.clone(), event.clone(), path.clone()));
+            }
+        }
+        sounds
     }
 
     /// Files shipped by loaded packages, sorted for a stable wire manifest.

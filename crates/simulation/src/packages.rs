@@ -60,6 +60,16 @@ impl Simulation {
                 weapons
             },
             assets: self.packages.asset_manifest(),
+            sounds: self
+                .packages
+                .sounds()
+                .into_iter()
+                .map(|(package, event, path)| protocol::SoundInfo {
+                    package,
+                    event,
+                    path,
+                })
+                .collect(),
         };
         for id in recipients {
             if self.send(id, &message) {

@@ -51,6 +51,7 @@
 
             buildInputs = with pkgs; [
               cuda.cudatoolkit
+              alsa-lib
               wayland
               libxkbcommon
               vulkan-loader
@@ -79,6 +80,7 @@
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:${
                 pkgs.lib.makeLibraryPath [
                   cuda.cudatoolkit
+                  pkgs.alsa-lib
                   pkgs.stdenv.cc.cc
                   pkgs.wayland
                   pkgs.libxkbcommon

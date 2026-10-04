@@ -13,6 +13,8 @@ pub(crate) struct ServerPackages {
     /// Melee weapons replicated with the package set; drives swing routing
     /// and item display names without client-side duplication.
     pub melee_weapons: Vec<MeleeWeaponInfo>,
+    /// Sounds loaded packages author, keyed by event.
+    pub sounds: Vec<protocol::SoundInfo>,
 }
 
 impl Default for ServerPackages {
@@ -22,6 +24,7 @@ impl Default for ServerPackages {
             statuses: Vec::new(),
             bow_shots_per_second: protocol::EXPLOSIVE_BOW_SHOTS_PER_SECOND,
             melee_weapons: Vec::new(),
+            sounds: Vec::new(),
         }
     }
 }
@@ -33,6 +36,7 @@ impl ServerPackages {
         statuses: Vec<PackageStatus>,
         bow_shots_per_second: u32,
         melee_weapons: Vec<MeleeWeaponInfo>,
+        sounds: Vec<protocol::SoundInfo>,
     ) {
         if self.revision.is_some_and(|current| revision <= current) {
             return;
@@ -42,6 +46,7 @@ impl ServerPackages {
         // Zero disables firing when no bow package is active.
         self.bow_shots_per_second = bow_shots_per_second;
         self.melee_weapons = melee_weapons;
+        self.sounds = sounds;
     }
 
     /// Authored display name for a replicated weapon item.
@@ -173,11 +178,11 @@ mod tests {
     #[test]
     fn stale_package_messages_cannot_restore_old_state_or_firing_rate() {
         let mut packages = ServerPackages::default();
-        packages.receive(0, vec![status(0, PackageState::Loading)], 0, vec![]);
+        packages.receive(0, vec![status(0, PackageState::Loading)], 0, vec![], vec![]);
         assert_eq!(packages.revision, Some(0));
-        packages.receive(2, vec![status(1, PackageState::Loaded)], 10, vec![]);
+        packages.receive(2, vec![status(1, PackageState::Loaded)], 10, vec![], vec![]);
         for revision in [0, 1, 2] {
-            packages.receive(revision, vec![status(0, PackageState::Error)], 25, vec![]);
+            packages.receive(revision, vec![status(0, PackageState::Error)], 25, vec![], vec![]);
         }
         assert_eq!(packages.revision, Some(2));
         assert_eq!(packages.bow_shots_per_second, 10);
@@ -214,7 +219,7 @@ mod tests {
             app.world_mut()
                 .resource_mut::<ClientSession>()
                 .packages
-                .receive(revision, vec![package], 10, vec![]);
+                .receive(revision, vec![package], 10, vec![], vec![]);
             app.update();
             assert_eq!(
                 app.world().get::<Node>(panel).unwrap().display,

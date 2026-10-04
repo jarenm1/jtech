@@ -174,6 +174,8 @@ pub enum ServerMessage {
         melee_weapons: Vec<MeleeWeaponInfo>,
         /// Files shipped by loaded packages under `assets/`, for client download.
         assets: Vec<PackageAssetInfo>,
+        /// Sounds loaded packages author, keyed by event.
+        sounds: Vec<SoundInfo>,
     },
     /// One chunk of a requested package asset; `offset` orders reassembly and
     /// `total` is the full file size. Chunks arrive reliably in order.
@@ -217,6 +219,16 @@ pub struct PackageStatus {
 pub enum ItemKind {
     Stack,
     Equipment,
+}
+
+/// One package sound: the event the client plays it on, and the asset path
+/// relative to the owning package's `assets/` dir. Events are `"draw"` (a bow
+/// draw starts), `"fire"` (a shot leaves), and `"hit"` (a projectile strikes).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SoundInfo {
+    pub package: String,
+    pub event: String,
+    pub path: String,
 }
 
 /// One authored melee weapon as clients need it: display name plus the swing
