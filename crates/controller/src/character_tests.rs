@@ -522,11 +522,12 @@ fn ability_on_cooldown_is_ignored() {
 }
 
 #[test]
-fn basic_attack_fires_once_per_weapon_cooldown() {
+fn basic_attack_fires_once_per_press_and_cooldown() {
     let world = tests::arena();
     let body = CharacterBody::default().with_basic_attack(Some(BasicAttack {
         kind: BasicAttackKind::Melee,
         cooldown_ticks: 30,
+        charge_ticks: 0,
     }));
     let profile = MovementProfile::default();
     let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
@@ -537,17 +538,19 @@ fn basic_attack_fires_once_per_weapon_cooldown() {
     let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
     assert!(output.basic_attack, "the first press must fire");
     assert_eq!(state.basic_attack_cooldown, 30);
-    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
-    assert!(!output.basic_attack, "the cooldown must block the next press");
-    let mut refired = false;
+    // Holding the attack must not repeat: a melee weapon swings once per press.
     for _ in 0..30 {
-        if step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]).basic_attack
-        {
-            refired = true;
-            break;
-        }
+        let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+        assert!(!output.basic_attack, "a held attack must not repeat");
     }
-    assert!(refired, "the attack must fire again once ready");
+    // Releasing and pressing again fires once the cooldown has elapsed.
+    intent.attack = false;
+    step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    intent.attack = true;
+    assert!(
+        step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]).basic_attack,
+        "a fresh press must fire once ready"
+    );
 }
 
 #[test]

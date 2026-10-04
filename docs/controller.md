@@ -6,9 +6,9 @@
 
 `step_character` is a fixed pipeline of named stages — `status`, `sanitize`, `stance`, `contact`, `steer`, `gravity`, `sweep_horizontal`, `sweep_vertical`, `drag` — so authority, prediction and replay agree on ordering. The public contract is unchanged: intent in, `CharacterState` out.
 
-- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a one-tick `attack` edge the host's combat system consumes (the motor owns its cadence); a one-tick `draw` request that starts a bow draw the motor runs to completion; held `sprint` and `crouch` requests.
+- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a held `attack` action the host's combat system resolves by the held weapon's kind; held `sprint` and `crouch` requests.
 - `CharacterBody`: feet-anchored AABB dimensions and mass in kilograms, the per-species `AbilityTable`, and the held weapon's `BasicAttack` (`Melee` or `Ranged` plus a cooldown).
-- `MovementProfile`: speed, sprint multiplier, coyote and jump-buffer ticks, step height, walkable-slope cosine, crouch multiplier and height, bow draw ticks and minimum release, draw speed multiplier, acceleration, braking, air control, strafe fraction, yaw rate, gravity, jump speed, and external-momentum drag.
+- `MovementProfile`: speed, sprint multiplier, coyote and jump-buffer ticks, step height, walkable-slope cosine, crouch multiplier and height, draw speed multiplier, acceleration, braking, air control, strafe fraction, yaw rate, gravity, jump speed, and external-momentum drag.
 - `CharacterState`: motion, facing, locomotion `mode`, active `statuses`, coyote/buffer ticks, crouch flag, per-slot `cooldowns`, any `cast`/`dash`, and the basic-attack cooldown — the complete replay unit. Horizontal external momentum is separate from controlled movement.
 
 At yaw zero, forward is world -Z and right is +X. Positive yaw/turn rotates left. Movement axes and turn are clamped to [-1, 1]; diagonal movement is limited to unit magnitude. Turn is multiplied by the profile's radians/second. Non-finite actions become zero. Shape/mass constructors reject invalid configuration; profile values are bounded at the motor boundary. Ticks must be finite and positive, with catch-up capped at 0.25 seconds.
@@ -19,9 +19,7 @@ Ground locomotion includes sliding, support detection, jumping, loose-cube conta
 
 ## Basic attack
 
-The held weapon's `BasicAttack` (`Melee` or `Ranged`, plus a cooldown) rides on `CharacterBody`; the host maps the held item to it. The motor owns the cadence — `CharacterState.basic_attack_cooldown` ticks down and a one-tick `attack` edge fires it — and reports the fired edge in `MotorOutput.basic_attack`. The host applies the effect: a melee raycast for `Melee`, a travelling projectile for `Ranged`. This keeps the basic attack in the same replay unit as abilities, so prediction and reconciliation cover it.
-
-A one-tick `draw` request starts a bow draw the motor runs to completion: `CharacterState.charge` advances to the profile's `charge_ticks`, target speed scales from 1.0 toward `charge_mult` as it builds, and `MotorOutput.charge` reports the fraction. At full draw the motor reports `MotorOutput.charge_release` and clears the draw; the host fires on that edge. The draw lives in replay state, so prediction, reconciliation and the authoritative server agree on both the slow and the release.
+The held weapon's `BasicAttack` (`Melee`, `Ranged` or `Admin`, plus a cooldown) rides on `CharacterBody`; the host maps the held item to it. `attack` is a **held** request — the general attack action. A `Melee` or `Admin` weapon fires once on the press edge, gated by its cooldown, and reports `MotorOutput.basic_attack`. A `Ranged` weapon charges while held (`CharacterState.charge`, slowing movement toward `charge_mult`) and reports `MotorOutput.charge_release` on release **only at full charge**; an earlier release cancels. The host applies the effect: a melee raycast for `Melee`, a travelling projectile for `Ranged`/`Admin`. This keeps the attack in the same replay unit as abilities, so prediction and reconciliation cover it.
 
 ## Status effects
 

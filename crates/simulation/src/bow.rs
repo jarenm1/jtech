@@ -3,7 +3,9 @@ use crate::actors::SimEntity;
 use game_packages::{BlastSpec, ProjectileSpec};
 use gameplay::combat::SwingTarget;
 use glam::Vec3;
-use protocol::{ArrowSnapshot, BowPower, PhysicsBodySnapshot};
+use protocol::{ArrowSnapshot, PhysicsBodySnapshot};
+#[cfg(test)]
+use protocol::BowPower;
 use voxel_world::VoxelWorld;
 
 pub(super) struct Arrow {
@@ -17,8 +19,6 @@ pub(super) struct Arrow {
     pub damage: u16,
     /// Impulse in kg·m/s a plain arrow applies along its flight direction.
     pub knockback: f32,
-    /// Bow preset this arrow was fired with, when it came from the bow package.
-    pub power: Option<BowPower>,
     /// Entity that fired the arrow; kept on queued detonations for event
     /// attribution.
     pub shooter: Option<SimEntity>,
@@ -41,18 +41,7 @@ impl Arrow {
         let shot = game_packages::PackageHost::new(&game_packages::default_directory())
             .fire(power)
             .unwrap();
-        Self::from_shot(id, origin, direction, shot)
-    }
-
-    pub fn from_shot(
-        id: u32,
-        origin: Vec3,
-        direction: Vec3,
-        shot: game_packages::Shot,
-    ) -> Self {
-        let mut arrow = Self::new_arrow(id, origin, direction, shot.projectile, Some(shot.impact()));
-        arrow.power = Some(shot.power);
-        arrow
+        Self::new_arrow(id, origin, direction, shot.projectile, Some(shot.impact()))
     }
 
     /// Build an arrow from explicit flight and impact parameters. `blast: None`
@@ -74,7 +63,6 @@ impl Arrow {
             blast,
             damage: 0,
             knockback: 0.0,
-            power: None,
             shooter: None,
             age: 0,
             traveled: 0.0,

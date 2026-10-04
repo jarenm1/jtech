@@ -401,50 +401,11 @@ fn delayed_launch_result_does_not_replace_newer_hit_feedback() {
     assert_eq!(client.accepted_edits, 1);
     assert_eq!(client.rejected_edits, 1);
 }
-#[test]
-fn bow_slot_selection_and_untargeted_shot_routing() {
-    let mut keys = ButtonInput::<KeyCode>::default();
-    keys.press(KeyCode::Digit6);
-    assert_eq!(selected_slot(&keys), Some(6));
-    let mut client = ClientSession {
-        selected: selected_slot(&keys).unwrap(),
-        ..default()
-    };
-    // Bow fire moved to `edit_blocks` on right-click release, so `block_action`
-    // only routes grid strikes and edits and never fires without a target.
-    let world = VoxelWorld::default();
-    assert!(block_action(&mut client, &world, false, false).is_none());
-    assert!(block_action(&mut client, &world, false, true).is_none());
-    assert_eq!(client.request, 0);
-    keys.reset_all();
-    keys.press(KeyCode::Digit3);
-    client.selected = selected_slot(&keys).unwrap();
-    assert!(block_action(&mut client, &world, false, false).is_none());
-}
-#[test]
-fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
-    let mut client = ClientSession {
-        selected: 6,
-        pitch: -1.0,
-        state: CharacterState {
-            motion: PlayerState {
-                position: Vec3::new(0.5, 0.0, 0.5),
-                ..default()
-            },
-            ..default()
-        },
-        ..default()
-    };
-    let world = arena();
-    assert!(matches!(
-        block_action(&mut client, &world, false, true),
-        Some(ClientMessage::Edit { block: 0, .. })
-    ));
-    assert!(matches!(
-        block_action(&mut client, &world, true, false),
-        Some(ClientMessage::Strike { .. })
-    ));
-}
+// `bow_slot_selection_and_untargeted_shot_routing` and
+// `equipped_bow_hits_and_debug_launches_use_grid_actions` were deleted: their
+// subject was the removed `main.rs::selected_slot`/`block_action` wiring, and
+// `actions::resolve` now routes weapon left-clicks to `attack_held` instead of
+// grid edits.
 #[test]
 fn reconciliation_replays_flight_mode_and_returns_to_walking() {
     let world = arena();
@@ -722,19 +683,29 @@ fn input_packets_and_respawn_requests_carry_observed_life() {
 }
 #[test]
 fn controls_block_look_and_slot_changes_while_dead() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mut app = App::new();
     app.insert_resource(Options {
         server: "127.0.0.1:4000".parse().unwrap(),
         ..default()
     })
     .insert_resource(ClientSession {
+        transport: Some(
+            ClientTransport::connect(listener.local_addr().unwrap()).unwrap(),
+        ),
+        id: Some(1),
         selected: 3,
         ..default()
     })
     .init_resource::<ButtonInput<KeyCode>>()
+    .init_resource::<ButtonInput<MouseButton>>()
     .init_resource::<AccumulatedMouseMotion>()
     .init_resource::<pause_menu::PauseMenu>()
-    .add_systems(Update, controls);
+    .init_resource::<actions::Actions>()
+    .init_resource::<loose_blocks::LooseBlocks>()
+    .insert_resource(arena())
+    .insert_resource(Time::<()>::default())
+    .add_systems(Update, (controls, actions::bindings, predict).chain());
     app.world_mut().spawn(CursorOptions {
         visible: false,
         grab_mode: CursorGrabMode::Locked,
@@ -804,10 +775,9 @@ fn left_click_plays_swing_animation_and_attacks_with_a_held_weapon() {
     app.init_resource::<ButtonInput<MouseButton>>()
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<pause_menu::PauseMenu>()
-        .init_resource::<RemoteActors>()
-        .init_resource::<RemotePlayers>()
+        .init_resource::<actions::Actions>()
+        .insert_resource(Options::default())
         .insert_resource(arena())
-        .insert_resource(Time::<()>::default())
         .insert_resource(ClientSession {
             transport: Some(
                 ClientTransport::connect(listener.local_addr().unwrap()).unwrap(),
@@ -815,7 +785,7 @@ fn left_click_plays_swing_animation_and_attacks_with_a_held_weapon() {
             id: Some(1),
             ..default()
         })
-        .add_systems(Update, edit_blocks);
+        .add_systems(Update, (actions::bindings, actions::resolve).chain());
     app.world_mut().spawn(CursorOptions {
         visible: false,
         grab_mode: CursorGrabMode::Locked,
@@ -831,7 +801,7 @@ fn left_click_plays_swing_animation_and_attacks_with_a_held_weapon() {
     assert!(session.swing_at.is_some());
     // The default session holds the explosive bow, so left click attacks even
     // with nothing under the crosshair.
-    assert!(session.attack_pending);
+    assert!(session.attack_held);
 }
 
 #[test]
@@ -841,19 +811,26 @@ fn left_click_with_an_empty_hand_mines_without_attacking() {
     app.init_resource::<ButtonInput<MouseButton>>()
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<pause_menu::PauseMenu>()
-        .init_resource::<RemoteActors>()
-        .init_resource::<RemotePlayers>()
+        .init_resource::<actions::Actions>()
+        .insert_resource(Options::default())
         .insert_resource(arena())
-        .insert_resource(Time::<()>::default())
         .insert_resource(ClientSession {
             transport: Some(
                 ClientTransport::connect(listener.local_addr().unwrap()).unwrap(),
             ),
             id: Some(1),
             selected: 1,
+            pitch: -1.0,
+            state: CharacterState {
+                motion: PlayerState {
+                    position: Vec3::new(0.5, 0.0, 0.5),
+                    ..default()
+                },
+                ..default()
+            },
             ..default()
         })
-        .add_systems(Update, edit_blocks);
+        .add_systems(Update, (actions::bindings, actions::resolve).chain());
     app.world_mut().spawn(CursorOptions {
         visible: false,
         grab_mode: CursorGrabMode::Locked,
@@ -865,7 +842,9 @@ fn left_click_with_an_empty_hand_mines_without_attacking() {
         .press(MouseButton::Left);
     app.update();
     let session = app.world().resource::<ClientSession>();
-    assert!(session.swing_at.is_some());
-    // An empty hand mines; it never queues an attack.
-    assert!(!session.attack_pending);
+    // An empty hand mines; it never queues an attack and never plays the
+    // weapon swing animation.
+    assert!(!session.attack_held);
+    assert!(session.swing_at.is_none());
+    assert_eq!(session.request, 1);
 }

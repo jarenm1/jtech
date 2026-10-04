@@ -232,8 +232,9 @@ pub struct MeleeWeaponInfo {
     pub damage: u16,
     pub cooldown_ticks: u32,
     pub knockback: f32,
-    /// True when the weapon's basic attack fires a projectile instead of a swing.
-    pub ranged: bool,
+    /// How the weapon's basic attack resolves: melee swing, charged ranged
+    /// shot, or an admin projectile that fires on the edge.
+    pub attack_kind: controller::BasicAttackKind,
     /// Asset path relative to the owning package's `assets/` dir, if the weapon
     /// ships a 3D model.
     pub model: Option<String>,

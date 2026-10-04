@@ -1,8 +1,7 @@
 //! Blast jumps through the ordinary server movement, projectile and GPU schedules.
 use super::*;
-use protocol::BowPower;
 
-fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
+fn ground_shot(gpu: bool, pitch: f32) -> f32 {
     let mut app = App::new();
     app.add_plugins(
         SimulationPlugin::headless(ServerConfig {
@@ -24,11 +23,38 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
     let mut player = Player::new();
     player.state.motion.position = Vec3::new(16.5, 10.0, 16.5);
     player.state.motion.grounded = true;
+    player.input.selected = protocol::EXPLOSIVE_BOW_ITEM;
+    player.input.attack = true;
+    player.input.yaw = 0.0;
+    player.input.pitch = pitch;
     {
         let mut sim = app.world_mut().resource_mut::<Simulation>();
         sim.players.insert(1, player);
-        sim.fire_bow(&world, 1, 0.0, pitch, power);
-        assert_eq!(sim.metrics.bow_shots, 1);
+        // The explosive bow is an admin item: it fires on the press edge, and
+        // `resolve_attacks` spawns the package's standard shot.
+        let attack = crate::basic_attack_for(&sim.packages, protocol::EXPLOSIVE_BOW_ITEM);
+        let player = sim.players.get_mut(&1).unwrap();
+        let pressed = controller::step_character_player(
+            &world,
+            &mut player.state,
+            Some(attack),
+            &player.input,
+            physics::FIXED_DT,
+            &[],
+        );
+        assert!(pressed.basic_attack, "the press edge must fire");
+        // Release so the tick loop does not fire again.
+        player.input.attack = false;
+        controller::step_character_player(
+            &world,
+            &mut player.state,
+            Some(attack),
+            &player.input,
+            physics::FIXED_DT,
+            &[],
+        );
+        sim.resolve_attacks(&world, &[1]);
+        assert_eq!(sim.arrows.len(), 1);
     }
     app.insert_resource(world);
     let mut peak = 10.0_f32;
@@ -57,7 +83,7 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
         assert!(!sim.physics.as_ref().unwrap().failed());
     }
     eprintln!(
-        "gpu={gpu} power={power:?} pitch={pitch} launch={launch_speed:.3} rise={:.3}",
+        "gpu={gpu} pitch={pitch} launch={launch_speed:.3} rise={:.3}",
         peak - 10.0
     );
     peak - 10.0
@@ -65,19 +91,11 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
 
 #[test]
 fn ground_shots_have_visible_lift_through_server_ticks() {
-    for (power, minimum_rise) in [
-        (BowPower::Low, [1.3, 0.7, 0.08]),
-        (BowPower::Standard, [3.5, 2.0, 0.4]),
-        (BowPower::High, [8.0, 5.0, 1.0]),
-        (BowPower::Extreme, [18.0, 11.0, 3.0]),
-    ] {
-        for (pitch, minimum) in [-1.54, -1.2, -0.8].into_iter().zip(minimum_rise) {
-            let rise = ground_shot(false, power, pitch);
-            assert!(
-                rise > minimum,
-                "{power:?} pitch={pitch}: rise={rise}, minimum={minimum}"
-            );
-        }
+    // The explosive bow always fires its package's standard shot, so only the
+    // aim pitch varies.
+    for (pitch, minimum) in [-1.54, -1.2, -0.8].into_iter().zip([3.5, 2.0, 0.4]) {
+        let rise = ground_shot(false, pitch);
+        assert!(rise > minimum, "pitch={pitch}: rise={rise}, minimum={minimum}");
     }
 }
 
@@ -85,8 +103,6 @@ fn ground_shots_have_visible_lift_through_server_ticks() {
 #[ignore = "requires a headless GPU adapter"]
 fn ground_shots_have_visible_lift_with_gpu_debris() {
     let _guard = physics_slice::GPU_TEST_LOCK.lock().unwrap();
-    for (power, minimum) in [(BowPower::Standard, 2.0), (BowPower::Extreme, 11.0)] {
-        let rise = ground_shot(true, power, -1.2);
-        assert!(rise > minimum, "{power:?}: rise={rise}, minimum={minimum}");
-    }
+    let rise = ground_shot(true, -1.2);
+    assert!(rise > 2.0, "rise={rise}");
 }

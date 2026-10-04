@@ -7,51 +7,11 @@ use super::{
 };
 use gameplay::combat::SwingTarget;
 use glam::{IVec3, Vec3};
-use physics::{CollisionShape, EYE_HEIGHT, PLAYER_MASS, apply_player_impulse, look_direction};
-use protocol::{BowPower, MAX_ARROWS, ServerMessage};
+use physics::{CollisionShape, PLAYER_MASS, apply_player_impulse};
+use protocol::{MAX_ARROWS, ServerMessage};
 use voxel_world::{CHUNK_SIZE, VoxelWorld};
 
 impl Simulation {
-    /// Fire the explosive bow for a completed draw. The motor owns the draw, so
-    /// this runs on its release edge rather than from a client request.
-    pub(super) fn fire_bow(
-        &mut self,
-        world: &VoxelWorld,
-        id: u64,
-        yaw: f32,
-        pitch: f32,
-        power: BowPower,
-    ) {
-        let Some(player) = self.players.get(&id) else {
-            return;
-        };
-        if player.health.is_depleted() {
-            return;
-        }
-        let origin = player.state.motion.position + Vec3::Y * EYE_HEIGHT;
-        if !yaw.is_finite() || !pitch.is_finite() || pitch.abs() > std::f32::consts::FRAC_PI_2 {
-            return;
-        }
-        if world.block(origin.floor().as_ivec3()) != Some(0) {
-            return;
-        }
-        if self.arrows.len() + self.detonations.len() >= MAX_ARROWS || self.next_arrow == u32::MAX {
-            return;
-        }
-        if self.physics.as_ref().is_some_and(|p| p.failed()) {
-            return;
-        }
-        let Ok(shot) = self.packages.fire(power) else {
-            return;
-        };
-        let mut arrow = Arrow::from_shot(self.next_arrow, origin, look_direction(yaw, pitch), shot);
-        arrow.shooter = Some(SimEntity::Player(id));
-        self.arrows.push(arrow);
-        self.next_arrow += 1;
-        self.arrow_revision += 1;
-        self.metrics.bow_shots += 1;
-    }
-
     /// Spawn a projectile from a ranged basic attack or ability. `blast: None`
     /// makes a plain arrow that damages the character it strikes directly.
     /// Returns false when the arrow budget is full.
@@ -334,52 +294,33 @@ mod tests {
     use crate::{Player, ServerConfig, SimulationPlugin};
     use bevy_app::App;
     use glam::IVec3;
+    use protocol::BowPower;
     use voxel_world::Chunk;
 
-    #[test]
-    fn each_shot_keeps_its_power_through_impact_and_queued_detonation() {
-        let mut app = App::new();
-        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
-        let mut world = VoxelWorld::default();
-        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
-        world.set_block(IVec3::new(5, 10, 4), 3).unwrap();
-        let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = Player::new();
-        player.state.motion.position = Vec3::new(4.5, 9.0, 4.5);
-        sim.players.insert(1, player);
-        let yaw = -std::f32::consts::FRAC_PI_2;
-        for power in BowPower::ALL {
-            sim.fire_bow(&world, 1, yaw, 0.0, power);
+    /// Drive one player's full basic-attack cycle and resolve the shot it
+    /// fired, mirroring the server tick's motor step and effect resolution.
+    /// The bow charges while held and fires on the release edge at full draw.
+    fn fire(sim: &mut Simulation, world: &VoxelWorld, id: u64) {
+        let attack = crate::basic_attack_for(&sim.packages, sim.players[&id].input.selected);
+        let charge = attack.charge_ticks.max(1);
+        for held in std::iter::repeat(true)
+            .take(usize::from(charge))
+            .chain([false])
+        {
+            let player = sim.players.get_mut(&id).unwrap();
+            player.input.attack = held;
+            let output = controller::step_character_player(
+                world,
+                &mut player.state,
+                Some(attack),
+                &player.input,
+                physics::FIXED_DT,
+                &[],
+            );
+            if output.basic_attack || output.charge_release.is_some() {
+                sim.resolve_attacks(world, &[id]);
+            }
         }
-        assert_eq!(
-            sim.arrows
-                .iter()
-                .map(|arrow| arrow.power)
-                .collect::<Vec<_>>(),
-            BowPower::ALL.map(Some)
-        );
-        // Occupy this tick's two detonation slots, retaining the new impacts in the queue.
-        for id in [100, 101] {
-            sim.detonations.push_back((
-                id,
-                Vec3::splat(24.0),
-                crate::packages::test_blast(BowPower::Low),
-                None,
-            ));
-        }
-        sim.advance_bow(&mut world);
-        assert!(sim.arrows.is_empty());
-        assert_eq!(sim.metrics.explosions, 2);
-        assert_eq!(
-            sim.detonations
-                .iter()
-                .map(|(_, _, power, _)| *power)
-                .collect::<Vec<_>>(),
-            BowPower::ALL.map(crate::packages::test_blast)
-        );
-        sim.advance_bow(&mut world);
-        assert_eq!(sim.metrics.explosions, 4);
-        assert_eq!(sim.detonations.len(), 2);
     }
 
     #[test]
@@ -397,8 +338,12 @@ mod tests {
         let mut player = Player::new();
         player.state.motion.position = Vec3::new(10.5, 10.0, 10.5);
         player.state.motion.grounded = true;
+        player.input.selected = protocol::EXPLOSIVE_BOW_ITEM;
+        player.input.attack = true;
+        player.input.yaw = 0.0;
+        player.input.pitch = -1.2;
         sim.players.insert(1, player);
-        sim.fire_bow(&world, 1, 0.0, -1.2, BowPower::Extreme);
+        fire(&mut sim, &world, 1);
         for _ in 0..10 {
             sim.advance_bow(&mut world);
         }
@@ -498,17 +443,30 @@ mod tests {
     #[test]
     fn dead_players_cannot_fire_or_receive_another_impulse() {
         let mut app = App::new();
-        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
+        app.add_plugins(
+            SimulationPlugin::headless(ServerConfig {
+                spawn_titan: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
         let mut world = VoxelWorld::default();
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
+        {
+            let mut sim = app.world_mut().resource_mut::<Simulation>();
+            let mut player = Player::new();
+            player.state.motion.position = Vec3::splat(10.0);
+            player.input.selected = protocol::EXPLOSIVE_BOW_ITEM;
+            player.input.attack = true;
+            sim.players.insert(1, player);
+            sim.damage_player(1, 100);
+        }
+        app.insert_resource(world);
+        // The tick drops a dead player's attack input before `resolve_attacks`.
+        app.update();
+        let mut world = app.world_mut().remove_resource::<VoxelWorld>().unwrap();
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = Player::new();
-        player.state.motion.position = Vec3::splat(10.0);
-        sim.players.insert(1, player);
-        sim.damage_player(1, 100);
-        sim.fire_bow(&world, 1, 0.0, 0.0, BowPower::Standard);
         assert!(sim.arrows.is_empty());
-        assert_eq!(sim.metrics.bow_shots, 0);
         sim.detonations.push_back((
             1,
             Vec3::splat(10.0),

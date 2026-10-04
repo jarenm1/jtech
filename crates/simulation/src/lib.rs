@@ -262,8 +262,10 @@ fn basic_attack_for(packages: &game_packages::PackageHost, item: u32) -> BasicAt
     if item == protocol::EXPLOSIVE_BOW_ITEM {
         let rate = packages.shots_per_second().max(1);
         return BasicAttack {
-            kind: BasicAttackKind::Ranged,
+            kind: BasicAttackKind::Admin,
             cooldown_ticks: (60 / rate).max(1) as u16,
+            // The explosive bow is an admin item: it fires on the press edge.
+            charge_ticks: 0,
         };
     }
     let table = packages.melee_table();
@@ -276,8 +278,17 @@ fn basic_attack_for(packages: &game_packages::PackageHost, item: u32) -> BasicAt
     BasicAttack {
         kind,
         cooldown_ticks: spec.cooldown_ticks.min(u32::from(u16::MAX)) as u16,
+        // A ranged weapon draws before firing; a melee swing fires on the edge.
+        charge_ticks: if kind == BasicAttackKind::Ranged {
+            DRAW_TICKS
+        } else {
+            0
+        },
     }
 }
+
+/// Ticks a ranged weapon draws before firing.
+const DRAW_TICKS: u16 = 60;
 
 /// Character collider ids start above the loose-body range so a character can
 /// never be confused with a physics body.
@@ -1325,8 +1336,6 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     character_colliders(&sim.players, &sim.actors, None, 0.0, &mut characters);
     // Players whose basic attack fired this tick, resolved after the loop.
     let mut basic_attacks: Vec<u64> = Vec::new();
-    // Players whose bow draw completed this tick, fired after the loop.
-    let mut bow_fires: Vec<(u64, protocol::BowPower)> = Vec::new();
     for (&id, player) in sim.players.iter_mut() {
         if player.health.is_depleted() {
             // Dead players are frozen: no input movement, noclip, or GPU body push
@@ -1376,11 +1385,9 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 bodies,
             );
             let attempted = output.attempted;
-            if let Some(fraction) = output.charge_release {
-                bow_fires.push((
-                    id,
-                    protocol::BowPower::from_charge(fraction).unwrap_or_default(),
-                ));
+            if output.charge_release.is_some() {
+                // A completed draw fires the same ranged attack as the edge.
+                basic_attacks.push(id);
             }
             if output.basic_attack {
                 basic_attacks.push(id);
@@ -1424,14 +1431,6 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     sim.collider_scratch = colliders;
     sim.character_scratch = characters;
     sim.resolve_attacks(&world, &basic_attacks);
-    for (id, power) in bow_fires {
-        let (yaw, pitch) = sim
-            .players
-            .get(&id)
-            .map(|player| (player.state.yaw, player.input.pitch))
-            .unwrap_or_default();
-        sim.fire_bow(&world, id, yaw, pitch, power);
-    }
     for (id, message) in incoming.reliable {
         match message {
             ClientMessage::Edit {
@@ -1860,11 +1859,26 @@ mod tests {
                 physics::FIXED_DT,
                 &[],
             );
-            if output.basic_attack {
+            if output.basic_attack || output.charge_release.is_some() {
                 fired.push(id);
             }
         }
         sim.resolve_attacks(world, &fired);
+    }
+
+    /// Drive one full basic-attack cycle: hold `attack` for the weapon's draw
+    /// (`charge_ticks`, at least one tick) then release, so a melee press edge
+    /// or a completed ranged draw fires exactly once.
+    fn swing_cycle(sim: &mut Simulation, world: &VoxelWorld, id: u64) {
+        let charge = basic_attack_for(&sim.packages, sim.players[&id].input.selected)
+            .charge_ticks
+            .max(1);
+        sim.players.get_mut(&id).unwrap().input.attack = true;
+        for _ in 0..charge {
+            swing(sim, world, id);
+        }
+        sim.players.get_mut(&id).unwrap().input.attack = false;
+        swing(sim, world, id);
     }
 
     #[test]
@@ -1884,7 +1898,7 @@ mod tests {
         player.input.selected = protocol::EXPLOSIVE_BOW_ITEM;
         sim.players.insert(1, player);
         let before = sim.arrows.len();
-        swing(&mut sim, &world, 1);
+        swing_cycle(&mut sim, &world, 1);
         assert_eq!(
             sim.arrows.len(),
             before + 1,
@@ -1913,7 +1927,7 @@ mod tests {
         sim.players.insert(1, player);
 
         sim.tick = 100;
-        swing(&mut sim, &world, 1);
+        swing_cycle(&mut sim, &world, 1);
         // A level swing at eye height lands in the head zone: double damage.
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
@@ -1925,7 +1939,7 @@ mod tests {
             "knockback did not move the dummy"
         );
         // The motor's cooldown blocks an immediate second swing.
-        swing(&mut sim, &world, 1);
+        swing_cycle(&mut sim, &world, 1);
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
             100 - gameplay::combat::MELEE_HANDS.damage * gameplay::combat::HEADSHOT_MULTIPLIER
@@ -1933,7 +1947,7 @@ mod tests {
         // Ten swings at cooldown spacing kill the dummy; it respawns later.
         for _ in 0..10 {
             sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
-            swing(&mut sim, &world, 1);
+            swing_cycle(&mut sim, &world, 1);
         }
         assert!(sim.actor_health(dummy).unwrap().is_depleted());
         sim.tick += 300;
@@ -1965,25 +1979,25 @@ mod tests {
         sim.players.insert(1, player);
 
         sim.tick = 100;
-        swing(&mut sim, &world, 1);
+        swing_cycle(&mut sim, &world, 1);
         assert_eq!(sim.actor_health(dummy).unwrap().current(), 100);
 
         sim.players.get_mut(&1).unwrap().inventory.add(7, 1);
-        swing(&mut sim, &world, 1);
+        swing_cycle(&mut sim, &world, 1);
         // Head-zone hit with the authored 12-damage spec.
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
             100 - 12 * gameplay::combat::HEADSHOT_MULTIPLIER
         );
         // The authored 24-tick cooldown, not the hands default, gates the next swing.
-        swing(&mut sim, &world, 1);
+        swing_cycle(&mut sim, &world, 1);
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
             100 - 12 * gameplay::combat::HEADSHOT_MULTIPLIER
         );
         for _ in 0..10 {
             sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
-            swing(&mut sim, &world, 1);
+            swing_cycle(&mut sim, &world, 1);
         }
         assert!(sim.actor_health(dummy).unwrap().is_depleted());
         put_resources(&mut app, world, sim);
@@ -2457,13 +2471,19 @@ mod tests {
         sim.players.insert(2, victim);
 
         sim.tick = 100;
-        loop {
+        // Five head-zone swings deplete the victim; bound the loop so a
+        // regression fails instead of hanging.
+        for _ in 0..20 {
             sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
-            swing(&mut sim, &world, 1);
+            swing_cycle(&mut sim, &world, 1);
             if sim.player_health(2).unwrap().is_depleted() {
                 break;
             }
         }
+        assert!(
+            sim.player_health(2).unwrap().is_depleted(),
+            "the victim must die within the bounded swing budget"
+        );
         let events = sim.drain_events();
         assert!(
             events.iter().any(|event| matches!(

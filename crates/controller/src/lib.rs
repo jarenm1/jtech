@@ -23,14 +23,14 @@ pub struct CharacterIntent {
     pub movement: Vec2,
     pub turn: f32,
     pub jump: bool,
+    /// Held attack request: the general attack action. A melee or admin weapon
+    /// fires once on the press edge; a ranged weapon charges while held and
+    /// fires on release at full charge.
     pub attack: bool,
     /// Item the character swings with; the host maps it to a melee spec.
     pub held_item: u32,
     /// Held sprint request: scales target speed by the profile's sprint multiplier.
     pub sprint: bool,
-    /// One-tick draw request: starts a bow draw the motor runs to completion,
-    /// firing on its own at full draw.
-    pub draw: bool,
     /// Held crouch request: lowers the body and scales target speed.
     pub crouch: bool,
     /// One-tick ability edges, one per slot; the motor consumes and clears them.
@@ -51,7 +51,6 @@ impl CharacterIntent {
             attack: self.attack,
             held_item: self.held_item,
             sprint: self.sprint,
-            draw: self.draw,
             crouch: self.crouch,
             ability: self.ability,
             aim: Vec2::new(
@@ -126,10 +125,6 @@ pub struct MovementProfile {
     pub crouch_mult: f32,
     /// Body height while crouching, in metres.
     pub crouch_height: f32,
-    /// Ticks to a full bow draw.
-    pub charge_ticks: u16,
-    /// Minimum charge ticks a release must reach to fire; shorter taps cancel.
-    pub charge_min_ticks: u16,
     /// Target-speed multiplier at a full draw; interpolated from 1.0 as it builds.
     pub charge_mult: f32,
     pub acceleration: f32,
@@ -153,8 +148,6 @@ impl Default for MovementProfile {
             max_slope_cos: std::f32::consts::FRAC_1_SQRT_2,
             crouch_mult: 0.5,
             crouch_height: 0.9,
-            charge_ticks: 60,
-            charge_min_ticks: 9,
             charge_mult: 0.15,
             acceleration: 10_000.0,
             braking: 10_000.0,
@@ -169,17 +162,6 @@ impl Default for MovementProfile {
     }
 }
 impl MovementProfile {
-    /// Draw fraction in 0..1 for a charge in ticks; a zero full draw reads as
-    /// fully charged.
-    pub fn charge_fraction(&self, charge: u16) -> f32 {
-        let full = self.charge_ticks;
-        if full == 0 {
-            1.0
-        } else {
-            (f32::from(charge) / f32::from(full)).clamp(0.0, 1.0)
-        }
-    }
-
     pub(crate) fn bounded(self) -> Self {
         Self {
             speed: finite(self.speed).clamp(0.0, 60.0),
@@ -190,8 +172,6 @@ impl MovementProfile {
             max_slope_cos: finite(self.max_slope_cos).clamp(0.0, 1.0),
             crouch_mult: finite(self.crouch_mult).clamp(0.0, 1.0),
             crouch_height: finite(self.crouch_height).clamp(0.01, 16.0),
-            charge_ticks: self.charge_ticks.min(600),
-            charge_min_ticks: self.charge_min_ticks.min(self.charge_ticks.min(600)),
             charge_mult: finite(self.charge_mult).clamp(0.0, 1.0),
             acceleration: finite(self.acceleration).clamp(0.0, 10_000.0),
             braking: finite(self.braking).clamp(0.0, 10_000.0),
@@ -400,10 +380,13 @@ pub struct Dash {
 /// owns the cooldown and the fired edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BasicAttackKind {
-    /// A raycast hit at melee reach.
+    /// A raycast hit at melee reach; fires once on the press edge.
     Melee,
-    /// A travelling projectile along the aim.
+    /// A travelling projectile along the aim; charges while held and fires on
+    /// release at full charge.
     Ranged,
+    /// An admin weapon that fires a projectile immediately on the press edge.
+    Admin,
 }
 
 /// The held weapon's basic attack: how it resolves and its cooldown. The host
@@ -412,6 +395,9 @@ pub enum BasicAttackKind {
 pub struct BasicAttack {
     pub kind: BasicAttackKind,
     pub cooldown_ticks: u16,
+    /// Ticks the attack winds up before firing; 0 fires on the edge. A charged
+    /// attack draws for this long, slowing movement, then fires itself.
+    pub charge_ticks: u16,
 }
 
 /// Per-tick motor output: the horizontal velocity the character attempted, the
@@ -455,6 +441,8 @@ pub struct CharacterState {
     pub charge: u16,
     /// Whether the draw was held last tick, for release-edge detection.
     pub drawing: bool,
+    /// Whether the attack action was held last tick, for press/release edges.
+    pub attack_held: bool,
 }
 impl CharacterState {
     pub fn apply_impulse(&mut self, body: &CharacterBody, impulse: Vec3) {

@@ -423,6 +423,7 @@ impl Simulation {
                 body: kind.body.with_basic_attack(Some(BasicAttack {
                     kind: BasicAttackKind::Melee,
                     cooldown_ticks: kind.melee.cooldown_ticks.min(u32::from(u16::MAX)) as u16,
+                    charge_ticks: 0,
                 })),
                 profile: kind.profile,
                 intent: CharacterIntent::default(),
@@ -606,7 +607,10 @@ impl Simulation {
             let player = &self.players[&id];
             let origin = player.state.motion.position + Vec3::Y * EYE_HEIGHT;
             let direction = look_direction(player.input.yaw, player.input.pitch);
-            if attack.kind == BasicAttackKind::Ranged {
+            if matches!(
+                attack.kind,
+                BasicAttackKind::Ranged | BasicAttackKind::Admin
+            ) {
                 // The explosive bow uses its package's authored shot; a ranged
                 // weapon carries its own flight spec and hits directly.
                 let (projectile, blast, damage, knockback) =
