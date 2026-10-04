@@ -113,7 +113,8 @@ melee) and a Bow (8, ranged) — and declares a spawn loadout granted on connect
 and respawn. A `ranged-weapon` also authors its projectile's speed, gravity,
 travel and lifetime; its basic attack fires that projectile instead of a swing.
 A plain projectile damages the character it strikes directly and expires on
-terrain; a projectile that authors a blast detonates on any impact.
+terrain; a projectile that authors a blast detonates on any impact. Projectiles
+are not expired by leaving loaded terrain, so a shot straight up falls back.
 Multiple melee packages merge into the same table; conflicting item
 ids error the later package. Weapons are equipment: each copy occupies its own
 inventory slot (duplicates collect normally — future per-item meta needs the

@@ -88,8 +88,8 @@ lists. All numeric outputs must be finite. Host validation applies these bounds:
 | --- | --- | --- |
 | speed | m/s | 0.1–200 |
 | gravity | m/s² | 0–100 |
-| travel | m | 0.1–256 |
-| lifetime | fixed60 ticks | integer 1–3600 |
+| travel | m | 0.1–100000 |
+| lifetime | fixed60 ticks | integer 1–18000 |
 | radius | m | 0.1–12 |
 | energy | material blast joules | 0–100000 |
 | player-speed | unobstructed center launch speed, m/s | 0–100 |

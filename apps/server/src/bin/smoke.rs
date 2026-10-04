@@ -642,8 +642,8 @@ fn explosive_bow() -> Result<()> {
             "(define shots-per-second 20)",
         )
         .replace(
-            "(projectile 36.0 3.0 64.0 180)",
-            "(projectile 18.0 3.0 64.0 180)",
+            "(projectile 36.0 3.0 100000.0 18000)",
+            "(projectile 18.0 3.0 100000.0 18000)",
         )
         .replace(
             "(list-ref '(3.0 4.0 5.0 6.0) power)",
