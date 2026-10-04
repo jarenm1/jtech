@@ -89,9 +89,10 @@ through a future registry.
 
 ## Melee combat
 
-Left click always plays the held-item swing animation; when a living actor or
-remote player is under the crosshair within reach it also attacks instead of
-mining terrain as before. Swings ride the input
+Left click always plays the held-item swing animation. With a weapon held it
+always attacks — a melee swing or a ranged shot — regardless of what is under
+the crosshair; with a block or an empty hand it mines terrain as before. Swings
+ride the input
 stream (`PlayerInput.attack`), so a held click repeats at the weapon cooldown
 and the same channel serves scripted policies. The server resolves one swing
 per tick per player through `gameplay::combat::resolve_swing`: a ray from the
@@ -111,6 +112,8 @@ for authored weapons; `MELEE_HANDS` is the built-in unarmed default. The
 melee) and a Bow (8, ranged) — and declares a spawn loadout granted on connect
 and respawn. A `ranged-weapon` also authors its projectile's speed, gravity,
 travel and lifetime; its basic attack fires that projectile instead of a swing.
+A plain projectile damages the character it strikes directly and expires on
+terrain; a projectile that authors a blast detonates on any impact.
 Multiple melee packages merge into the same table; conflicting item
 ids error the later package. Weapons are equipment: each copy occupies its own
 inventory slot (duplicates collect normally — future per-item meta needs the

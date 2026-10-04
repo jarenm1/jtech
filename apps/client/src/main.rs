@@ -1247,8 +1247,6 @@ fn edit_blocks(
     cursor: Option<Single<&CursorOptions>>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
-    actors: Res<RemoteActors>,
-    remotes: Res<RemotePlayers>,
     time: Res<Time>,
     mut bow_repeat: Local<BowRepeat>,
     menu: Res<pause_menu::PauseMenu>,
@@ -1266,14 +1264,13 @@ fn edit_blocks(
         return;
     }
     let strike = keys.just_pressed(KeyCode::KeyF);
-    // Melee: a living actor or remote player under the crosshair within reach
-    // sets the attack flag instead of mining. The server re-validates; this
-    // only routes input. The swing animation plays on every left click —
-    // mining, whiffing, or hitting — so the held item always reacts.
-    let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
-    let direction = look_direction(session.yaw, session.pitch);
-    let melee = buttons.pressed(MouseButton::Left)
-        && melee_target(&world, origin, direction, &actors, &remotes, &session);
+    // A held weapon always attacks on left click — swinging or firing into the
+    // air — rather than only when a target is under the crosshair. Blocks still
+    // mine on left click; F strikes regardless. The swing animation plays on
+    // every left click, so the held item always reacts.
+    let armed = session.packages.is_equipment(session.held_item())
+        || session.held_item() == EXPLOSIVE_BOW_ITEM;
+    let melee = buttons.pressed(MouseButton::Left) && armed;
     if melee {
         session.attack_pending = true;
     }
@@ -1298,39 +1295,6 @@ fn edit_blocks(
     if let Some(message) = block_action(&mut session, &world, strike, hit, secondary) {
         session.send(message);
     }
-}
-
-/// True when a living actor or remote player is under the crosshair within
-fn melee_target(
-    world: &VoxelWorld,
-    origin: Vec3,
-    direction: Vec3,
-    actors: &RemoteActors,
-    remotes: &RemotePlayers,
-    session: &ClientSession,
-) -> bool {
-    let range = session.packages.melee_range(session.held_item());
-    let wall = world
-        .raycast(origin, direction, range)
-        .map(|hit| hit.distance)
-        .unwrap_or(range);
-    let shape = physics::CollisionShape::default();
-    actors
-        .0
-        .values()
-        .filter(|actor| !actor.health.is_depleted())
-        .any(|actor| {
-            physics::raycast_body(origin, direction, actor.current, shape)
-                .is_some_and(|distance| distance < wall)
-        })
-        || remotes
-            .0
-            .values()
-            .filter(|remote| !remote.health.is_depleted())
-            .any(|remote| {
-                physics::raycast_body(origin, direction, remote.current, shape)
-                    .is_some_and(|distance| distance < wall)
-            })
 }
 
 #[derive(Default)]

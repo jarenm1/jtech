@@ -1,12 +1,13 @@
 //! Bow request admission, projectile replication, and authoritative blast transactions.
 use super::{
     Simulation,
-    actors::SimEntity,
+    actors::{ACTOR_RESPAWN_TICKS, ACTOR_TARGET, SimEntity, SimEvent},
     bow::{Arrow, Flight},
     explosion::{self, Target},
 };
+use gameplay::combat::SwingTarget;
 use glam::{IVec3, Vec3};
-use physics::{EYE_HEIGHT, PLAYER_MASS, apply_player_impulse, look_direction};
+use physics::{CollisionShape, EYE_HEIGHT, PLAYER_MASS, apply_player_impulse, look_direction};
 use protocol::{BowPower, EditRejection, MAX_ARROWS, ServerMessage};
 use voxel_world::{CHUNK_SIZE, VoxelWorld};
 
@@ -78,7 +79,7 @@ impl Simulation {
             look_direction(yaw, pitch),
             shot,
         );
-        arrow.shooter = Some(id);
+        arrow.shooter = Some(SimEntity::Player(id));
         self.arrows.push(arrow);
         self.next_arrow += 1;
         self.arrow_revision += 1;
@@ -93,25 +94,106 @@ impl Simulation {
         self.finish_edit(id, request, Ok(None));
     }
 
-    /// Spawn a projectile from a ranged basic attack or ability. Returns false
-    /// when the arrow budget is full.
+    /// Spawn a projectile from a ranged basic attack or ability. `blast: None`
+    /// makes a plain arrow that damages the character it strikes directly.
+    /// Returns false when the arrow budget is full.
     pub(super) fn spawn_projectile(
         &mut self,
         origin: Vec3,
         direction: Vec3,
         projectile: game_packages::ProjectileSpec,
-        blast: game_packages::BlastSpec,
-        shooter: Option<u64>,
+        blast: Option<game_packages::BlastSpec>,
+        damage: u16,
+        knockback: f32,
+        shooter: Option<SimEntity>,
     ) -> bool {
         if self.arrows.len() + self.detonations.len() >= MAX_ARROWS || self.next_arrow == u32::MAX {
             return false;
         }
         let mut arrow = Arrow::new_arrow(self.next_arrow, origin, direction, projectile, blast);
+        arrow.damage = damage;
+        arrow.knockback = knockback;
         arrow.shooter = shooter;
         self.arrows.push(arrow);
         self.next_arrow += 1;
         self.arrow_revision += 1;
         true
+    }
+
+    /// Every living character as a swing target, for projectile and melee hits.
+    /// `exclude` drops the attacker's own target so a swing or arrow cannot hit
+    /// the character that produced it.
+    pub(super) fn swing_targets(&self, exclude: Option<u64>) -> Vec<SwingTarget> {
+        let mut targets: Vec<SwingTarget> = self
+            .actors
+            .iter()
+            .filter(|(_, actor)| !actor.health.is_depleted())
+            .map(|(&id, actor)| SwingTarget {
+                id: u64::from(id) | ACTOR_TARGET,
+                position: actor.state.motion.position,
+                shape: actor.body.shape,
+            })
+            .collect();
+        targets.extend(
+            self.players
+                .iter()
+                .filter(|(_, player)| !player.health.is_depleted() && !player.state.motion.noclip)
+                .map(|(&id, player)| SwingTarget {
+                    id,
+                    position: player.state.motion.position,
+                    shape: CollisionShape::default(),
+                }),
+        );
+        targets.retain(|target| Some(target.id) != exclude);
+        targets
+    }
+
+    /// Apply a plain arrow's direct hit: damage plus a knockback impulse along
+    /// the flight direction, attributed to the shooter.
+    fn apply_arrow_hit(
+        &mut self,
+        target: u64,
+        damage: u16,
+        knockback: f32,
+        velocity: Vec3,
+        shooter: Option<SimEntity>,
+    ) {
+        let impulse = velocity.try_normalize().unwrap_or(Vec3::NEG_Z) * knockback;
+        let tick = self.tick;
+        if target & ACTOR_TARGET != 0 {
+            let actor_id = (target & !ACTOR_TARGET) as u32;
+            let Some(actor) = self.actors.get_mut(&actor_id) else {
+                return;
+            };
+            actor.state.apply_impulse(&actor.body, impulse);
+            let was_depleted = actor.health.is_depleted();
+            let amount = actor.health.damage(damage);
+            let killed = actor.health.is_depleted();
+            if killed {
+                actor.respawn_at = Some(tick + ACTOR_RESPAWN_TICKS);
+            }
+            if let Some(source) = shooter {
+                self.push_event(SimEvent::DamageDealt {
+                    source,
+                    target: SimEntity::Actor(actor_id),
+                    amount,
+                    killed,
+                });
+            }
+            if !was_depleted && killed {
+                self.push_event(SimEvent::ActorDied {
+                    id: actor_id,
+                    killer: shooter,
+                });
+            }
+        } else {
+            if let Some(victim) = self.players.get_mut(&target) {
+                apply_player_impulse(&mut victim.state.motion, impulse);
+            }
+            if let Some(source) = shooter {
+                self.damage_player_event(source, target, damage);
+            }
+        }
     }
 
     pub(super) fn advance_bow(&mut self, world: &mut VoxelWorld) {
@@ -130,14 +212,25 @@ impl Simulation {
             self.arrow_revision += 1;
         }
         for mut arrow in arrows {
-            match arrow.tick(world, &bodies, ready) {
+            let targets = self.swing_targets(arrow.shooter.map(SimEntity::target_id));
+            match arrow.tick(world, &bodies, &targets, ready) {
                 Flight::Flying => self.arrows.push(arrow),
-                Flight::Impact(position) => self.detonations.push_back((
-                    arrow.snapshot.id,
-                    position,
-                    arrow.blast,
-                    arrow.shooter.map(SimEntity::Player),
-                )),
+                Flight::Impact(position, target) => {
+                    if let Some(blast) = arrow.blast {
+                        // An explosive arrow detonates on any impact.
+                        self.detonations
+                            .push_back((arrow.snapshot.id, position, blast, arrow.shooter));
+                    } else if let Some(target) = target {
+                        // A plain arrow damages the character it struck directly.
+                        self.apply_arrow_hit(
+                            target,
+                            arrow.damage,
+                            arrow.knockback,
+                            arrow.snapshot.velocity,
+                            arrow.shooter,
+                        );
+                    }
+                }
                 Flight::Expired => {}
             }
         }

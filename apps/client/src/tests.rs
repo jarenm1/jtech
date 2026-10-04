@@ -903,7 +903,7 @@ fn ground_jump_edge_survives_render_only_frames_and_fires_once_per_catchup() {
     assert!(!session.consume_jump(true, false));
 }
 #[test]
-fn left_click_plays_swing_animation_without_a_melee_target() {
+fn left_click_plays_swing_animation_and_attacks_with_a_held_weapon() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mut app = App::new();
     app.init_resource::<ButtonInput<MouseButton>>()
@@ -934,6 +934,43 @@ fn left_click_plays_swing_animation_without_a_melee_target() {
     app.update();
     let session = app.world().resource::<ClientSession>();
     assert!(session.swing_at.is_some());
-    // No actor or remote player under the crosshair, so nothing attacks.
+    // The default session holds the explosive bow, so left click attacks even
+    // with nothing under the crosshair.
+    assert!(session.attack_pending);
+}
+
+#[test]
+fn left_click_with_an_empty_hand_mines_without_attacking() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut app = App::new();
+    app.init_resource::<ButtonInput<MouseButton>>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .init_resource::<pause_menu::PauseMenu>()
+        .init_resource::<RemoteActors>()
+        .init_resource::<RemotePlayers>()
+        .insert_resource(arena())
+        .insert_resource(Time::<()>::default())
+        .insert_resource(ClientSession {
+            transport: Some(
+                ClientTransport::connect(listener.local_addr().unwrap()).unwrap(),
+            ),
+            id: Some(1),
+            selected: 1,
+            ..default()
+        })
+        .add_systems(Update, edit_blocks);
+    app.world_mut().spawn(CursorOptions {
+        visible: false,
+        grab_mode: CursorGrabMode::Locked,
+        ..default()
+    });
+    app.update();
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .press(MouseButton::Left);
+    app.update();
+    let session = app.world().resource::<ClientSession>();
+    assert!(session.swing_at.is_some());
+    // An empty hand mines; it never queues an attack.
     assert!(!session.attack_pending);
 }

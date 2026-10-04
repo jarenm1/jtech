@@ -403,6 +403,30 @@ fn drive_first(
     }
     Ok(())
 }
+/// Drive only the second bot, mirroring `drive_first`.
+fn drive_second(
+    app: &mut App,
+    first: &mut Bot,
+    second: &mut Bot,
+    steps: usize,
+    movement: [f32; 2],
+    pitch: f32,
+) -> Result<()> {
+    for _ in 0..steps {
+        let tick = app.world().resource::<Simulation>().tick;
+        first.poll()?;
+        first.input(tick, [0.0; 2], pitch)?;
+        first.poll()?;
+        second.poll()?;
+        second.input(tick, movement, pitch)?;
+        second.poll()?;
+        app.update();
+        std::thread::sleep(Duration::from_millis(1));
+        first.poll()?;
+        second.poll()?;
+    }
+    Ok(())
+}
 fn require(condition: bool, message: &str) -> Result<()> {
     if condition {
         Ok(())
@@ -670,6 +694,9 @@ fn explosive_bow() -> Result<()> {
         "late join did not receive the current package status",
     )?;
     drop(late);
+    // Arrows collide with characters, and both bots spawn on the same tile:
+    // walk the second bot out of the fixture lane so the wall shot is clear.
+    drive_second(&mut app, &mut first, &mut second, 24, [0.0, 1.0], 0.0)?;
     let yaw = -std::f32::consts::FRAC_PI_2;
     let shot = ClientMessage::FireBow {
         request: 1,

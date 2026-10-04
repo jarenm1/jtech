@@ -44,17 +44,6 @@ impl ServerPackages {
         self.melee_weapons = melee_weapons;
     }
 
-    /// Swing reach for the held item; unarmed reach when the item is not a
-    /// replicated weapon.
-    pub fn melee_range(&self, item: u32) -> f32 {
-        self.melee_weapons
-            .iter()
-            .find(|weapon| weapon.item == item)
-            .map_or(gameplay::combat::MELEE_HANDS.range, |weapon| {
-                weapon.range
-            })
-    }
-
     /// Authored display name for a replicated weapon item.
     pub fn melee_name(&self, item: u32) -> Option<&str> {
         self.melee_weapons
