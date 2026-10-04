@@ -6,7 +6,7 @@
 
 `step_character` is a fixed pipeline of named stages — `status`, `sanitize`, `stance`, `contact`, `steer`, `gravity`, `sweep_horizontal`, `sweep_vertical`, `drag` — so authority, prediction and replay agree on ordering. The public contract is unchanged: intent in, `CharacterState` out.
 
-- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a one-tick `attack` edge the host's combat system consumes (the motor owns its cadence); held `sprint`, `draw` and `crouch` requests.
+- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a one-tick `attack` edge the host's combat system consumes (the motor owns its cadence); a one-tick `draw` request that starts a bow draw the motor runs to completion; held `sprint` and `crouch` requests.
 - `CharacterBody`: feet-anchored AABB dimensions and mass in kilograms, the per-species `AbilityTable`, and the held weapon's `BasicAttack` (`Melee` or `Ranged` plus a cooldown).
 - `MovementProfile`: speed, sprint multiplier, coyote and jump-buffer ticks, step height, walkable-slope cosine, crouch multiplier and height, bow draw ticks and minimum release, draw speed multiplier, acceleration, braking, air control, strafe fraction, yaw rate, gravity, jump speed, and external-momentum drag.
 - `CharacterState`: motion, facing, locomotion `mode`, active `statuses`, coyote/buffer ticks, crouch flag, per-slot `cooldowns`, any `cast`/`dash`, and the basic-attack cooldown — the complete replay unit. Horizontal external momentum is separate from controlled movement.
@@ -21,7 +21,7 @@ Ground locomotion includes sliding, support detection, jumping, loose-cube conta
 
 The held weapon's `BasicAttack` (`Melee` or `Ranged`, plus a cooldown) rides on `CharacterBody`; the host maps the held item to it. The motor owns the cadence — `CharacterState.basic_attack_cooldown` ticks down and a one-tick `attack` edge fires it — and reports the fired edge in `MotorOutput.basic_attack`. The host applies the effect: a melee raycast for `Melee`, a travelling projectile for `Ranged`. This keeps the basic attack in the same replay unit as abilities, so prediction and reconciliation cover it.
 
-A held `draw` request charges a bow in `CharacterState.charge`, capped at the profile's `charge_ticks`; the motor scales target speed from 1.0 toward `charge_mult` as the draw builds and reports the fraction in `MotorOutput.charge`. Clearing the request reports `MotorOutput.charge_release` with the fraction reached, once it passes `charge_min_ticks`; the host fires on that edge. The charge lives in replay state, so prediction, reconciliation and the authoritative server agree on both the slow and the release.
+A one-tick `draw` request starts a bow draw the motor runs to completion: `CharacterState.charge` advances to the profile's `charge_ticks`, target speed scales from 1.0 toward `charge_mult` as it builds, and `MotorOutput.charge` reports the fraction. At full draw the motor reports `MotorOutput.charge_release` and clears the draw; the host fires on that edge. The draw lives in replay state, so prediction, reconciliation and the authoritative server agree on both the slow and the release.
 
 ## Status effects
 

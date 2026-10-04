@@ -8,22 +8,16 @@ use super::{
 use gameplay::combat::SwingTarget;
 use glam::{IVec3, Vec3};
 use physics::{CollisionShape, EYE_HEIGHT, PLAYER_MASS, apply_player_impulse, look_direction};
-use protocol::{BowPower, EditRejection, MAX_ARROWS, ServerMessage};
+use protocol::{BowPower, MAX_ARROWS, ServerMessage};
 use voxel_world::{CHUNK_SIZE, VoxelWorld};
 
 impl Simulation {
-    /// Draw ticks a release must hold to fire at `power`, from the motor's
-    /// full-draw length and the power's minimum fraction.
-    fn charge_ticks(power: BowPower) -> u16 {
-        let full = controller::MovementProfile::default().charge_ticks;
-        (power.min_charge() * f32::from(full)).ceil() as u16
-    }
-
+    /// Fire the explosive bow for a completed draw. The motor owns the draw, so
+    /// this runs on its release edge rather than from a client request.
     pub(super) fn fire_bow(
         &mut self,
         world: &VoxelWorld,
         id: u64,
-        request: u64,
         yaw: f32,
         pitch: f32,
         power: BowPower,
@@ -31,76 +25,31 @@ impl Simulation {
         let Some(player) = self.players.get(&id) else {
             return;
         };
-        if let Some((_, outcome)) = player.results.iter().find(|(old, _)| *old == request) {
-            self.send_edit_result(id, request, *outcome);
-            return;
-        }
-        if self
-            .strikes
-            .iter()
-            .any(|s| s.id == id && s.request == request)
-        {
+        if player.health.is_depleted() {
             return;
         }
         let origin = player.state.motion.position + Vec3::Y * EYE_HEIGHT;
-        let subticks_per_tick = u64::from(self.packages.shots_per_second());
-        let now = self.tick.saturating_mul(subticks_per_tick);
-        let rejection = if request <= player.highest_request {
-            Some(EditRejection::OldRequest)
-        } else if player.health.is_depleted() {
-            Some(EditRejection::Dead)
-        } else if subticks_per_tick == 0 {
-            Some(EditRejection::PackageUnavailable)
-        } else if now < player.next_bow_time {
-            Some(EditRejection::Cooldown)
-        } else if player.recent_charge < Self::charge_ticks(power) {
-            Some(EditRejection::NotCharged)
-        } else if !yaw.is_finite()
-            || !pitch.is_finite()
-            || pitch.abs() > std::f32::consts::FRAC_PI_2
-        {
-            Some(EditRejection::InvalidTarget)
-        } else if world.block(origin.floor().as_ivec3()) != Some(0) {
-            Some(EditRejection::Occupied)
-        } else if self.arrows.len() + self.detonations.len() >= MAX_ARROWS
-            || self.next_arrow == u32::MAX
-        {
-            Some(EditRejection::BodyCapacity)
-        } else if self.physics.as_ref().is_some_and(|p| p.failed()) {
-            Some(EditRejection::PhysicsUnavailable)
-        } else {
-            None
-        };
-        if let Some(reason) = rejection {
-            self.finish_edit(id, request, Err(reason));
+        if !yaw.is_finite() || !pitch.is_finite() || pitch.abs() > std::f32::consts::FRAC_PI_2 {
             return;
         }
-        let shot = match self.packages.fire(power) {
-            Ok(shot) => shot,
-            Err(_) => {
-                self.finish_edit(id, request, Err(EditRejection::PackageUnavailable));
-                return;
-            }
+        if world.block(origin.floor().as_ivec3()) != Some(0) {
+            return;
+        }
+        if self.arrows.len() + self.detonations.len() >= MAX_ARROWS || self.next_arrow == u32::MAX {
+            return;
+        }
+        if self.physics.as_ref().is_some_and(|p| p.failed()) {
+            return;
+        }
+        let Ok(shot) = self.packages.fire(power) else {
+            return;
         };
-        let mut arrow = Arrow::from_shot(
-            self.next_arrow,
-            origin,
-            look_direction(yaw, pitch),
-            shot,
-        );
+        let mut arrow = Arrow::from_shot(self.next_arrow, origin, look_direction(yaw, pitch), shot);
         arrow.shooter = Some(SimEntity::Player(id));
         self.arrows.push(arrow);
         self.next_arrow += 1;
         self.arrow_revision += 1;
         self.metrics.bow_shots += 1;
-        let deadline = &mut self.players.get_mut(&id).unwrap().next_bow_time;
-        // Carry sub-tick rounding forward for the package's authored firing rate.
-        // After idle time, start a new cadence rather than banking burst shots.
-        if now.saturating_sub(*deadline) >= subticks_per_tick {
-            *deadline = now;
-        }
-        *deadline = deadline.saturating_add(60);
-        self.finish_edit(id, request, Ok(None));
     }
 
     /// Spawn a projectile from a ranged basic attack or ability. `blast: None`
@@ -387,51 +336,6 @@ mod tests {
     use glam::IVec3;
     use voxel_world::Chunk;
 
-    /// A player holding a full bow draw, so `fire_bow` passes the charge check.
-    fn charged_player() -> Player {
-        let mut player = Player::new();
-        player.recent_charge = 60;
-        player
-    }
-
-    #[test]
-    fn bow_admits_25_shots_per_second_without_idle_or_replay_bursts() {
-        let mut app = App::new();
-        app.add_plugins(SimulationPlugin::headless(ServerConfig::default()).unwrap());
-        let mut world = VoxelWorld::default();
-        world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
-        let mut sim = app.world_mut().resource_mut::<Simulation>();
-        sim.players.insert(1, charged_player());
-        let mut request = 0;
-        for tick in 0..600 {
-            sim.tick = tick;
-            // Retire projectiles here to isolate admission from the active-arrow cap.
-            sim.arrows.clear();
-            request += 1;
-            sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
-            let shots = sim.metrics.bow_shots;
-            sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
-            assert_eq!(sim.metrics.bow_shots, shots);
-            if tick % 60 == 59 {
-                assert_eq!(shots, (tick / 60 + 1) * 25);
-            }
-        }
-        sim.tick = 1200;
-        sim.arrows.clear();
-        request += 1;
-        sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
-        assert_eq!(sim.metrics.bow_shots, 251);
-        for tick in 1200..1203 {
-            sim.tick = tick;
-            request += 1;
-            sim.fire_bow(&world, 1, request, 0.0, 0.0, BowPower::Standard);
-            assert_eq!(sim.metrics.bow_shots, 251);
-        }
-        sim.tick = 1203;
-        sim.fire_bow(&world, 1, request + 1, 0.0, 0.0, BowPower::Standard);
-        assert_eq!(sim.metrics.bow_shots, 252);
-    }
-
     #[test]
     fn each_shot_keeps_its_power_through_impact_and_queued_detonation() {
         let mut app = App::new();
@@ -440,13 +344,12 @@ mod tests {
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
         world.set_block(IVec3::new(5, 10, 4), 3).unwrap();
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = charged_player();
+        let mut player = Player::new();
         player.state.motion.position = Vec3::new(4.5, 9.0, 4.5);
         sim.players.insert(1, player);
         let yaw = -std::f32::consts::FRAC_PI_2;
-        for (index, power) in BowPower::ALL.into_iter().enumerate() {
-            sim.tick = index as u64 * 10;
-            sim.fire_bow(&world, 1, index as u64 + 1, yaw, 0.0, power);
+        for power in BowPower::ALL {
+            sim.fire_bow(&world, 1, yaw, 0.0, power);
         }
         assert_eq!(
             sim.arrows
@@ -455,10 +358,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             BowPower::ALL.map(Some)
         );
-        // A replay with a changed preset must not alter an existing arrow.
-        sim.fire_bow(&world, 1, 1, yaw, 0.0, BowPower::Extreme);
-        assert_eq!(sim.arrows.len(), 4);
-        assert_eq!(sim.arrows[0].power, Some(BowPower::Low));
         // Occupy this tick's two detonation slots, retaining the new impacts in the queue.
         for id in [100, 101] {
             sim.detonations.push_back((
@@ -495,11 +394,11 @@ mod tests {
             }
         }
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = charged_player();
+        let mut player = Player::new();
         player.state.motion.position = Vec3::new(10.5, 10.0, 10.5);
         player.state.motion.grounded = true;
         sim.players.insert(1, player);
-        sim.fire_bow(&world, 1, 1, 0.0, -1.2, BowPower::Extreme);
+        sim.fire_bow(&world, 1, 0.0, -1.2, BowPower::Extreme);
         for _ in 0..10 {
             sim.advance_bow(&mut world);
         }
@@ -526,7 +425,7 @@ mod tests {
         let mut world = VoxelWorld::default();
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = charged_player();
+        let mut player = Player::new();
         player.state.motion.position = Vec3::new(10.5, 10.0, 10.5);
         let center = player.state.motion.position;
         sim.players.insert(1, player);
@@ -566,7 +465,7 @@ mod tests {
             (4, Vec3::new(9.5, 10.0, 10.5), true),
             (5, Vec3::new(20.5, 10.0, 10.5), false),
         ] {
-            let mut player = charged_player();
+            let mut player = Player::new();
             player.state.motion.position = position;
             player.state.motion.noclip = noclip;
             sim.players.insert(id, player);
@@ -603,16 +502,13 @@ mod tests {
         let mut world = VoxelWorld::default();
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = charged_player();
+        let mut player = Player::new();
         player.state.motion.position = Vec3::splat(10.0);
         sim.players.insert(1, player);
         sim.damage_player(1, 100);
-        sim.fire_bow(&world, 1, 1, 0.0, 0.0, BowPower::Standard);
-        assert_eq!(
-            sim.players[&1].results.back().unwrap().1,
-            Err(EditRejection::Dead)
-        );
+        sim.fire_bow(&world, 1, 0.0, 0.0, BowPower::Standard);
         assert!(sim.arrows.is_empty());
+        assert_eq!(sim.metrics.bow_shots, 0);
         sim.detonations.push_back((
             1,
             Vec3::splat(10.0),
@@ -641,7 +537,7 @@ mod tests {
             }
         }
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = charged_player();
+        let mut player = Player::new();
         player.state.motion.position = Vec3::new(10.5, 20.0, 10.5);
         player
             .known

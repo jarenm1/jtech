@@ -59,6 +59,7 @@ pub fn step_character(
     let profile = profile.bounded();
     let input = intent.bounded();
     intent.jump = false;
+    intent.draw = false;
     // One grid build amortizes this tick's separation pass and every sweep.
     let broadphase = physics::BodyBroadphase::new(bodies);
     let mut motor = Motor {
@@ -289,24 +290,27 @@ fn resolve(motor: &mut Motor, character: &mut CharacterState, slot: u8, aim: Vec
     }
 }
 
-/// Accumulate a held bow draw and report the release edge. The charge lives in
-/// replay state so prediction and authority agree on the movement slow.
+/// Run a one-shot bow draw: a `draw` edge starts it, it advances on its own, and
+/// it reports the release when it reaches full. The charge lives in replay state
+/// so prediction and authority agree on the slow and the release.
 fn charge(motor: &mut Motor, character: &mut CharacterState) {
     let full = motor.profile.charge_ticks;
-    if motor.input.draw {
-        character.charge = character.charge.saturating_add(1).min(full);
+    if motor.input.draw && !character.drawing {
         character.drawing = true;
-        motor.charge = draw_fraction(character.charge, full);
+        character.charge = 0;
+    }
+    if !character.drawing {
+        character.charge = 0;
+        motor.charge = 0.0;
         return;
     }
-    if character.drawing {
+    character.charge = character.charge.saturating_add(1).min(full);
+    motor.charge = draw_fraction(character.charge, full);
+    if character.charge >= full {
         character.drawing = false;
-        if character.charge >= motor.profile.charge_min_ticks {
-            motor.charge_release = Some(draw_fraction(character.charge, full));
-        }
+        character.charge = 0;
+        motor.charge_release = Some(1.0);
     }
-    character.charge = 0;
-    motor.charge = 0.0;
 }
 
 /// Draw fraction in 0..1; a zero full draw reads as fully charged.
