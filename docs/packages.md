@@ -107,10 +107,23 @@ server uses the same existing projectile/explosion messages for presentation.
 | `spawn-items` | Optional list of `(id count)` pairs granted on spawn and respawn |
 | `sounds` | Optional list of `(event path)` pairs the client plays on that event |
 
-`sounds` maps a fixed event set to files under the package's `assets/` dir:
-`"draw"` (a bow draw starts), `"fire"` (a shot leaves), `"hit"` (a projectile
-strikes). The client resolves them through the same `pkg://` asset source the
-models use, so an OGG or WAV dropped in `assets/` and named here plays with no
+`sounds` maps a fixed event set to files under the package's `assets/` dir. The
+client detects these moments locally (prediction) or receives them, so a sound
+lands on the right frame; the package only chooses the file.
+
+| Event | Fires when |
+| --- | --- |
+| `draw` | a ranged weapon's draw starts |
+| `fire` | a shot leaves (predicted) |
+| `hit` | a projectile strikes (replicated) |
+| `equip` | the held item changes |
+| `death` | the player's health reaches zero |
+| `respawn` | the player's life counter changes |
+| `jump` | a jump is requested |
+| `land` | the player touches down |
+
+The client resolves them through the same `pkg://` asset source the models use,
+so a WAV, OGG or FLAC file dropped in `assets/` and named here plays with no
 further wiring; a missing file is silent rather than an error. Both package
 kinds accept `sounds`.
 

@@ -257,8 +257,9 @@ fn four<T>(values: [Result<T, String>; 4]) -> Result<[T; 4], String> {
 }
 
 /// Parse the optional `sounds` list: `(event path)` pairs. Events are the fixed
-/// set the client knows how to trigger; paths are relative to the package's
-/// `assets/` dir. A missing list means the package ships no sounds.
+/// set of moments the client can detect locally or receive; paths are relative
+/// to the package's `assets/` dir. A missing list means the package ships no
+/// sounds.
 fn sounds(vm: &mut Vm) -> Result<Vec<(String, String)>, String> {
     let Ok(value) = vm.engine.extract_value("sounds") else {
         return Ok(Vec::new());
@@ -280,7 +281,10 @@ fn sounds(vm: &mut Vm) -> Result<Vec<(String, String)>, String> {
         let SteelVal::StringV(path) = &pair[1] else {
             return Err("sound path must be a string".into());
         };
-        if !matches!(event.as_str(), "draw" | "fire" | "hit") {
+        if !matches!(
+            event.as_str(),
+            "draw" | "fire" | "hit" | "equip" | "death" | "respawn" | "jump" | "land"
+        ) {
             return Err(format!("unknown sound event {event}"));
         }
         sounds.push((event.to_string(), path.to_string()));

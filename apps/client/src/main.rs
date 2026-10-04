@@ -967,7 +967,21 @@ fn receive_network(
         if snapshot.tick <= session.last_tick || Some(snapshot.you.id) != session.id {
             continue;
         }
+        let was_dead = session.health.is_depleted();
+        let life = session.life;
         reconcile(&mut session, &world, &snapshot, loose.colliders());
+        if !was_dead && session.health.is_depleted() {
+            res.play.write(sounds::PlaySound {
+                event: "death",
+                position: None,
+            });
+        }
+        if session.life != life {
+            res.play.write(sounds::PlaySound {
+                event: "respawn",
+                position: None,
+            });
+        }
         let now = Instant::now();
         snapshot_ids.players.clear();
         snapshot_ids
@@ -1232,7 +1246,20 @@ fn predict(
             ability: actions.ability,
             aim: [0.0, 1.0],
         };
+        let was_grounded = session.state.motion.grounded;
         let output = session.predict_input(&world, input, colliders);
+        if jump {
+            play.write(sounds::PlaySound {
+                event: "jump",
+                position: None,
+            });
+        }
+        if !was_grounded && session.state.motion.grounded {
+            play.write(sounds::PlaySound {
+                event: "land",
+                position: None,
+            });
+        }
         if output.charge_release.is_some() {
             play.write(sounds::PlaySound {
                 event: "fire",
