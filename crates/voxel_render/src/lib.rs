@@ -428,12 +428,16 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                     if ring.contains(&u32::MAX) {
                         continue;
                     }
-                    // Air sits on the side the edge leaves solid toward.
-                    let mut hint = Vec3::ZERO;
-                    hint[axis] = if d0 > 0 { 1.0 } else { -1.0 };
-                    let p = |i: usize| Vec3::from_array(mesh.positions[ring[i] as usize]);
-                    let geometric = (p(2) - p(0)).cross(p(3) - p(1));
-                    if geometric.dot(hint) > 0.0 {
+                    // The canonical ring order winds `+axis`; the surface
+                    // normal points from solid to air, so an edge whose start
+                    // lattice point is solid (`d0 > 0`) faces `+axis`. The
+                    // field decides the winding, not the geometry: the
+                    // roughness displacement makes quads non-planar, so a
+                    // geometric normal can disagree with the surface and flip
+                    // a triangle into a backface-culled hole. Deciding both
+                    // triangles together keeps the quad manifold (a
+                    // per-triangle choice can emit a bowtie).
+                    if d0 > 0 {
                         mesh.indices
                             .extend([ring[0], ring[1], ring[2], ring[0], ring[2], ring[3]]);
                     } else {
@@ -535,6 +539,12 @@ fn initialize_material(
         base: StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 0.95,
+            // Opaque terrain viewed from outside: the roughness displacement
+            // makes surface-nets quads non-planar, so a triangle's geometric
+            // normal can point into the hill even when its quad faces out.
+            // Culling would drop it as a hole; the depth test already hides
+            // the far side, so render both faces.
+            cull_mode: None,
             ..default()
         },
         extension: TerrainExtension {
@@ -2128,6 +2138,57 @@ mod tests {
             "{} interior dangling edges at the seam: {:?}",
             interior.len(),
             interior
+        );
+    }
+
+    /// Every interior edge must be traversed once in each direction: a quad
+    /// whose two triangles disagree (a "bowtie") is non-manifold and renders
+    /// as a folded/missing quad. The winding is chosen from the density field
+    /// (the surface normal points from solid to air), so both triangles of a
+    /// quad always agree.
+    #[test]
+    fn terrain_mesh_is_manifold() {
+        let generator = TerrainGenerator::default();
+        let seed = 7;
+        let mut bowties = 0;
+        let mut total_quads = 0;
+        for cz in -3..3 {
+            for cx in -3..3 {
+                let coord = IVec3::new(cx, 1, cz);
+                let mut world = VoxelWorld::default();
+                for dz in -1..=1 {
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let c = coord + IVec3::new(dx, dy, dz);
+                            world.insert(c, Chunk::generate_with(c, seed, &generator));
+                        }
+                    }
+                }
+                let mesh = surface_nets(&world.neighborhood(coord));
+                total_quads += mesh.indices.len() / 6;
+                // Manifold: each edge traversed once in each direction.
+                let mut dir: HashMap<(u32, u32), (i32, i32)> = HashMap::new();
+                for tri in mesh.indices.chunks_exact(3) {
+                    for k in 0..3 {
+                        let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                        let e = dir.entry((a.min(b), a.max(b))).or_default();
+                        if a < b {
+                            e.0 += 1;
+                        } else {
+                            e.1 += 1;
+                        }
+                    }
+                }
+                for &(fwd, back) in dir.values() {
+                    if fwd + back == 2 && (fwd == 2 || back == 2) {
+                        bowties += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            bowties, 0,
+            "{bowties} non-manifold edges across {total_quads} terrain quads"
         );
     }
 
