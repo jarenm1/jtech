@@ -235,9 +235,48 @@ pub struct MeleeWeaponInfo {
     /// How the weapon's basic attack resolves: melee swing, charged ranged
     /// shot, or an admin projectile that fires on the edge.
     pub attack_kind: controller::BasicAttackKind,
+    /// Ticks a ranged weapon draws before firing; 0 for other kinds.
+    pub charge_ticks: u16,
     /// Asset path relative to the owning package's `assets/` dir, if the weapon
     /// ships a 3D model.
     pub model: Option<String>,
+}
+
+impl MeleeWeaponInfo {
+    /// The basic attack this weapon grants its holder.
+    pub fn basic_attack(&self) -> controller::BasicAttack {
+        controller::BasicAttack {
+            kind: self.attack_kind,
+            cooldown_ticks: self.cooldown_ticks.min(u32::from(u16::MAX)) as u16,
+            charge_ticks: self.charge_ticks,
+        }
+    }
+}
+
+/// Ticks a ranged weapon draws before firing; shared so client prediction and
+/// the server agree on the charge length.
+pub const DRAW_TICKS: u16 = 60;
+
+/// The basic attack a held item grants, from the replicated weapon table and the
+/// bow package's rate. Shared so client prediction and the server agree on the
+/// cadence, the charge and the movement slow it implies.
+pub fn basic_attack_for(
+    item: u32,
+    weapons: &[MeleeWeaponInfo],
+    bow_shots_per_second: u32,
+) -> Option<controller::BasicAttack> {
+    if item == EXPLOSIVE_BOW_ITEM {
+        let rate = bow_shots_per_second.max(1);
+        return Some(controller::BasicAttack {
+            kind: controller::BasicAttackKind::Admin,
+            cooldown_ticks: (60 / rate).max(1) as u16,
+            charge_ticks: 0,
+        });
+    }
+    weapons
+        .iter()
+        .find(|weapon| weapon.item == item)
+        .map(MeleeWeaponInfo::basic_attack)
 }
 
 /// One file a loaded package ships under its `assets/` directory. `hash`

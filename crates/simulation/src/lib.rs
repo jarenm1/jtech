@@ -280,15 +280,12 @@ fn basic_attack_for(packages: &game_packages::PackageHost, item: u32) -> BasicAt
         cooldown_ticks: spec.cooldown_ticks.min(u32::from(u16::MAX)) as u16,
         // A ranged weapon draws before firing; a melee swing fires on the edge.
         charge_ticks: if kind == BasicAttackKind::Ranged {
-            DRAW_TICKS
+            protocol::DRAW_TICKS
         } else {
             0
         },
     }
 }
-
-/// Ticks a ranged weapon draws before firing.
-const DRAW_TICKS: u16 = 60;
 
 /// Character collider ids start above the loose-body range so a character can
 /// never be confused with a physics body.

@@ -48,6 +48,11 @@ impl Simulation {
                         } else {
                             controller::BasicAttackKind::Melee
                         },
+                        charge_ticks: if weapon.ranged.is_some() {
+                            protocol::DRAW_TICKS
+                        } else {
+                            0
+                        },
                         model: weapon.model.clone(),
                     })
                     .collect();
