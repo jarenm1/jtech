@@ -257,6 +257,12 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
             }
         }
     }
+    // World origin of this chunk. Vertices are solved in world space and only
+    // converted to local at the end: a halo cell is meshed by every chunk whose
+    // -1/32 layer reaches it, and those chunks' local frames differ by a
+    // multiple of `CHUNK_SIZE`, so solving in local coordinates rounds the same
+    // world vertex to different floats and splits the seam.
+    let base = (neighborhood.coord * CHUNK_SIZE).as_vec3();
 
     // Corner (dx,dy,dz) is bit dx | dy<<1 | dz<<2; the 12 edges pair corners
     // differing in exactly one bit.
@@ -311,7 +317,8 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                         continue;
                     }
                     let t = da / (da - db);
-                    let crossing = corner(c, a).as_vec3().lerp(corner(c, b).as_vec3(), t);
+                    let crossing = (base + corner(c, a).as_vec3())
+                        .lerp(base + corner(c, b).as_vec3(), t);
                     position += crossing;
                     crossings += 1.0;
                     let distance = (crossing - position / crossings).length_squared();
@@ -322,7 +329,7 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                 }
                 position /= crossings;
                 // Trilinear gradient at the vertex; the normal points at air.
-                let t = position - c.as_vec3();
+                let t = position - (base + c.as_vec3());
                 let (tx, ty, tz) = (t.x, t.y, t.z);
                 let wy = |i: usize| if i & 2 == 2 { ty } else { 1.0 - ty };
                 let wz = |i: usize| if i & 4 == 4 { tz } else { 1.0 - tz };
@@ -345,7 +352,8 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                     if d[i] <= 0 || i == surface_corner {
                         continue;
                     }
-                    let distance = (position - corner(c, i).as_vec3()).length_squared();
+                    let distance =
+                        (position - (base + corner(c, i).as_vec3())).length_squared();
                     if second.is_none_or(|(_, best)| distance < best) {
                         second = Some((i as u8, distance));
                     }
@@ -354,7 +362,7 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                     Some((corner_index, second_distance)) => {
                         let other = neighborhood.block(corner(c, corner_index as usize));
                         let first_distance = (position
-                            - corner(c, surface_corner).as_vec3())
+                            - (base + corner(c, surface_corner).as_vec3()))
                         .length_squared();
                         // Weight of the secondary material: 0.4 when the two
                         // corners are equidistant, fading to 0 as the second
@@ -372,10 +380,9 @@ pub fn surface_nets(neighborhood: &ChunkNeighborhood) -> MeshData {
                 // bump is sub-voxel, so recomputing the gradient buys nothing).
                 // The heightfield is a pure function of world position, so a
                 // seam vertex shifts identically on both sides of a boundary.
-                let world = (neighborhood.coord * CHUNK_SIZE).as_vec3() + position;
-                position += normal * (noise2d(world.x, world.z) * roughness(material));
+                position += normal * (noise2d(position.x, position.z) * roughness(material));
                 vert_index[cell(c)] = mesh.positions.len() as u32;
-                mesh.positions.push(position.to_array());
+                mesh.positions.push((position - base).to_array());
                 mesh.normals.push(normal.to_array());
                 mesh.colors.push(color);
                 mesh.uvs.push([material as f32, second_material as f32]);
@@ -1695,6 +1702,433 @@ mod tests {
                 .sum();
             assert!((b - a).cross(c - a).dot(normal_sum) > 0.0);
         }
+    }
+
+    /// A half-solid chunk with every neighbor missing must still mesh to a
+    /// closed surface: the boundary fallback caps the -faces, so no triangle
+    /// edge is left dangling. A dangling edge is a hole where a quad is
+    /// missing.
+    #[test]
+    fn missing_neighbors_leave_no_hole_in_the_surface() {
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, chunk_with(|p| if p.y < 16 { STONE } else { AIR }));
+        let mesh = surface_nets(&world.neighborhood(IVec3::ZERO));
+        let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
+        for tri in mesh.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let dangling: Vec<_> = edges
+            .iter()
+            .filter(|&(_, &count)| count == 1)
+            .map(|(&(a, b), _)| {
+                (
+                    Vec3::from_array(mesh.positions[a as usize]),
+                    Vec3::from_array(mesh.positions[b as usize]),
+                )
+            })
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "{} dangling edges (holes): {:?}",
+            dangling.len(),
+            dangling
+        );
+    }
+
+    /// With a full neighborhood, the chunk must emit exactly one quad for
+    /// every sign-changing lattice edge whose start lattice point it owns.
+    #[test]
+    fn real_terrain_chunk_emits_every_owned_quad() {
+        let generator = TerrainGenerator::default();
+        let seed = 7;
+        let coord = IVec3::new(0, 1, 0);
+        let mut world = VoxelWorld::default();
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let c = coord + IVec3::new(dx, dy, dz);
+                    world.insert(c, Chunk::generate_with(c, seed, &generator));
+                }
+            }
+        }
+        let mesh = surface_nets(&world.neighborhood(coord));
+        let base = coord * CHUNK_SIZE;
+        let mut expected = 0usize;
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    for axis in 0..3 {
+                        let mut step = IVec3::ZERO;
+                        step[axis] = 1;
+                        let p = IVec3::new(x, y, z);
+                        let d0 = world.density(base + p).unwrap();
+                        let d1 = world.density(base + p + step).unwrap();
+                        if (d0 > 0) != (d1 > 0) {
+                            expected += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mesh.indices.len() / 6,
+            expected,
+            "quad count mismatch for a full neighborhood"
+        );
+    }
+
+    /// With only the `-x` neighbor missing, the fallback must still emit a
+    /// quad for every sign-changing x-edge it owns (start lattice x = -1,
+    /// perpendicular coords >= 0), on top of the chunk's own edges.
+    #[test]
+    fn missing_x_neighbor_fallback_emits_every_owned_quad() {
+        let generator = TerrainGenerator::default();
+        let seed = 7;
+        let coord = IVec3::new(0, 1, 0);
+        let mut world = VoxelWorld::default();
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == -1 {
+                        continue;
+                    }
+                    let c = coord + IVec3::new(dx, dy, dz);
+                    world.insert(c, Chunk::generate_with(c, seed, &generator));
+                }
+            }
+        }
+        let mesh = surface_nets(&world.neighborhood(coord));
+        let base = coord * CHUNK_SIZE;
+        let mut expected = 0usize;
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    for axis in 0..3 {
+                        let mut step = IVec3::ZERO;
+                        step[axis] = 1;
+                        let p = IVec3::new(x, y, z);
+                        let d0 = world.density(base + p).unwrap();
+                        let d1 = world.density(base + p + step).unwrap();
+                        if (d0 > 0) != (d1 > 0) {
+                            expected += 1;
+                        }
+                    }
+                }
+                // Fallback: x-edges starting at local x = -1.
+                let p = IVec3::new(-1, y, z);
+                let d0 = world.density(base + p).unwrap_or(voxel_world::DENSITY_AIR);
+                let d1 = world.density(base + p + IVec3::X).unwrap();
+                if (d0 > 0) != (d1 > 0) {
+                    expected += 1;
+                }
+            }
+        }
+        assert_eq!(
+            mesh.indices.len() / 6,
+            expected,
+            "fallback quad count mismatch with the -x neighbor missing"
+        );
+    }
+
+    /// `-x` missing while `-y` is present: the fallback's ring guard skips
+    /// edges whose perpendicular coordinate is -1, so a sign-changing edge at
+    /// the corner may get no quad. Check the present region stays closed.
+    #[test]
+    fn missing_x_with_present_y_leaves_no_hole() {
+        let mut world = VoxelWorld::default();
+        world.insert(IVec3::ZERO, chunk_with(|p| if p.y < 16 { STONE } else { AIR }));
+        world.insert(IVec3::NEG_Y, chunk_with(|_| STONE));
+        // Combine the center chunk and its present -y neighbor so the seam
+        // between them is closed; any remaining dangling edge is a real hole.
+        let mut mesh = MeshData::default();
+        for (coord, offset) in [(IVec3::ZERO, 0.0f32), (IVec3::NEG_Y, -32.0)] {
+            let part = surface_nets(&world.neighborhood(coord));
+            let base = mesh.positions.len() as u32;
+            mesh.positions
+                .extend(part.positions.iter().map(|p| [p[0], p[1] + offset, p[2]]));
+            mesh.normals.extend(part.normals.iter().copied());
+            mesh.colors.extend(part.colors.iter().copied());
+            mesh.uvs.extend(part.uvs.iter().copied());
+            mesh.indices.extend(part.indices.iter().map(|i| i + base));
+        }
+        let mut edges: HashMap<([i64; 3], [i64; 3]), i32> = HashMap::new();
+        let key = |i: u32| {
+            let p = mesh.positions[i as usize];
+            [
+                (p[0] * 256.0).round() as i64,
+                (p[1] * 256.0).round() as i64,
+                (p[2] * 256.0).round() as i64,
+            ]
+        };
+        for tri in mesh.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (key(tri[k]), key(tri[(k + 1) % 3]));
+                let edge = if a <= b { (a, b) } else { (b, a) };
+                *edges.entry(edge).or_default() += 1;
+            }
+        }
+        let present = |p: [i64; 3]| {
+            p[0] < 0 && p[1] > -192 && p[2] > 128 && p[2] < 8064
+        };
+        let holes: Vec<_> = edges
+            .iter()
+            .filter(|&(_, &count)| count == 1)
+            .filter(|&(&(a, b), _)| present(a) && present(b))
+            .map(|(&(a, b), _)| (a, b))
+            .collect();
+        assert!(
+            holes.is_empty(),
+            "{} dangling edges in the present region: {:?}",
+            holes.len(),
+            holes
+        );
+    }
+
+    /// A real terrain chunk with a full neighborhood must have no dangling
+    /// edge strictly inside it: an interior hole is a missing quad.
+    #[test]
+    fn real_terrain_chunk_has_no_interior_hole() {
+        let generator = TerrainGenerator::default();
+        let seed = 7;
+        let coord = IVec3::new(0, 1, 0);
+        let mut world = VoxelWorld::default();
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let c = coord + IVec3::new(dx, dy, dz);
+                    world.insert(c, Chunk::generate_with(c, seed, &generator));
+                }
+            }
+        }
+        let mesh = surface_nets(&world.neighborhood(coord));
+        let key = |i: u32| {
+            let p = mesh.positions[i as usize];
+            [
+                (p[0] * 256.0).round() as i64,
+                (p[1] * 256.0).round() as i64,
+                (p[2] * 256.0).round() as i64,
+            ]
+        };
+        let mut edges: HashMap<([i64; 3], [i64; 3]), i32> = HashMap::new();
+        for tri in mesh.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (key(tri[k]), key(tri[(k + 1) % 3]));
+                let edge = if a <= b { (a, b) } else { (b, a) };
+                *edges.entry(edge).or_default() += 1;
+            }
+        }
+        let inside = |p: [i64; 3]| {
+            p.iter().all(|&c| c > 256 && c < 7936)
+        };
+        let holes: Vec<_> = edges
+            .iter()
+            .filter(|&(_, &count)| count == 1)
+            .filter(|&(&(a, b), _)| inside(a) && inside(b))
+            .map(|(&(a, b), _)| (a, b))
+            .collect();
+        assert!(
+            holes.is_empty(),
+            "{} interior dangling edges: {:?}",
+            holes.len(),
+            holes
+        );
+    }
+
+    /// Fuzz: for many random subsets of present neighbors, combine every
+    /// present chunk's mesh and require no dangling edge inside the present
+    /// region. A dangling edge there is a hole where a quad was dropped.
+    #[test]
+    fn random_neighbor_subsets_leave_no_hole() {
+        let generator = TerrainGenerator::default();
+        let seed = 7;
+        let coord = IVec3::new(0, 1, 0);
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for round in 0..64 {
+            let mut present = Vec::new();
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if next() % 3 != 0 {
+                            present.push(coord + IVec3::new(dx, dy, dz));
+                        }
+                    }
+                }
+            }
+            if !present.contains(&coord) {
+                present.push(coord);
+            }
+            let mut world = VoxelWorld::default();
+            for &c in &present {
+                world.insert(c, Chunk::generate_with(c, seed, &generator));
+            }
+            let mut mesh = MeshData::default();
+            let mut origins: Vec<IVec3> = Vec::new();
+            for &c in &present {
+                let part = surface_nets(&world.neighborhood(c));
+                let base = mesh.positions.len() as u32;
+                let off = (c - coord) * CHUNK_SIZE;
+                mesh.positions.extend(part.positions.iter().map(|p| {
+                    [
+                        p[0] + off.x as f32,
+                        p[1] + off.y as f32,
+                        p[2] + off.z as f32,
+                    ]
+                }));
+                origins.extend(std::iter::repeat(c).take(part.positions.len()));
+                mesh.indices.extend(part.indices.iter().map(|i| i + base));
+            }
+            // Diagnostic: near-duplicate vertices computed by different chunks.
+            {
+                let mut by_key: HashMap<[i64; 3], Vec<(IVec3, [f32; 3])>> = HashMap::new();
+                for (i, &p) in mesh.positions.iter().enumerate() {
+                    let k = [
+                        (p[0] * 64.0).round() as i64,
+                        (p[1] * 64.0).round() as i64,
+                        (p[2] * 64.0).round() as i64,
+                    ];
+                    by_key.entry(k).or_default().push((origins[i], p));
+                }
+                for (k, v) in &by_key {
+                    for a in 0..v.len() {
+                        for b in a + 1..v.len() {
+                            if v[a].0 == v[b].0 {
+                                continue;
+                            }
+                            let d = ((v[a].1[0] - v[b].1[0]).powi(2)
+                                + (v[a].1[1] - v[b].1[1]).powi(2)
+                                + (v[a].1[2] - v[b].1[2]).powi(2))
+                            .sqrt();
+                            if d > 0.0 && d < 0.05 {
+                                println!(
+                                    "round {round} near-dup d={d:.4} key={k:?}: {:?} {:?} vs {:?} {:?}",
+                                    v[a].0, v[a].1, v[b].0, v[b].1
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let key = |i: u32| {
+                let p = mesh.positions[i as usize];
+                [
+                    (p[0] * 256.0).round() as i64,
+                    (p[1] * 256.0).round() as i64,
+                    (p[2] * 256.0).round() as i64,
+                ]
+            };
+            let mut edges: HashMap<([i64; 3], [i64; 3]), i32> = HashMap::new();
+            for tri in mesh.indices.chunks_exact(3) {
+                for k in 0..3 {
+                    let (a, b) = (key(tri[k]), key(tri[(k + 1) % 3]));
+                    let edge = if a <= b { (a, b) } else { (b, a) };
+                    *edges.entry(edge).or_default() += 1;
+                }
+            }
+            // A vertex is in the present region if its chunk is loaded.
+            let loaded = |p: [i64; 3]| {
+                let cell = [
+                    (p[0] as f32 / 256.0).floor() as i32,
+                    (p[1] as f32 / 256.0).floor() as i32,
+                    (p[2] as f32 / 256.0).floor() as i32,
+                ];
+                let c = coord
+                    + IVec3::new(
+                        cell[0].div_euclid(CHUNK_SIZE),
+                        cell[1].div_euclid(CHUNK_SIZE),
+                        cell[2].div_euclid(CHUNK_SIZE),
+                    );
+                present.contains(&c)
+            };
+            let mut key_origins: HashMap<[i64; 3], Vec<IVec3>> = HashMap::new();
+            for (i, _) in mesh.positions.iter().enumerate() {
+                key_origins.entry(key(i as u32)).or_default().push(origins[i]);
+            }
+            let holes: Vec<_> = edges
+                .iter()
+                .filter(|&(_, &count)| count == 1)
+                .filter(|&(&(a, b), _)| loaded(a) && loaded(b))
+                .map(|(&(a, b), _)| {
+                    let mut oa = key_origins[&a].clone();
+                    oa.sort_by_key(|v| (v.x, v.y, v.z));
+                    oa.dedup();
+                    let mut ob = key_origins[&b].clone();
+                    ob.sort_by_key(|v| (v.x, v.y, v.z));
+                    ob.dedup();
+                    (a, b, oa, ob)
+                })
+                .collect();
+            assert!(
+                holes.is_empty(),
+                "round {round}: {} dangling edges in the present region: {:?}\npresent: {:?}",
+                holes.len(),
+                &holes[..holes.len().min(8)],
+                present
+            );
+        }
+    }
+
+    /// Two adjacent half-solid chunks, all other neighbors missing: the
+    /// combined mesh must have no dangling edge in its interior. A dangling
+    /// interior edge is a hole where the seam dropped a quad.
+    #[test]
+    fn adjacent_chunks_leave_no_interior_hole_at_the_seam() {
+        let mut world = VoxelWorld::default();
+        let half = || chunk_with(|p| if p.y < 16 { STONE } else { AIR });
+        world.insert(IVec3::ZERO, half());
+        world.insert(IVec3::X, half());
+        let mut combined = MeshData::default();
+        for (coord, offset) in [(IVec3::ZERO, 0.0f32), (IVec3::X, 32.0)] {
+            let mesh = surface_nets(&world.neighborhood(coord));
+            let base = combined.positions.len() as u32;
+            combined.positions.extend(
+                mesh.positions
+                    .iter()
+                    .map(|p| [p[0] + offset, p[1], p[2]]),
+            );
+            combined.normals.extend(mesh.normals.iter().copied());
+            combined.colors.extend(mesh.colors.iter().copied());
+            combined.uvs.extend(mesh.uvs.iter().copied());
+            combined
+                .indices
+                .extend(mesh.indices.iter().map(|i| i + base));
+        }
+        let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
+        for tri in combined.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let interior: Vec<_> = edges
+            .iter()
+            .filter(|&(_, &count)| count == 1)
+            .filter(|&(&(a, b), _)| {
+                let inside = |i: u32| {
+                    let p = combined.positions[i as usize];
+                    p[0] > 1.0 && p[0] < 63.0 && p[1] > 1.0 && p[1] < 15.0 && p[2] > 1.0 && p[2] < 31.0
+                };
+                inside(a) && inside(b)
+            })
+            .map(|(&(a, b), _)| {
+                (
+                    Vec3::from_array(combined.positions[a as usize]),
+                    Vec3::from_array(combined.positions[b as usize]),
+                )
+            })
+            .collect();
+        assert!(
+            interior.is_empty(),
+            "{} interior dangling edges at the seam: {:?}",
+            interior.len(),
+            interior
+        );
     }
 
     #[test]
