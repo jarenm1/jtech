@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub use motor::step_character;
 pub use physics::{CollisionShape, DynamicCollider, FIXED_DT, PlayerState};
 pub use player::{PlayerInput, step_character_player, step_player, step_player_with_bodies};
+pub use motor::resolve;
 pub use plugin::{ControllerPlugin, ControllerSet, ObservedBodies};
 
 /// Held body-relative axes: +X right, +Y forward (-Z at yaw zero).
@@ -186,8 +187,9 @@ impl MovementProfile {
     }
 }
 
-/// Exclusive locomotion/action mode. Ground and Air are derived from support;
-/// Cast, Dash and Blink are timed actions that lock input.
+/// Exclusive locomotion/action mode, derived by the motor each tick from the
+/// support and the in-progress timed actions. Never set by callers: it is an
+/// observation, not an input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
     #[default]
@@ -195,7 +197,6 @@ pub enum Mode {
     Air,
     Cast,
     Dash,
-    Blink,
 }
 
 /// Status effect kinds. Knockback stays physics-owned; these gate action and
@@ -435,6 +436,54 @@ impl SpeedModifiers {
     }
 }
 
+/// A discrete transition the motor applies this tick, derived purely from the
+/// intent and the current state. `resolve` has no side effects, so the same
+/// inputs always produce the same transitions: they are testable in isolation
+/// and replay exactly. This is also the action space a scripted or RL policy
+/// drives, one level below `CharacterIntent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transition {
+    /// A melee or admin weapon fires on the press edge.
+    Swing,
+    /// A ranged weapon starts or continues its draw.
+    Draw,
+    /// A ranged weapon fires at full charge.
+    Fire { charge: u16 },
+    /// A ranged weapon's draw is cancelled before it reaches full charge.
+    CancelDraw,
+    /// An ability slot resolves immediately.
+    FireAbility { slot: u8, aim: Vec2 },
+    /// An ability slot begins a cast.
+    BeginCast { slot: u8, aim: Vec2 },
+    /// An in-progress cast completes.
+    CompleteCast { slot: u8, aim: Vec2 },
+    /// A hard status interrupts an in-progress cast.
+    InterruptCast,
+    /// A hard status interrupts an in-progress dash.
+    InterruptDash,
+    /// An in-progress dash reaches its last tick.
+    EndDash,
+}
+
+/// At most four transitions per tick, in application order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Transitions {
+    entries: [Option<Transition>; 4],
+}
+impl Transitions {
+    pub fn push(&mut self, transition: Transition) {
+        if let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some(transition);
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = Transition> + '_ {
+        self.entries.iter().flatten().copied()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+}
+
 /// Per-tick motor output: the horizontal velocity the character attempted, the
 /// aim of each ability slot that resolved this tick, and whether the basic
 /// attack fired, for the host to apply effects to.
@@ -458,6 +507,7 @@ pub struct MotorOutput {
 pub struct CharacterState {
     pub motion: physics::KinematicState,
     pub yaw: f32,
+    /// Derived each tick by the motor; an observation, not an input.
     pub mode: Mode,
     pub statuses: StatusList,
     /// Ticks of coyote time remaining after leaving the ground.
