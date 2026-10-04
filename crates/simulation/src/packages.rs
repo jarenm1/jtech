@@ -47,6 +47,7 @@ impl Simulation {
                         damage: weapon.spec.damage,
                         cooldown_ticks: weapon.spec.cooldown_ticks,
                         knockback: weapon.spec.knockback,
+                        ranged: weapon.ranged.is_some(),
                         model: weapon.model.clone(),
                     })
                     .collect();

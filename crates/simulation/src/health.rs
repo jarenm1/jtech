@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(sim.players[&1].life, 1);
         assert_eq!(sim.player_health(1), Some(Health::default()));
         // The package loadout is re-granted after death scattered the old gear.
-        for item in [7u32, 8, 9] {
+        for item in [7u32, 8] {
             assert_eq!(sim.players[&1].inventory.count(item), 1);
         }
         let player = &sim.players[&1];

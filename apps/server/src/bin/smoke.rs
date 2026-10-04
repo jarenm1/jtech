@@ -1010,7 +1010,7 @@ fn main() -> Result<()> {
     )?;
     // Melee package: the loadout reached the welcome inventory and the weapon
     // table replicated with the package set.
-    for item in [7u32, 8, 9] {
+    for item in [7u32, 8] {
         // check_health killed first: its gear scattered and may have been
         // re-collected, so counts can exceed the granted one.
         require(
@@ -1024,7 +1024,9 @@ fn main() -> Result<()> {
             .last()
             .ok_or("no package message received")?;
         require(
-            weapons.len() == 3 && weapons.iter().any(|w| w.item == 8 && w.damage == 30),
+            weapons.len() == 2
+                && weapons.iter().any(|w| w.item == 7 && w.damage == 12)
+                && weapons.iter().any(|w| w.item == 8 && w.ranged),
             "melee weapon table did not replicate",
         )?;
     }
@@ -1054,8 +1056,8 @@ fn main() -> Result<()> {
     }
     // Melee: walk to the training dummy, swing until it dies, watch it respawn.
     // Aim with the authoritative position: the server resolves swings there.
-    // Swing the granted war hammer: ownership is required for the authored spec.
-    first.selected = 8;
+    // Swing the granted sword: ownership is required for the authored spec.
+    first.selected = 7;
     let dummy = *first
         .actors
         .keys()

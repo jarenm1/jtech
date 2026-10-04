@@ -28,6 +28,24 @@ use voxel_world::VoxelWorld;
 
 /// Fixed ticks a dead actor waits before respawning at its spawn point.
 const ACTOR_RESPAWN_TICKS: u64 = 300;
+
+/// A ranged weapon's impact when it authors no blast: a light hit rather than
+/// an explosion. Radius and window stay inside the host's validated bounds.
+const PLAIN_ARROW_BLAST: game_packages::BlastSpec = game_packages::BlastSpec {
+    radius: 1.0,
+    energy: 800.0,
+    player_speed: 2.0,
+    absorbed_fraction: 0.5,
+    load_window: 0.02,
+};
+
+/// Fallback flight for a ranged weapon that somehow carries no spec.
+const PLAIN_PROJECTILE: game_packages::ProjectileSpec = game_packages::ProjectileSpec {
+    speed: 40.0,
+    gravity: 9.0,
+    max_travel: 64.0,
+    max_age_ticks: 600,
+};
 /// High bit separates actor ids from player ids inside swing target lists.
 const ACTOR_TARGET: u64 = 1 << 63;
 /// Bound on the replicated actor set.
@@ -588,7 +606,20 @@ impl Simulation {
             let origin = player.state.motion.position + Vec3::Y * EYE_HEIGHT;
             let direction = look_direction(player.input.yaw, player.input.pitch);
             if attack.kind == BasicAttackKind::Ranged {
-                self.spawn_projectile(origin, direction, Some(id));
+                // The explosive bow uses its package's authored shot; a ranged
+                // weapon carries its own flight spec and a plain impact.
+                let (projectile, blast) = if held == protocol::EXPLOSIVE_BOW_ITEM {
+                    match self.packages.fire(protocol::BowPower::Standard) {
+                        Ok(shot) => (shot.projectile, shot.impact()),
+                        Err(_) => continue,
+                    }
+                } else {
+                    (
+                        melee.ranged(held).unwrap_or(PLAIN_PROJECTILE),
+                        PLAIN_ARROW_BLAST,
+                    )
+                };
+                self.spawn_projectile(origin, direction, projectile, blast, Some(id));
                 continue;
             }
             let spec = melee.spec(held).unwrap_or(gameplay::combat::MELEE_HANDS);

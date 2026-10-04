@@ -1,14 +1,17 @@
 //! Authoritative point-projectile flight with swept terrain and loose-cube hits.
-use game_packages::Shot;
+use game_packages::{BlastSpec, ProjectileSpec};
 use glam::Vec3;
-#[cfg(test)]
-use protocol::BowPower;
-use protocol::{ArrowSnapshot, PhysicsBodySnapshot};
+use protocol::{ArrowSnapshot, BowPower, PhysicsBodySnapshot};
 use voxel_world::VoxelWorld;
 
 pub(super) struct Arrow {
     pub snapshot: ArrowSnapshot,
-    pub shot: Shot,
+    /// Flight parameters, independent of the package that authored them.
+    pub projectile: ProjectileSpec,
+    /// Blast applied on impact; a light spec makes a plain arrow.
+    pub blast: BlastSpec,
+    /// Bow preset this arrow was fired with, when it came from the bow package.
+    pub power: Option<BowPower>,
     /// Player id that fired the arrow; kept on queued detonations for event
     /// attribution.
     pub shooter: Option<u64>,
@@ -32,14 +35,34 @@ impl Arrow {
         Self::from_shot(id, origin, direction, shot)
     }
 
-    pub fn from_shot(id: u32, origin: Vec3, direction: Vec3, shot: Shot) -> Self {
+    pub fn from_shot(
+        id: u32,
+        origin: Vec3,
+        direction: Vec3,
+        shot: game_packages::Shot,
+    ) -> Self {
+        let mut arrow = Self::new_arrow(id, origin, direction, shot.projectile, shot.impact());
+        arrow.power = Some(shot.power);
+        arrow
+    }
+
+    /// Build an arrow from explicit flight and blast parameters.
+    pub fn new_arrow(
+        id: u32,
+        origin: Vec3,
+        direction: Vec3,
+        projectile: ProjectileSpec,
+        blast: BlastSpec,
+    ) -> Self {
         Self {
             snapshot: ArrowSnapshot {
                 id,
                 position: origin,
-                velocity: direction * shot.projectile.speed,
+                velocity: direction * projectile.speed,
             },
-            shot,
+            projectile,
+            blast,
+            power: None,
             shooter: None,
             age: 0,
             traveled: 0.0,
@@ -57,7 +80,7 @@ impl Arrow {
         ready: bool,
     ) -> Flight {
         self.age += 1;
-        if self.age > self.shot.projectile.max_age_ticks {
+        if self.age > self.projectile.max_age_ticks {
             return Flight::Expired;
         }
         self.pending_steps = (self.pending_steps + 1).min(3);
@@ -73,7 +96,7 @@ impl Arrow {
     }
 
     fn step(&mut self, world: &VoxelWorld, bodies: &[PhysicsBodySnapshot]) -> Flight {
-        if self.traveled >= self.shot.projectile.max_travel {
+        if self.traveled >= self.projectile.max_travel {
             return Flight::Expired;
         }
         let start = self.snapshot.position;
@@ -81,11 +104,11 @@ impl Arrow {
         if world.block(start.floor().as_ivec3()).is_none() {
             return Flight::Expired;
         }
-        self.snapshot.velocity.y -= self.shot.projectile.gravity * physics::FIXED_DT;
+        self.snapshot.velocity.y -= self.projectile.gravity * physics::FIXED_DT;
         let displacement = self.snapshot.velocity * physics::FIXED_DT;
         let distance = displacement
             .length()
-            .min(self.shot.projectile.max_travel - self.traveled);
+            .min(self.projectile.max_travel - self.traveled);
         let Some(direction) = displacement.try_normalize() else {
             // Authored gravity can bring an upward shot momentarily to rest.
             return Flight::Flying;
@@ -209,7 +232,7 @@ mod tests {
                 break;
             }
         }
-        assert!(arrow.traveled >= arrow.shot.projectile.max_travel);
+        assert!(arrow.traveled >= arrow.projectile.max_travel);
         let mut arrow = Arrow::new(2, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
         assert!(matches!(arrow.step(&world, &[]), Flight::Expired));
     }
@@ -231,7 +254,7 @@ mod tests {
         assert_eq!(arrow.snapshot.position.x, 2.9);
         assert!(matches!(arrow.tick(&world, &[], true), Flight::Flying));
         assert!((arrow.snapshot.position.x - 4.1).abs() < 0.001);
-        for _ in 0..arrow.shot.projectile.max_age_ticks {
+        for _ in 0..arrow.projectile.max_age_ticks {
             arrow.tick(&world, &[], false);
         }
         assert!(matches!(arrow.tick(&world, &[], false), Flight::Expired));
