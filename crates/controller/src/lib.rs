@@ -65,6 +65,8 @@ pub struct CharacterBody {
     pub shape: CollisionShape,
     /// Per-species ability table; empty slots mean the species has no ability.
     pub abilities: AbilityTable,
+    /// Held weapon's basic attack; `None` means no basic attack is available.
+    pub basic_attack: Option<BasicAttack>,
     mass: f32,
 }
 impl CharacterBody {
@@ -72,12 +74,18 @@ impl CharacterBody {
         (mass.is_finite() && (0.01..=100_000.0).contains(&mass)).then_some(Self {
             shape,
             abilities: AbilityTable::default(),
+            basic_attack: None,
             mass,
         })
     }
     /// Attach an ability table to this body.
     pub fn with_abilities(mut self, abilities: AbilityTable) -> Self {
         self.abilities = abilities;
+        self
+    }
+    /// Attach a basic attack to this body.
+    pub fn with_basic_attack(mut self, basic_attack: Option<BasicAttack>) -> Self {
+        self.basic_attack = basic_attack;
         self
     }
     pub fn mass(self) -> f32 {
@@ -89,6 +97,7 @@ impl Default for CharacterBody {
         Self {
             shape: CollisionShape::default(),
             abilities: AbilityTable::default(),
+            basic_attack: None,
             mass: physics::PLAYER_MASS,
         }
     }
@@ -360,13 +369,32 @@ pub struct Dash {
     pub speed: f32,
 }
 
-/// Per-tick motor output: the horizontal velocity the character attempted, and
-/// the aim of each ability slot that resolved this tick for the host to apply
-/// effects to.
+/// How a weapon's basic attack resolves. The host owns the effect; the motor
+/// owns the cooldown and the fired edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BasicAttackKind {
+    /// A raycast hit at melee reach.
+    Melee,
+    /// A travelling projectile along the aim.
+    Ranged,
+}
+
+/// The held weapon's basic attack: how it resolves and its cooldown. The host
+/// maps the held item to this; `None` means the character cannot basic-attack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BasicAttack {
+    pub kind: BasicAttackKind,
+    pub cooldown_ticks: u16,
+}
+
+/// Per-tick motor output: the horizontal velocity the character attempted, the
+/// aim of each ability slot that resolved this tick, and whether the basic
+/// attack fired, for the host to apply effects to.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MotorOutput {
     pub attempted: Vec2,
     pub fired: [Option<Vec2>; MAX_SLOTS],
+    pub basic_attack: bool,
 }
 
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.
@@ -389,6 +417,8 @@ pub struct CharacterState {
     pub cast: Option<Cast>,
     /// In-progress dash or blink, if any.
     pub dash: Option<Dash>,
+    /// Remaining cooldown ticks of the held weapon's basic attack.
+    pub basic_attack_cooldown: u16,
 }
 impl CharacterState {
     pub fn apply_impulse(&mut self, body: &CharacterBody, impulse: Vec3) {

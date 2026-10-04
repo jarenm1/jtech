@@ -1,4 +1,4 @@
-use controller::PlayerInput;
+use controller::{BasicAttack, BasicAttackKind, PlayerInput};
 mod active_terrain;
 mod actors;
 #[cfg(test)]
@@ -213,6 +213,7 @@ impl Plugin for SimulationPlugin {
                 collider_scratch: Vec::new(),
                 character_scratch: Vec::new(),
                 step_scratch: Vec::new(),
+                actor_attacks: Vec::new(),
                 terrain: self.terrain.lock().take().expect("plugin built once"),
                 scatter,
                 spawn,
@@ -254,6 +255,27 @@ impl Plugin for SimulationPlugin {
         }
     }
 }
+/// The held item's basic attack: melee weapons swing at their authored
+/// cooldown, the bow fires a projectile at its authored rate. Unregistered
+/// items (hands, blocks) swing the unarmed default.
+fn basic_attack_for(packages: &game_packages::PackageHost, item: u32) -> BasicAttack {
+    if item == protocol::EXPLOSIVE_BOW_ITEM {
+        let rate = packages.shots_per_second().max(1);
+        return BasicAttack {
+            kind: BasicAttackKind::Ranged,
+            cooldown_ticks: (60 / rate).max(1) as u16,
+        };
+    }
+    let spec = packages
+        .melee_table()
+        .spec(item)
+        .unwrap_or(gameplay::combat::MELEE_HANDS);
+    BasicAttack {
+        kind: BasicAttackKind::Melee,
+        cooldown_ticks: spec.cooldown_ticks.min(u32::from(u16::MAX)) as u16,
+    }
+}
+
 /// Character collider ids start above the loose-body range so a character can
 /// never be confused with a physics body.
 pub(crate) const CHARACTER_ID_BASE: u64 = 1 << 31;
@@ -332,8 +354,6 @@ struct Player {
     next_bow_time: u64,
     arrow_revision: Option<u64>,
     package_revision: Option<u64>,
-    /// Fixed tick when the next melee swing is allowed.
-    attack_ready: u64,
     inventory: Inventory,
     inventory_dirty: bool,
     /// Requested package assets waiting for paced transmission.
@@ -372,7 +392,6 @@ impl Player {
             arrow_revision: None,
             package_revision: None,
             inventory: Inventory::default(),
-            attack_ready: 0,
             inventory_dirty: false,
             asset_queue: VecDeque::new(),
         }
@@ -454,6 +473,8 @@ pub struct Simulation {
     character_scratch: Vec<physics::DynamicCollider>,
     /// Reused per-actor buffer of loose bodies plus other characters.
     step_scratch: Vec<physics::DynamicCollider>,
+    /// Actor ids whose basic attack fired this tick, resolved by `resolve_attacks`.
+    actor_attacks: Vec<u32>,
     /// Sparse exceptions survive chunk eviction and transfer across loose/grid ownership.
     damage: HashMap<IVec3, DamageState>,
     /// Targets whose [`DamageState::release`] is set, keyed `(y, z, x)` so
@@ -1302,7 +1323,9 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     // Every living character's AABB, so actors block and shove each other.
     let mut characters = std::mem::take(&mut sim.character_scratch);
     character_colliders(&sim.players, &sim.actors, None, 0.0, &mut characters);
-    for player in sim.players.values_mut() {
+    // Players whose basic attack fired this tick, resolved after the loop.
+    let mut basic_attacks: Vec<u64> = Vec::new();
+    for (&id, player) in sim.players.iter_mut() {
         if player.health.is_depleted() {
             // Dead players are frozen: no input movement, noclip, or GPU body push
             // until an explicit respawn restores a safe supported position.
@@ -1330,16 +1353,30 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 }
             };
             let previous = player.state;
+            // Registered weapons require ownership; hands, blocks and the bow
+            // fall back to their own basic attack.
+            let held = player.input.selected;
+            let basic_attack = (sim
+                .packages
+                .melee_table()
+                .spec(held)
+                .is_none_or(|_| player.inventory.count(held) > 0))
+            .then(|| basic_attack_for(&sim.packages, held));
             // The same pass reports the horizontal velocity attempted before
             // loose bodies clamped the sweep; the GPU resolves that kinematic
             // push against material mass and terrain.
-            let attempted = controller::step_character_player(
+            let output = controller::step_character_player(
                 &world,
                 &mut player.state,
+                basic_attack,
                 &input,
                 FIXED_DT,
                 bodies,
             );
+            let attempted = output.attempted;
+            if output.basic_attack {
+                basic_attacks.push(id);
+            }
             player.body_push_velocity =
                 Vec3::new(attempted.x, player.state.motion.velocity.y, attempted.y);
             if player.state.motion.noclip {
@@ -1378,7 +1415,7 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     sim.advance_actors(&world, &bodies, &characters);
     sim.collider_scratch = colliders;
     sim.character_scratch = characters;
-    sim.resolve_attacks(&world);
+    sim.resolve_attacks(&world, &basic_attacks);
     for (id, message) in incoming.reliable {
         match message {
             ClientMessage::Edit {
@@ -1792,6 +1829,60 @@ mod tests {
         put_resources(&mut app, world, sim);
     }
 
+    /// Drive one player's motor tick and resolve any basic attack it fired,
+    /// mirroring the server's ownership check and effect resolution.
+    fn swing(sim: &mut Simulation, world: &VoxelWorld, id: u64) {
+        let mut fired = Vec::new();
+        if let Some(player) = sim.players.get_mut(&id) {
+            let input = player.input;
+            let held = input.selected;
+            let attack = (sim
+                .packages
+                .melee_table()
+                .spec(held)
+                .is_none_or(|_| player.inventory.count(held) > 0))
+            .then(|| basic_attack_for(&sim.packages, held));
+            let output = controller::step_character_player(
+                world,
+                &mut player.state,
+                attack,
+                &input,
+                physics::FIXED_DT,
+                &[],
+            );
+            if output.basic_attack {
+                fired.push(id);
+            }
+        }
+        sim.resolve_attacks(world, &fired);
+    }
+
+    #[test]
+    fn bow_basic_attack_spawns_a_projectile() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set_block(IVec3::new(x, 0, z), voxel_world::STONE).unwrap();
+            }
+        }
+        let mut player = Player::new();
+        player.state.motion.position = Vec3::new(2.5, 1.0, 3.5);
+        player.input.yaw = 0.0;
+        player.input.attack = true;
+        player.input.selected = protocol::EXPLOSIVE_BOW_ITEM;
+        sim.players.insert(1, player);
+        let before = sim.arrows.len();
+        swing(&mut sim, &world, 1);
+        assert_eq!(
+            sim.arrows.len(),
+            before + 1,
+            "the bow must fire a projectile instead of a melee swing"
+        );
+        put_resources(&mut app, world, sim);
+    }
+
     #[test]
     fn melee_swings_damage_knockback_and_respawn_actors() {
         let mut app = headless_app(1);
@@ -1812,7 +1903,7 @@ mod tests {
         sim.players.insert(1, player);
 
         sim.tick = 100;
-        sim.resolve_attacks(&world);
+        swing(&mut sim, &world, 1);
         // A level swing at eye height lands in the head zone: double damage.
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
@@ -1823,16 +1914,16 @@ mod tests {
                 || sim.actors[&dummy].state.motion.external_velocity.length() > 0.0,
             "knockback did not move the dummy"
         );
-        // Cooldown blocks an immediate second swing.
-        sim.resolve_attacks(&world);
+        // The motor's cooldown blocks an immediate second swing.
+        swing(&mut sim, &world, 1);
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
             100 - gameplay::combat::MELEE_HANDS.damage * gameplay::combat::HEADSHOT_MULTIPLIER
         );
         // Ten swings at cooldown spacing kill the dummy; it respawns later.
         for _ in 0..10 {
-            sim.tick += u64::from(gameplay::combat::MELEE_HANDS.cooldown_ticks);
-            sim.resolve_attacks(&world);
+            sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
+            swing(&mut sim, &world, 1);
         }
         assert!(sim.actor_health(dummy).unwrap().is_depleted());
         sim.tick += 300;
@@ -1864,25 +1955,24 @@ mod tests {
         sim.players.insert(1, player);
 
         sim.tick = 100;
-        sim.resolve_attacks(&world);
+        swing(&mut sim, &world, 1);
         assert_eq!(sim.actor_health(dummy).unwrap().current(), 100);
 
         sim.players.get_mut(&1).unwrap().inventory.add(8, 1);
-        sim.resolve_attacks(&world);
+        swing(&mut sim, &world, 1);
         // Head-zone hit with the authored 30-damage spec.
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
             100 - 30 * gameplay::combat::HEADSHOT_MULTIPLIER
         );
         // The authored 60-tick cooldown, not the hands default, gates the next swing.
-        sim.tick += u64::from(gameplay::combat::MELEE_HANDS.cooldown_ticks);
-        sim.resolve_attacks(&world);
+        swing(&mut sim, &world, 1);
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
             100 - 30 * gameplay::combat::HEADSHOT_MULTIPLIER
         );
-        sim.tick += 30;
-        sim.resolve_attacks(&world);
+        sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
+        swing(&mut sim, &world, 1);
         assert!(sim.actor_health(dummy).unwrap().is_depleted());
         put_resources(&mut app, world, sim);
     }
@@ -2356,11 +2446,11 @@ mod tests {
 
         sim.tick = 100;
         loop {
-            sim.resolve_attacks(&world);
+            sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
+            swing(&mut sim, &world, 1);
             if sim.player_health(2).unwrap().is_depleted() {
                 break;
             }
-            sim.tick += u64::from(gameplay::combat::MELEE_HANDS.cooldown_ticks);
         }
         let events = sim.drain_events();
         assert!(

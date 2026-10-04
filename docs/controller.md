@@ -6,16 +6,20 @@
 
 `step_character` is a fixed pipeline of named stages — `status`, `sanitize`, `stance`, `contact`, `steer`, `gravity`, `sweep_horizontal`, `sweep_vertical`, `drag` — so authority, prediction and replay agree on ordering. The public contract is unchanged: intent in, `CharacterState` out.
 
-- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a one-tick `attack` edge the host's combat system consumes (the motor ignores it); held `sprint` and `crouch` requests.
-- `CharacterBody`: feet-anchored AABB dimensions and mass in kilograms.
+- `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a one-tick `attack` edge the host's combat system consumes (the motor owns its cadence); held `sprint` and `crouch` requests.
+- `CharacterBody`: feet-anchored AABB dimensions and mass in kilograms, the per-species `AbilityTable`, and the held weapon's `BasicAttack` (`Melee` or `Ranged` plus a cooldown).
 - `MovementProfile`: speed, sprint multiplier, coyote and jump-buffer ticks, step height, walkable-slope cosine, crouch multiplier and height, acceleration, braking, air control, strafe fraction, yaw rate, gravity, jump speed, and external-momentum drag.
-- `CharacterState`: motion, facing, locomotion `mode`, active `statuses`, coyote/buffer ticks and crouch flag — the complete replay unit. Horizontal external momentum is separate from controlled movement.
+- `CharacterState`: motion, facing, locomotion `mode`, active `statuses`, coyote/buffer ticks, crouch flag, per-slot `cooldowns`, any `cast`/`dash`, and the basic-attack cooldown — the complete replay unit. Horizontal external momentum is separate from controlled movement.
 
 At yaw zero, forward is world -Z and right is +X. Positive yaw/turn rotates left. Movement axes and turn are clamped to [-1, 1]; diagonal movement is limited to unit magnitude. Turn is multiplied by the profile's radians/second. Non-finite actions become zero. Shape/mass constructors reject invalid configuration; profile values are bounded at the motor boundary. Ticks must be finite and positive, with catch-up capped at 0.25 seconds.
 
 Call `step_character` directly, or spawn the four components together and use the plugin. `movement` and `turn` persist until replaced. `jump` is consumed during a valid tick even when airborne or jumping is disabled, then buffered for `jump_buffer_ticks` and honoured inside the `coyote_ticks` window after leaving the ground. A policy deciding every N ticks should submit jump once and retain held actions across those ticks. Include actions, initial state, profiles, timesteps, terrain and collider snapshots when reproducing an episode. Exact replay tests cover the same executable and inputs, not cross-platform floating-point determinism.
 
 Ground locomotion includes sliding, support detection, jumping, loose-cube contacts, and automatic step-up: a blocked horizontal sweep retries from a pose lifted by `step_height`, so low obstructions are climbed while a ceiling still blocks. Terrain collision is a smooth density sweep: the leading face samples trilinear `VoxelWorld::density_at`, so actors rest on the iso surface. The support probe reports the ground normal; ground steeper than `max_slope_cos` overrides control and slides the actor downhill. Crouch lowers the effective collision shape to `crouch_height` and scales speed by `crouch_mult`; standing up requires clearance for the full-height body. Placed cubes and unloaded chunks stay discrete solids.
+
+## Basic attack
+
+The held weapon's `BasicAttack` (`Melee` or `Ranged`, plus a cooldown) rides on `CharacterBody`; the host maps the held item to it. The motor owns the cadence — `CharacterState.basic_attack_cooldown` ticks down and a one-tick `attack` edge fires it — and reports the fired edge in `MotorOutput.basic_attack`. The host applies the effect: a melee raycast for `Melee`, a travelling projectile for `Ranged`. This keeps the basic attack in the same replay unit as abilities, so prediction and reconciliation cover it.
 
 ## Status effects
 

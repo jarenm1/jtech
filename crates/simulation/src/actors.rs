@@ -9,8 +9,9 @@
 //! tick.
 use super::{Player, Simulation};
 use controller::{
-    AbilityKind, AbilitySpec, AbilityTable, Cast, CastBehavior, CharacterBody, CharacterIntent,
-    CharacterState, MAX_SLOTS, Mode, MovementProfile, StatusList, step_character,
+    AbilityKind, AbilitySpec, AbilityTable, BasicAttack, BasicAttackKind, Cast, CastBehavior,
+    CharacterBody, CharacterIntent, CharacterState, MAX_SLOTS, Mode, MovementProfile, StatusList,
+    step_character,
 };
 use gameplay::{
     Health,
@@ -255,7 +256,6 @@ pub(super) struct Actor {
     pub health: Health,
     pub spawn: Vec3,
     pub respawn_at: Option<u64>,
-    pub attack_ready: u64,
     pub kind: ActorKind,
     pub brain: ActorBrain,
 }
@@ -365,7 +365,7 @@ fn observation_of(
         yaw: actor.state.yaw,
         grounded: actor.state.motion.grounded,
         health: actor.health,
-        attack_ready: tick >= actor.attack_ready,
+        attack_ready: actor.state.basic_attack_cooldown == 0,
         melee_range: actor.kind.melee.range,
         nearest_player,
         nearest_actor,
@@ -401,13 +401,15 @@ impl Simulation {
                     yaw: 0.0,
                     ..Default::default()
                 },
-                body: kind.body,
+                body: kind.body.with_basic_attack(Some(BasicAttack {
+                    kind: BasicAttackKind::Melee,
+                    cooldown_ticks: kind.melee.cooldown_ticks.min(u32::from(u16::MAX)) as u16,
+                })),
                 profile: kind.profile,
                 intent: CharacterIntent::default(),
                 health: Health::new(kind.health).unwrap_or_default(),
                 spawn: position,
                 respawn_at: None,
-                attack_ready: 0,
                 kind,
                 brain: match kind.brain {
                     BrainKind::External => ActorBrain::External,
@@ -501,6 +503,7 @@ impl Simulation {
         }));
         self.actors = actors;
         let mut fired: Vec<(u32, usize, Vec2)> = Vec::new();
+        self.actor_attacks.clear();
         for (&id, actor) in self.actors.iter_mut() {
             if actor.health.is_depleted() {
                 if self.tick >= actor.respawn_at.unwrap_or(u64::MAX) {
@@ -538,6 +541,9 @@ impl Simulation {
             );
             self.step_scratch = step_bodies;
             actor.intent = intent;
+            if output.basic_attack {
+                self.actor_attacks.push(id);
+            }
             for (slot, aim) in output.fired.iter().enumerate() {
                 if let Some(aim) = aim {
                     fired.push((id, slot, *aim));
@@ -565,50 +571,27 @@ impl Simulation {
         self.next_arrow += 1;
     }
 
-    /// Resolve one melee swing per attacker per tick: players swing along their
-    /// input yaw/pitch, actors along their state yaw with level aim. Cooldowns
-    /// apply to misses and hits alike; dead players and noclip attackers cannot
-    /// swing.
-    pub(super) fn resolve_attacks(&mut self, world: &VoxelWorld) {
+    /// Resolve one basic attack per attacker per tick. The motor owns the
+    /// cadence; this applies the effect: players swing along their input
+    /// yaw/pitch (or fire a projectile for ranged weapons), actors along their
+    /// state yaw with level aim. Dead players and noclip attackers cannot swing.
+    pub(super) fn resolve_attacks(&mut self, world: &VoxelWorld, player_attacks: &[u64]) {
         let melee = self.packages.melee_table();
-        let attackers: Vec<u64> = self
-            .players
-            .iter()
-            .filter(|(_, player)| {
-                !player.health.is_depleted()
-                    && !player.state.motion.noclip
-                    && player.input.attack
-                    && self.tick >= player.attack_ready
-                    // Registered weapons require ownership; hands, blocks and
-                    // the bow swing the unarmed default as before.
-                    && melee
-                        .spec(player.input.selected)
-                        .is_none_or(|_| player.inventory.count(player.input.selected) > 0)
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        // Actor intents carry the same attack edge; consume it here so a policy
-        // sees one swing per written edge, matching the player input channel.
-        let actor_attackers: Vec<u32> = self
-            .actors
-            .iter()
-            .filter(|(_, actor)| {
-                !actor.health.is_depleted()
-                    && actor.intent.attack
-                    && self.tick >= actor.attack_ready
-            })
-            .map(|(&id, _)| id)
-            .collect();
-        for actor_id in actor_attackers {
+        let actor_attacks = std::mem::take(&mut self.actor_attacks);
+        for actor_id in actor_attacks {
             self.swing_actor(world, actor_id);
         }
-        for id in attackers {
-            let spec = melee
-                .spec(self.players[&id].input.selected)
-                .unwrap_or(gameplay::combat::MELEE_HANDS);
+        for &id in player_attacks {
+            let held = self.players[&id].input.selected;
+            let attack = super::basic_attack_for(&self.packages, held);
             let player = &self.players[&id];
             let origin = player.state.motion.position + Vec3::Y * EYE_HEIGHT;
             let direction = look_direction(player.input.yaw, player.input.pitch);
+            if attack.kind == BasicAttackKind::Ranged {
+                self.spawn_projectile(origin, direction, Some(id));
+                continue;
+            }
+            let spec = melee.spec(held).unwrap_or(gameplay::combat::MELEE_HANDS);
             let mut targets: Vec<SwingTarget> = self
                 .actors
                 .iter()
@@ -631,8 +614,6 @@ impl Simulation {
                         shape: CollisionShape::default(),
                     }),
             );
-            self.players.get_mut(&id).unwrap().attack_ready =
-                self.tick + u64::from(spec.cooldown_ticks);
             let Some(hit) = resolve_swing(world, origin, direction, &spec, &targets) else {
                 continue;
             };
@@ -705,7 +686,6 @@ impl Simulation {
         );
         let actor = self.actors.get_mut(&id).unwrap();
         actor.intent.attack = false;
-        actor.attack_ready = self.tick + u64::from(spec.cooldown_ticks);
         let Some(hit) = resolve_swing(world, origin, direction, &spec, &targets) else {
             return;
         };
