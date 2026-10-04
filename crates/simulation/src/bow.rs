@@ -118,10 +118,6 @@ impl Arrow {
             return Flight::Expired;
         }
         let start = self.snapshot.position;
-        // Expire at the loaded-world boundary rather than firing through unknown terrain.
-        if world.block(start.floor().as_ivec3()).is_none() {
-            return Flight::Expired;
-        }
         self.snapshot.velocity.y -= self.projectile.gravity * physics::FIXED_DT;
         let displacement = self.snapshot.velocity * physics::FIXED_DT;
         let distance = displacement
@@ -159,14 +155,9 @@ impl Arrow {
         }
         self.snapshot.position += direction * distance;
         self.traveled += distance;
-        if world
-            .block(self.snapshot.position.floor().as_ivec3())
-            .is_none()
-        {
-            Flight::Expired
-        } else {
-            Flight::Flying
-        }
+        // An arrow may leave the loaded world and fall back into it: terrain
+        // only blocks it where chunks are loaded, and the age cap bounds it.
+        Flight::Flying
     }
 }
 
@@ -252,18 +243,54 @@ mod tests {
     }
 
     #[test]
-    fn arrows_expire_at_range_and_loaded_boundary() {
+    fn arrows_fly_past_the_loaded_boundary_and_expire_on_age() {
         let world = empty_world();
-        let mut arrow = Arrow::new(1, Vec3::new(1., 20., 1.), Vec3::X, BowPower::Standard);
+        // An arrow leaving the loaded world keeps flying, so a shot straight up
+        // can fall back into loaded terrain.
+        let mut arrow = Arrow::new(1, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
+        assert!(matches!(arrow.step(&world, &[], &[]), Flight::Flying));
+        assert!(arrow.snapshot.position.x > 96.0);
+        // The age cap still bounds its lifetime.
+        for _ in 0..arrow.projectile.max_age_ticks {
+            arrow.tick(&world, &[], &[], false);
+        }
+        assert!(matches!(arrow.tick(&world, &[], &[], false), Flight::Expired));
+    }
+
+    #[test]
+    fn a_vertical_arrow_falls_back_into_the_loaded_world() {
+        let world = empty_world();
+        let mut arrow = Arrow::new(1, Vec3::new(48.5, 20.5, 48.5), Vec3::Y, BowPower::Standard);
+        let origin = arrow.snapshot.position;
+        let mut apex = origin.y;
+        for _ in 0..1800 {
+            let _ = arrow.step(&world, &[], &[]);
+            apex = apex.max(arrow.snapshot.position.y);
+            if arrow.snapshot.position.y <= origin.y && arrow.snapshot.velocity.y < 0.0 {
+                break;
+            }
+        }
+        assert!(apex > origin.y + 100.0, "arrow did not climb: {apex}");
+        assert!(arrow.snapshot.position.y <= origin.y + 0.5);
+    }
+
+    #[test]
+    fn arrows_expire_at_their_travel_cap() {
+        let world = empty_world();
+        let spec = ProjectileSpec {
+            speed: 36.0,
+            gravity: 3.0,
+            max_travel: 8.0,
+            max_age_ticks: 18_000,
+        };
+        let mut arrow = Arrow::new_arrow(1, Vec3::new(1., 20., 1.), Vec3::X, spec, None);
         for _ in 0..180 {
             if matches!(arrow.step(&world, &[], &[]), Flight::Expired) {
-                assert!(arrow.snapshot.position.x <= 65.0 && arrow.snapshot.position.x > 64.0);
+                assert!(arrow.snapshot.position.x <= 9.0 && arrow.snapshot.position.x > 8.0);
                 break;
             }
         }
         assert!(arrow.traveled >= arrow.projectile.max_travel);
-        let mut arrow = Arrow::new(2, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
-        assert!(matches!(arrow.step(&world, &[], &[]), Flight::Expired));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 (define (projectile-for-power power)
   ;; speed m/s, gravity m/s², maximum travel m, lifetime fixed60 ticks
-  (projectile 36.0 3.0 64.0 180))
+  (projectile 36.0 3.0 100000.0 18000))
 
 (define (blast-for-power power)
   (let ((scale (power-scale power)))

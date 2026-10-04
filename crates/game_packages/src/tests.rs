@@ -78,8 +78,8 @@ fn bow_package_authors_flight_and_each_blast_preset() {
             ProjectileSpec {
                 speed: 36.0,
                 gravity: 3.0,
-                max_travel: 64.0,
-                max_age_ticks: 180
+                max_travel: 100_000.0,
+                max_age_ticks: 18_000
             }
         );
         let blast = package.impact(power);
@@ -177,7 +177,7 @@ fn invalid_api_and_commands_are_rejected_before_installation() {
         ("version 1", "version 2"),
         ("second 25", "second 0"),
         ("36.0", "+nan.0"),
-        ("180)", "180.5)"),
+        ("18000)", "18000.5)"),
         ("6000.0", "-1.0"),
         ("0.35", "2.0"),
         ("(blast-for-power power)", "(missing-blast power)"),
