@@ -1,7 +1,7 @@
 use crate::{
     AbilityKind, BasicAttackKind, Cast, CastBehavior, CharacterBody, CharacterIntent,
-    CharacterState, CollisionShape, Constraints, Dash, MAX_SLOTS, MotorOutput, MovementProfile,
-    SpeedModifiers, finite,
+    CharacterState, CollisionShape, Constraints, Dash, MAX_SLOTS, Mode, MotorOutput,
+    MovementProfile, SpeedModifiers, Transition, Transitions, finite,
 };
 use glam::{Vec2, Vec3};
 use physics::DynamicCollider;
@@ -202,97 +202,188 @@ const DASH_TICKS: u16 = 12;
 /// Step size when searching for a clear blink destination.
 const BLINK_STEP: f32 = 0.5;
 
-/// Consume ability edges, advance casts and dashes, and tick cooldowns. A cast
-/// roots or slows the caster; a dash overrides movement; the host applies the
-/// effect when a slot reports `fired`.
-fn abilities(motor: &mut Motor, character: &mut CharacterState) {
-    for cooldown in character.cooldowns.iter_mut() {
-        *cooldown = cooldown.saturating_sub(1);
-    }
+/// Pure transition function: intent + state + body + constraints -> the
+/// transitions to apply this tick. No side effects, so it is testable in
+/// isolation and replays exactly.
+pub fn resolve(
+    intent: &CharacterIntent,
+    state: &CharacterState,
+    body: &CharacterBody,
+    constraints: &Constraints,
+) -> Transitions {
+    let mut transitions = Transitions::default();
     // Basic attack: `attack` is held. A melee or admin weapon fires once on the
-    // press edge, gated by its cooldown; a ranged weapon charges while held and
-    // fires on release only at full charge, cancelling an early release.
-    character.basic_attack_cooldown = character.basic_attack_cooldown.saturating_sub(1);
-    let pressed = motor.input.attack && !character.attack_held;
-    let released = !motor.input.attack && character.attack_held;
-    character.attack_held = motor.input.attack;
-    if let Some(attack) = motor.body.basic_attack {
+    // press edge; a ranged weapon draws while held and fires on release at full
+    // charge, cancelling an early release.
+    let pressed = intent.attack && !state.attack_held;
+    let released = !intent.attack && state.attack_held;
+    if let Some(attack) = body.basic_attack {
         match attack.kind {
             BasicAttackKind::Melee | BasicAttackKind::Admin => {
-                if pressed
-                    && character.basic_attack_cooldown == 0
-                    && !motor.constraints.action_locked
-                {
-                    character.basic_attack_cooldown = attack.cooldown_ticks;
-                    motor.basic_attack = true;
+                if pressed && state.basic_attack_cooldown == 0 && !constraints.action_locked {
+                    transitions.push(Transition::Swing);
                 }
             }
             BasicAttackKind::Ranged => {
                 let full = attack.charge_ticks.max(1);
-                if motor.input.attack && !motor.constraints.action_locked {
-                    character.drawing = true;
-                    character.charge = character.charge.saturating_add(1).min(full);
-                } else if released {
-                    if character.drawing
-                        && character.charge >= full
-                        && character.basic_attack_cooldown == 0
-                    {
-                        character.basic_attack_cooldown = attack.cooldown_ticks;
-                        motor.charge_release = Some(1.0);
+                if intent.attack && !constraints.action_locked {
+                    transitions.push(Transition::Draw);
+                } else if released && state.drawing {
+                    if state.charge >= full && state.basic_attack_cooldown == 0 {
+                        transitions.push(Transition::Fire {
+                            charge: state.charge,
+                        });
+                    } else {
+                        transitions.push(Transition::CancelDraw);
                     }
-                    character.drawing = false;
-                    character.charge = 0;
                 }
             }
         }
     }
-    if let Some(cast) = character.cast {
-        if cast.remaining > 1 {
+    // A hard status interrupts an in-progress cast or dash.
+    if constraints.action_locked {
+        if state.cast.is_some() {
+            transitions.push(Transition::InterruptCast);
+        }
+        if state.dash.is_some() {
+            transitions.push(Transition::InterruptDash);
+        }
+    }
+    // Timed actions complete on their last tick.
+    if let Some(cast) = state.cast
+        && cast.remaining <= 1
+    {
+        transitions.push(Transition::CompleteCast {
+            slot: cast.slot,
+            aim: cast.aim,
+        });
+    }
+    if let Some(dash) = state.dash
+        && dash.remaining <= 1
+    {
+        transitions.push(Transition::EndDash);
+    }
+    // A new ability only starts when nothing else is in progress.
+    if state.cast.is_none() && state.dash.is_none() && !constraints.cast_locked {
+        for slot in 0..MAX_SLOTS {
+            if !intent.ability[slot] || state.cooldowns[slot] > 0 {
+                continue;
+            }
+            let Some(spec) = body.abilities.get(slot) else {
+                continue;
+            };
+            let aim = aim_vector(intent, state);
+            if spec.behavior == CastBehavior::Instant {
+                transitions.push(Transition::FireAbility {
+                    slot: slot as u8,
+                    aim,
+                });
+            } else {
+                transitions.push(Transition::BeginCast {
+                    slot: slot as u8,
+                    aim,
+                });
+            }
+            break;
+        }
+    }
+    transitions
+}
+
+/// Apply one transition. Deterministic; the only place transitions mutate state.
+fn apply(transition: Transition, motor: &mut Motor, character: &mut CharacterState) {
+    match transition {
+        Transition::Swing => {
+            if let Some(attack) = motor.body.basic_attack {
+                character.basic_attack_cooldown = attack.cooldown_ticks;
+            }
+            motor.basic_attack = true;
+        }
+        Transition::Draw => {
+            character.drawing = true;
+            let full = motor.draw_ticks();
+            character.charge = character.charge.saturating_add(1).min(full);
+        }
+        Transition::Fire { charge } => {
+            if let Some(attack) = motor.body.basic_attack {
+                character.basic_attack_cooldown = attack.cooldown_ticks;
+            }
+            character.drawing = false;
+            character.charge = 0;
+            motor.charge_release = Some(draw_fraction(charge, motor.draw_ticks()));
+        }
+        Transition::CancelDraw => {
+            character.drawing = false;
+            character.charge = 0;
+        }
+        Transition::FireAbility { slot, aim } => resolve_ability(motor, character, slot, aim),
+        Transition::BeginCast { slot, aim } => {
+            let Some(spec) = motor.body.abilities.get(slot as usize) else {
+                return;
+            };
             character.cast = Some(Cast {
-                remaining: cast.remaining - 1,
-                ..cast
-            });
-        } else {
-            character.cast = None;
-            resolve(motor, character, cast.slot, cast.aim);
-        }
-    }
-    if let Some(dash) = character.dash {
-        if dash.remaining > 1 {
-            character.dash = Some(Dash {
-                remaining: dash.remaining - 1,
-                ..dash
-            });
-        } else {
-            character.dash = None;
-        }
-    }
-    if character.cast.is_some() || character.dash.is_some() || motor.constraints.cast_locked {
-        return;
-    }
-    for slot in 0..MAX_SLOTS {
-        if !motor.input.ability[slot] || character.cooldowns[slot] > 0 {
-            continue;
-        }
-        let Some(spec) = motor.body.abilities.get(slot) else {
-            continue;
-        };
-        let aim = aim_vector(motor, character);
-        if spec.behavior == CastBehavior::Instant {
-            resolve(motor, character, slot as u8, aim);
-        } else {
-            character.cast = Some(Cast {
-                slot: slot as u8,
+                slot,
                 remaining: spec.cast_ticks.max(1),
                 aim,
             });
         }
-        break;
+        Transition::CompleteCast { slot, aim } => {
+            character.cast = None;
+            resolve_ability(motor, character, slot, aim);
+        }
+        Transition::InterruptCast => character.cast = None,
+        Transition::InterruptDash => character.dash = None,
+        Transition::EndDash => character.dash = None,
     }
 }
 
-/// Resolve a slot: mark it fired, start its cooldown, and begin any movement.
-fn resolve(motor: &mut Motor, character: &mut CharacterState, slot: u8, aim: Vec2) {
+/// Consume ability edges, advance casts and dashes, and tick cooldowns. The
+/// decision is `resolve` (pure); this stage only applies it and advances timers.
+fn abilities(motor: &mut Motor, character: &mut CharacterState) {
+    for cooldown in character.cooldowns.iter_mut() {
+        *cooldown = cooldown.saturating_sub(1);
+    }
+    character.basic_attack_cooldown = character.basic_attack_cooldown.saturating_sub(1);
+    let was_casting = character.cast.is_some();
+    let was_dashing = character.dash.is_some();
+    let transitions = resolve(&motor.input, character, motor.body, &motor.constraints);
+    character.attack_held = motor.input.attack;
+    for transition in transitions.iter() {
+        apply(transition, motor, character);
+    }
+    // Advance only actions already in progress: one begun this tick starts its
+    // countdown next tick, so a cast of N ticks resolves on the Nth tick.
+    if was_casting
+        && let Some(cast) = character.cast
+    {
+        character.cast = Some(Cast {
+            remaining: cast.remaining.saturating_sub(1),
+            ..cast
+        });
+    }
+    if was_dashing
+        && let Some(dash) = character.dash
+    {
+        character.dash = Some(Dash {
+            remaining: dash.remaining.saturating_sub(1),
+            ..dash
+        });
+    }
+    // Derive the observation mode from the support and the timed actions.
+    character.mode = if character.cast.is_some() {
+        Mode::Cast
+    } else if character.dash.is_some() {
+        Mode::Dash
+    } else if character.motion.grounded {
+        Mode::Ground
+    } else {
+        Mode::Air
+    };
+}
+
+/// Resolve an ability slot: mark it fired, start its cooldown, and begin any
+/// movement.
+fn resolve_ability(motor: &mut Motor, character: &mut CharacterState, slot: u8, aim: Vec2) {
     let Some(spec) = motor.body.abilities.get(slot as usize) else {
         return;
     };
@@ -360,13 +451,13 @@ impl Motor<'_> {
 }
 
 /// World-space aim direction: the body-relative aim rotated by yaw, or forward
-/// when the aim is zero.
-fn aim_vector(motor: &Motor, character: &CharacterState) -> Vec2 {
-    let yaw = finite(character.yaw);
+/// when the aim is zero. Pure, so `resolve` can call it.
+fn aim_vector(intent: &CharacterIntent, state: &CharacterState) -> Vec2 {
+    let yaw = finite(state.yaw);
     let (sy, cy) = yaw.sin_cos();
     let right = Vec2::new(cy, -sy);
     let forward = Vec2::new(-sy, -cy);
-    let world = right * motor.input.aim.x + forward * motor.input.aim.y;
+    let world = right * intent.aim.x + forward * intent.aim.y;
     if world.length_squared() > 1e-6 {
         world.normalize()
     } else {

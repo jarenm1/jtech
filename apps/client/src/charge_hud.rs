@@ -55,23 +55,27 @@ pub(crate) fn spawn(commands: &mut Commands) {
 pub(crate) fn update(
     session: Res<ClientSession>,
     mut track: Single<&mut Node, (With<ChargeTrack>, Without<ChargeFill>)>,
-    mut fill: Single<&mut Node, (With<ChargeFill>, Without<ChargeTrack>)>,
-    mut shown: Local<Option<(bool, u32)>>,
+    mut fill: Single<(&mut Node, &mut BackgroundColor), (With<ChargeFill>, Without<ChargeTrack>)>,
+    mut shown: Local<Option<(bool, u32, bool)>>,
 ) {
     let visible = crate::held_item::draws(&session, session.held_item());
     let fraction = (f32::from(session.state.charge) / DRAW_TICKS).clamp(0.0, 1.0);
+    // At full charge the arrow is ready: the fill turns ivory to say so.
+    let ready = fraction >= 1.0;
     // The bar is static between charge changes; skip the per-frame writes.
     let permille = (fraction * 1000.0).round() as u32;
-    if *shown == Some((visible, permille)) {
+    if *shown == Some((visible, permille, ready)) {
         return;
     }
-    *shown = Some((visible, permille));
+    *shown = Some((visible, permille, ready));
     track.display = if visible {
         Display::Flex
     } else {
         Display::None
     };
-    fill.width = percent(fraction * 100.0);
+    let (node, color) = &mut *fill;
+    node.width = percent(fraction * 100.0);
+    color.0 = if ready { palette::IVORY } else { palette::AMBER };
 }
 
 #[cfg(test)]

@@ -110,8 +110,13 @@ pub(crate) fn resolve(
     // A weapon attacks on the held action; the animation plays on the press so
     // the held item always reacts. Blocks and empty hands mine instead.
     let attacking = actions.attack && matches!(held, Held::Weapon(_));
+    let released = !actions.attack && session.attack_held;
     session.attack_held = attacking;
     if attacking && buttons.just_pressed(MouseButton::Left) {
+        session.swing_at = Some(Instant::now());
+    }
+    // A bow's release kicks the viewmodel forward as the arrow leaves.
+    if released && matches!(held, Held::Weapon(BasicAttackKind::Ranged)) {
         session.swing_at = Some(Instant::now());
     }
     let mining = (actions.attack && !attacking) || strike;

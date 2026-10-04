@@ -522,6 +522,47 @@ fn ability_on_cooldown_is_ignored() {
 }
 
 #[test]
+fn transitions_are_pure_and_cover_the_bow_draw() {
+    let body = CharacterBody::default().with_basic_attack(Some(BasicAttack {
+        kind: BasicAttackKind::Ranged,
+        cooldown_ticks: 30,
+        charge_ticks: 10,
+    }));
+    let constraints = Constraints::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    // Press starts the draw.
+    let pressed = CharacterIntent {
+        attack: true,
+        ..Default::default()
+    };
+    let transitions = resolve(&pressed, &state, &body, &constraints);
+    assert_eq!(transitions.iter().collect::<Vec<_>>(), vec![Transition::Draw]);
+    // Pure: the same inputs give the same transitions and mutate nothing.
+    let before = state;
+    assert_eq!(resolve(&pressed, &state, &body, &constraints), transitions);
+    assert_eq!(state, before);
+    // Release before full charge cancels.
+    state.drawing = true;
+    state.attack_held = true;
+    state.charge = 4;
+    let released = CharacterIntent::default();
+    assert_eq!(
+        resolve(&released, &state, &body, &constraints)
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Transition::CancelDraw]
+    );
+    // Release at full charge fires.
+    state.charge = 10;
+    assert_eq!(
+        resolve(&released, &state, &body, &constraints)
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Transition::Fire { charge: 10 }]
+    );
+}
+
+#[test]
 fn basic_attack_fires_once_per_press_and_cooldown() {
     let world = tests::arena();
     let body = CharacterBody::default().with_basic_attack(Some(BasicAttack {

@@ -4,12 +4,14 @@
 
 ## Shared motor
 
-`step_character` is a fixed pipeline of named stages — `status`, `sanitize`, `stance`, `contact`, `steer`, `gravity`, `sweep_horizontal`, `sweep_vertical`, `drag` — so authority, prediction and replay agree on ordering. The public contract is unchanged: intent in, `CharacterState` out.
+`step_character` is a fixed pipeline of named stages — `status`, `sanitize`, `stance`, `contact`, `abilities`, `charge`, `steer`, `gravity`, `sweep_horizontal`, `sweep_vertical`, `drag` — so authority, prediction and replay agree on ordering. The public contract is unchanged: intent in, `CharacterState` out.
+
+Decisions are separated from mutation. `resolve(intent, state, body, constraints) -> Transitions` is a **pure** function: it derives the discrete transitions this tick (`Swing`, `Draw`, `Fire`, `CancelDraw`, `FireAbility`, `BeginCast`, `CompleteCast`, `InterruptCast`, `InterruptDash`, `EndDash`) with no side effects, so it is testable in isolation and replays exactly. The `abilities` stage applies them and advances the timed actions. This is also the action space a scripted or RL policy drives, one level below `CharacterIntent`.
 
 - `CharacterIntent`: held, bounded body-relative movement and turn; a consumed one-tick jump request; a held `attack` action the host's combat system resolves by the held weapon's kind; held `sprint` and `crouch` requests.
 - `CharacterBody`: feet-anchored AABB dimensions and mass in kilograms, the per-species `AbilityTable`, and the held weapon's `BasicAttack` (`Melee` or `Ranged` plus a cooldown).
 - `MovementProfile`: speed, sprint multiplier, coyote and jump-buffer ticks, step height, walkable-slope cosine, crouch multiplier and height, draw speed multiplier, acceleration, braking, air control, strafe fraction, yaw rate, gravity, jump speed, and external-momentum drag.
-- `CharacterState`: motion, facing, locomotion `mode`, active `statuses`, coyote/buffer ticks, crouch flag, per-slot `cooldowns`, any `cast`/`dash`, and the basic-attack cooldown — the complete replay unit. Horizontal external momentum is separate from controlled movement.
+- `CharacterState`: motion, facing, the derived `mode`, active `statuses`, coyote/buffer ticks, crouch flag, per-slot `cooldowns`, any `cast`/`dash`, the basic-attack cooldown, and the bow draw — the complete replay unit. Horizontal external momentum is separate from controlled movement. `mode` (`Ground`/`Air`/`Cast`/`Dash`) is derived by the motor each tick and is an observation, never an input.
 
 At yaw zero, forward is world -Z and right is +X. Positive yaw/turn rotates left. Movement axes and turn are clamped to [-1, 1]; diagonal movement is limited to unit magnitude. Turn is multiplied by the profile's radians/second. Non-finite actions become zero. Shape/mass constructors reject invalid configuration; profile values are bounded at the motor boundary. Ticks must be finite and positive, with catch-up capped at 0.25 seconds.
 

@@ -24,8 +24,8 @@ pub(crate) struct HeldState {
 const REST_OFFSET: Vec3 = Vec3::new(0.42, -0.34, -0.62);
 /// Swing animation length in seconds.
 const SWING_SECONDS: f32 = 0.28;
-/// Bow draw animation length in seconds; matches the motor's full draw.
-const DRAW_SECONDS: f32 = 1.0;
+/// Ticks a ranged weapon draws before firing; matches the server's wind-up.
+const DRAW_TICKS: f32 = 60.0;
 
 /// Whether an item draws before firing: a package weapon whose basic attack is
 /// ranged. The explosive bow is an admin item that fires on the edge instead.
@@ -154,22 +154,20 @@ pub(crate) fn update(
     let bob = (seconds * 1.7).sin() * 0.012;
     let mut offset = REST_OFFSET + Vec3::Y * bob;
     let mut rotation = Quat::from_rotation_y(-0.25) * Quat::from_rotation_x(0.15);
+    if draws(&session, item) {
+        // The draw follows the actual charge, so it builds smoothly, holds at
+        // full while the arrow is ready, and snaps back when the shot releases.
+        let pull = (f32::from(session.state.charge) / DRAW_TICKS).clamp(0.0, 1.0);
+        offset += Vec3::new(0.02 * pull, -0.06 * pull, 0.16 * pull);
+        rotation *= Quat::from_rotation_x(0.55 * pull) * Quat::from_rotation_z(0.2 * pull);
+    }
     if let Some(started) = session.swing_at {
-        let bow = draws(&session, item);
-        let duration = if bow { DRAW_SECONDS } else { SWING_SECONDS };
-        let t = started.elapsed().as_secs_f32() / duration;
+        // A melee swing, or the bow's release kick: a quick forward dip.
+        let t = started.elapsed().as_secs_f32() / SWING_SECONDS;
         if t < 1.0 {
-            if bow {
-                // Draw: pull the bow back and up over the whole draw, then snap
-                // forward when the window closes as the arrow releases.
-                offset += Vec3::new(0.02 * t, -0.06 * t, 0.16 * t);
-                rotation *= Quat::from_rotation_x(0.55 * t) * Quat::from_rotation_z(0.2 * t);
-            } else {
-                // Ease out then recover: dip forward-left and pitch the item down.
-                let arc = (t * std::f32::consts::PI).sin();
-                offset += Vec3::new(-0.14 * arc, -0.1 * arc, -0.2 * arc);
-                rotation *= Quat::from_rotation_x(-1.1 * arc);
-            }
+            let arc = (t * std::f32::consts::PI).sin();
+            offset += Vec3::new(-0.14 * arc, -0.1 * arc, -0.2 * arc);
+            rotation *= Quat::from_rotation_x(-1.1 * arc);
         }
     }
     transform.translation = offset;
