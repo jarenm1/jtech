@@ -1,6 +1,5 @@
 //! Bow draw charge bar: fills as the explosive bow charges, hidden otherwise.
 use bevy::prelude::*;
-use protocol::EXPLOSIVE_BOW_ITEM;
 
 use crate::{
     ClientSession,
@@ -14,6 +13,9 @@ pub(crate) struct ChargeTrack;
 /// Inner fill whose width tracks the draw fraction.
 #[derive(Component)]
 pub(crate) struct ChargeFill;
+
+/// Ticks a ranged weapon draws before firing; matches the server's wind-up.
+const DRAW_TICKS: f32 = 60.0;
 
 pub(crate) fn spawn(commands: &mut Commands) {
     commands
@@ -56,8 +58,8 @@ pub(crate) fn update(
     mut fill: Single<&mut Node, (With<ChargeFill>, Without<ChargeTrack>)>,
     mut shown: Local<Option<(bool, u32)>>,
 ) {
-    let visible = session.held_item() == EXPLOSIVE_BOW_ITEM;
-    let fraction = controller::MovementProfile::default().charge_fraction(session.state.charge);
+    let visible = crate::held_item::draws(&session, session.held_item());
+    let fraction = (f32::from(session.state.charge) / DRAW_TICKS).clamp(0.0, 1.0);
     // The bar is static between charge changes; skip the per-frame writes.
     let permille = (fraction * 1000.0).round() as u32;
     if *shown == Some((visible, permille)) {
@@ -75,14 +77,39 @@ pub(crate) fn update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{ItemKind, MeleeWeaponInfo};
+
+    /// A replicated weapon; only a ranged one draws and fills the charge bar.
+    fn weapon(item: u32, name: &str, attack_kind: controller::BasicAttackKind) -> MeleeWeaponInfo {
+        MeleeWeaponInfo {
+            item,
+            package: "melee".into(),
+            name: name.into(),
+            kind: ItemKind::Equipment,
+            range: 16.0,
+            damage: 14,
+            cooldown_ticks: 30,
+            knockback: 0.0,
+            attack_kind,
+            model: None,
+        }
+    }
 
     #[test]
-    fn bar_fills_with_the_draw_and_hides_without_the_bow() {
+    fn bar_fills_with_the_draw_and_hides_without_a_ranged_weapon() {
         let mut app = App::new();
-        app.insert_resource(ClientSession {
+        let mut session = ClientSession {
             selected: 6,
             ..default()
-        })
+        };
+        // Slot 6 holds the ranged bow (item 8); slot 3 holds the melee sword (7).
+        session.hotbar[5] = Some(8);
+        session.hotbar[2] = Some(7);
+        session.packages.melee_weapons = vec![
+            weapon(7, "Sword", controller::BasicAttackKind::Melee),
+            weapon(8, "Bow", controller::BasicAttackKind::Ranged),
+        ];
+        app.insert_resource(session)
         .add_systems(Startup, |mut commands: Commands| spawn(&mut commands))
         .add_systems(Update, update);
         app.update();

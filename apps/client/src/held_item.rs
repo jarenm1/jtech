@@ -27,15 +27,16 @@ const SWING_SECONDS: f32 = 0.28;
 /// Bow draw animation length in seconds; matches the motor's full draw.
 const DRAW_SECONDS: f32 = 1.0;
 
-/// Whether an item renders and animates as a bow: the built-in explosive bow,
-/// or a package weapon whose basic attack fires a projectile.
-fn is_bow(session: &ClientSession, item: u32) -> bool {
-    item == EXPLOSIVE_BOW_ITEM
-        || session
-            .packages
-            .melee_weapons
-            .iter()
-            .any(|weapon| weapon.item == item && weapon.ranged)
+/// Whether an item draws before firing: a package weapon whose basic attack is
+/// ranged. The explosive bow is an admin item that fires on the edge instead.
+pub(crate) fn draws(session: &ClientSession, item: u32) -> bool {
+    session
+        .packages
+        .melee_weapons
+        .iter()
+        .any(|weapon| {
+            weapon.item == item && weapon.attack_kind == controller::BasicAttackKind::Ranged
+        })
 }
 
 /// Keep the held item entity in sync with the selected hotbar slot and the
@@ -154,7 +155,7 @@ pub(crate) fn update(
     let mut offset = REST_OFFSET + Vec3::Y * bob;
     let mut rotation = Quat::from_rotation_y(-0.25) * Quat::from_rotation_x(0.15);
     if let Some(started) = session.swing_at {
-        let bow = is_bow(&session, item);
+        let bow = draws(&session, item);
         let duration = if bow { DRAW_SECONDS } else { SWING_SECONDS };
         let t = started.elapsed().as_secs_f32() / duration;
         if t < 1.0 {

@@ -19,7 +19,7 @@ impl Plugin for ProjectilesPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Projectiles>()
             .add_systems(Startup, setup)
-            .add_systems(Update, present.after(super::edit_blocks));
+            .add_systems(Update, present.after(super::actions::resolve));
     }
 }
 

@@ -43,7 +43,11 @@ impl Simulation {
                         damage: weapon.spec.damage,
                         cooldown_ticks: weapon.spec.cooldown_ticks,
                         knockback: weapon.spec.knockback,
-                        ranged: weapon.ranged.is_some(),
+                        attack_kind: if weapon.ranged.is_some() {
+                            controller::BasicAttackKind::Ranged
+                        } else {
+                            controller::BasicAttackKind::Melee
+                        },
                         model: weapon.model.clone(),
                     })
                     .collect();

@@ -89,12 +89,9 @@ through a future registry.
 
 ## Melee combat
 
-Left click always plays the held-item swing animation. With a weapon held it
-always attacks — a melee swing or a ranged shot — regardless of what is under
-the crosshair; with a block or an empty hand it mines terrain as before. Swings
+Left click is the general attack action: with a weapon held it attacks — a melee swing or a ranged shot — regardless of what is under the crosshair; with a block or an empty hand it mines terrain. A melee weapon swings once per press; a ranged weapon draws while held and fires on release at full charge. Swings
 ride the input
-stream (`PlayerInput.attack`), so a held click repeats at the weapon cooldown
-and the same channel serves scripted policies. The server resolves one swing
+stream (`PlayerInput.attack`), so the same channel serves scripted policies. The server resolves one swing
 per tick per player through `gameplay::combat::resolve_swing`: a ray from the
 eye must reach a feet-anchored AABB before terrain blocks it. Hits apply
 `MeleeSpec` damage and a directional knockback impulse; a killing blow still

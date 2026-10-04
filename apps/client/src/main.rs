@@ -1,4 +1,5 @@
 use controller::{CharacterState, PlayerInput};
+mod actions;
 mod charge_hud;
 mod death_overlay;
 mod drops;
@@ -37,7 +38,7 @@ use bevy::{
 };
 use image::codecs::gif::{GifEncoder, Repeat};
 use networking::ClientTransport;
-use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, look_direction};
+use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT};
 use protocol::{
     ClientMessage, EXPLOSIVE_BOW_ITEM, EditRejection, Health, InputBatch, InputPacket, Inventory,
     MAX_INPUT_BATCH, ServerMessage, Snapshot,
@@ -220,7 +221,8 @@ struct ClientSession {
     inventory: Inventory,
     noclip_requested: bool,
     jump_pending: bool,
-    attack_pending: bool,
+    /// Held attack action, resolved against the held item each frame.
+    attack_held: bool,
     /// When the last melee swing started, for the held-item swing animation.
     swing_at: Option<Instant>,
     pending: VecDeque<PlayerInput>,
@@ -234,8 +236,6 @@ struct ClientSession {
     selected: u8,
     /// Item id assigned to each hotbar slot; `None` is an empty slot.
     hotbar: [Option<u32>; 10],
-    /// One-tick bow draw request, consumed like jump so a click draws once.
-    draw_pending: bool,
     packages: package_hud::ServerPackages,
     request: u64,
     accepted_edits: u64,
@@ -288,7 +288,7 @@ impl Default for ClientSession {
             inventory: Inventory::default(),
             noclip_requested: false,
             jump_pending: false,
-            attack_pending: false,
+            attack_held: false,
             pending: VecDeque::with_capacity(256),
             swing_at: None,
             sequence: 0,
@@ -303,7 +303,6 @@ impl Default for ClientSession {
                 hotbar[5] = Some(EXPLOSIVE_BOW_ITEM);
                 hotbar
             },
-            draw_pending: false,
             packages: package_hud::ServerPackages::default(),
             request: 0,
             accepted_edits: 0,
@@ -338,14 +337,6 @@ impl ClientSession {
     fn consume_jump(&mut self, flight: bool, held: bool) -> bool {
         let pressed = std::mem::take(&mut self.jump_pending);
         if flight { held } else { pressed }
-    }
-    /// One-tick melee request, consumed like jump so a click swings once.
-    fn consume_attack(&mut self) -> bool {
-        std::mem::take(&mut self.attack_pending)
-    }
-    /// One-tick bow draw request, consumed like jump so a click draws once.
-    fn consume_draw(&mut self) -> bool {
-        std::mem::take(&mut self.draw_pending)
     }
     fn predict_input(
         &mut self,
@@ -493,6 +484,7 @@ impl Plugin for ClientPlugin {
             observe_character_bodies.in_set(controller::ControllerSet::Intent),
         );
         app.init_resource::<ClientSession>()
+            .init_resource::<actions::Actions>()
             .init_resource::<RemotePlayers>()
             .init_resource::<RemoteActors>()
             .init_resource::<pause_menu::PauseMenu>()
@@ -525,8 +517,9 @@ impl Plugin for ClientPlugin {
                     death_overlay::sync,
                     pause_menu::sync_cursor.run_if(windowed),
                     controls.run_if(windowed),
+                    actions::bindings,
+                    actions::resolve,
                     predict,
-                    edit_blocks,
                     held_item::update,
                     present_players,
                     game_hud::update,
@@ -1092,7 +1085,6 @@ fn reconcile(
 }
 
 fn controls(
-    keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<AccumulatedMouseMotion>,
     options: Res<Options>,
     mut session: ResMut<ClientSession>,
@@ -1106,28 +1098,8 @@ fn controls(
         session.yaw = (session.yaw - mouse.delta.x * 0.0025) % std::f32::consts::TAU;
         session.pitch = (session.pitch - mouse.delta.y * 0.0025).clamp(-1.54, 1.54);
     }
-    session.selected = selected_slot(&keys).unwrap_or(session.selected);
 }
 
-fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
-    [
-        KeyCode::Digit1,
-        KeyCode::Digit2,
-        KeyCode::Digit3,
-        KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
-        KeyCode::Digit7,
-        KeyCode::Digit8,
-        KeyCode::Digit9,
-        KeyCode::Digit0,
-    ]
-    .into_iter()
-    .enumerate()
-    .filter(|(_, key)| keys.just_pressed(*key))
-    .map(|(index, _)| index as u8 + 1)
-    .next_back()
-}
 #[allow(clippy::too_many_arguments)] // Prediction reads input, pause state and world observations.
 fn predict(
     time: Res<Time>,
@@ -1135,6 +1107,7 @@ fn predict(
     cursor: Option<Single<&CursorOptions>>,
     options: Res<Options>,
     world: Res<VoxelWorld>,
+    actions: Res<actions::Actions>,
     mut session: ResMut<ClientSession>,
     loose: Res<loose_blocks::LooseBlocks>,
     menu: Res<pause_menu::PauseMenu>,
@@ -1155,13 +1128,10 @@ fn predict(
         }
         return;
     }
-    if !menu.blocks_gameplay()
-        && !options.bot
-        && !cursor_visible
-        && keys.just_pressed(KeyCode::KeyV)
-    {
+    if actions.noclip {
         session.noclip_requested = !session.noclip_requested;
     }
+    session.selected = actions.slot.unwrap_or(session.selected);
     if !session.noclip_requested
         && !session.state.motion.noclip
         && world
@@ -1185,9 +1155,8 @@ fn predict(
             continue;
         }
         session.sequence += 1;
-        let mut movement = [0.0, 0.0];
+        let mut movement = actions.movement;
         let mut jump = false;
-        let mut descend = false;
         if options.bot && !menu.blocks_gameplay() {
             // Reproducible traversal for profiling the real rendered client.
             let phase = (session.sequence / 240) % 4;
@@ -1199,13 +1168,8 @@ fn predict(
             };
             jump = session.sequence.is_multiple_of(90);
         } else if !cursor_visible && !menu.blocks_gameplay() {
-            movement[0] = f32::from(u8::from(keys.pressed(KeyCode::KeyD)))
-                - f32::from(u8::from(keys.pressed(KeyCode::KeyA)));
-            movement[1] = f32::from(u8::from(keys.pressed(KeyCode::KeyW)))
-                - f32::from(u8::from(keys.pressed(KeyCode::KeyS)));
             let flight = session.noclip_requested || session.state.motion.noclip;
-            jump = session.consume_jump(flight, keys.pressed(KeyCode::Space));
-            descend = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+            jump = session.consume_jump(flight, actions.jump);
         }
         let input = PlayerInput {
             sequence: session.sequence,
@@ -1214,17 +1178,12 @@ fn predict(
             pitch: session.pitch,
             selected: session.held_item(),
             jump,
-            descend,
+            descend: actions.descend,
             noclip: session.noclip_requested,
-            attack: session.consume_attack(),
-            sprint: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
-            draw: session.consume_draw(),
-            crouch: keys.pressed(KeyCode::KeyC),
-            ability: [
-                keys.just_pressed(KeyCode::KeyQ),
-                keys.just_pressed(KeyCode::KeyE),
-                keys.just_pressed(KeyCode::KeyR),
-            ],
+            attack: session.attack_held,
+            sprint: actions.sprint,
+            crouch: actions.crouch,
+            ability: actions.ability,
             aim: [0.0, 1.0],
         };
         session.predict_input(&world, input, colliders);
@@ -1245,86 +1204,6 @@ fn predict(
             session.disconnect(error);
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)] // Gate gameplay actions separately from menu interaction.
-fn edit_blocks(
-    buttons: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
-    cursor: Option<Single<&CursorOptions>>,
-    world: Res<VoxelWorld>,
-    mut session: ResMut<ClientSession>,
-    menu: Res<pause_menu::PauseMenu>,
-) {
-    // Headless spawns no window entity, so there is no `CursorOptions`: treat
-    // the cursor as hidden, matching what the bot path already assumes.
-    let cursor_visible = cursor.is_some_and(|cursor| cursor.visible);
-    if menu.blocks_gameplay()
-        || cursor_visible
-        || session.transport.is_none()
-        || session.id.is_none()
-        || session.health.is_depleted()
-    {
-        session.draw_pending = false;
-        return;
-    }
-    let strike = keys.just_pressed(KeyCode::KeyF);
-    // A held weapon always attacks on left click — swinging or firing into the
-    // air — rather than only when a target is under the crosshair. Blocks still
-    // mine on left click; F strikes regardless. The swing animation plays on
-    // every left click, so the held item always reacts.
-    let armed = session.packages.is_equipment(session.held_item())
-        || session.held_item() == EXPLOSIVE_BOW_ITEM;
-    let melee = buttons.pressed(MouseButton::Left) && armed;
-    if melee {
-        session.attack_pending = true;
-    }
-    if buttons.just_pressed(MouseButton::Left) {
-        session.swing_at = Some(Instant::now());
-    }
-    let hit = buttons.just_pressed(MouseButton::Left) && !melee;
-    // The explosive bow draws on a single right click and fires itself at full
-    // draw; the motor owns the draw, so the server fires on the same edge. The
-    // swing animation spans the whole draw so the pull-back is visible.
-    let bow = session.held_item() == EXPLOSIVE_BOW_ITEM;
-    if bow && buttons.just_pressed(MouseButton::Right) && !strike && !hit {
-        session.draw_pending = true;
-        session.swing_at = Some(Instant::now());
-    }
-    if let Some(message) = block_action(&mut session, &world, strike, hit) {
-        session.send(message);
-    }
-}
-
-fn block_action(
-    session: &mut ClientSession,
-    world: &VoxelWorld,
-    strike: bool,
-    hit: bool,
-) -> Option<ClientMessage> {
-    if !strike && !hit {
-        return None;
-    }
-    let origin = session.state.motion.position + Vec3::Y * EYE_HEIGHT;
-    let direction = look_direction(session.yaw, session.pitch);
-    let hit = world.raycast(origin, direction, 6.0)?;
-    let expected_revision = world.chunks.get(&chunk_coord(hit.block))?.revision;
-    session.request += 1;
-    let request = session.request;
-    Some(if strike {
-        ClientMessage::Strike {
-            request,
-            target: hit.block,
-            expected_revision,
-        }
-    } else {
-        ClientMessage::Edit {
-            request,
-            target: hit.block,
-            block: 0,
-            expected_revision,
-        }
-    })
 }
 
 fn present_players(

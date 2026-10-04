@@ -1,6 +1,7 @@
 use crate::{
-    AbilityKind, Cast, CastBehavior, CharacterBody, CharacterIntent, CharacterState, CollisionShape,
-    Constraints, Dash, MAX_SLOTS, MotorOutput, MovementProfile, finite,
+    AbilityKind, BasicAttackKind, Cast, CastBehavior, CharacterBody, CharacterIntent,
+    CharacterState, CollisionShape, Constraints, Dash, MAX_SLOTS, MotorOutput, MovementProfile,
+    finite,
 };
 use glam::{Vec2, Vec3};
 use physics::DynamicCollider;
@@ -52,14 +53,16 @@ pub fn step_character(
             attempted: Vec2::new(character.motion.velocity.x, character.motion.velocity.z),
             fired: [None; MAX_SLOTS],
             basic_attack: false,
-            charge: draw_fraction(character.charge, profile.charge_ticks),
+            charge: draw_fraction(
+                character.charge,
+                body.basic_attack.map_or(0, |attack| attack.charge_ticks).max(1),
+            ),
             charge_release: None,
         };
     }
     let profile = profile.bounded();
     let input = intent.bounded();
     intent.jump = false;
-    intent.draw = false;
     // One grid build amortizes this tick's separation pass and every sweep.
     let broadphase = physics::BodyBroadphase::new(bodies);
     let mut motor = Motor {
@@ -201,16 +204,42 @@ fn abilities(motor: &mut Motor, character: &mut CharacterState) {
     for cooldown in character.cooldowns.iter_mut() {
         *cooldown = cooldown.saturating_sub(1);
     }
-    // Basic attack: a one-tick edge gated by the held weapon's cooldown. The
-    // host resolves the hit; the motor only owns the cadence.
+    // Basic attack: `attack` is held. A melee or admin weapon fires once on the
+    // press edge, gated by its cooldown; a ranged weapon charges while held and
+    // fires on release only at full charge, cancelling an early release.
     character.basic_attack_cooldown = character.basic_attack_cooldown.saturating_sub(1);
-    if motor.input.attack
-        && character.basic_attack_cooldown == 0
-        && !motor.constraints.action_locked
-        && let Some(attack) = motor.body.basic_attack
-    {
-        character.basic_attack_cooldown = attack.cooldown_ticks;
-        motor.basic_attack = true;
+    let pressed = motor.input.attack && !character.attack_held;
+    let released = !motor.input.attack && character.attack_held;
+    character.attack_held = motor.input.attack;
+    if let Some(attack) = motor.body.basic_attack {
+        match attack.kind {
+            BasicAttackKind::Melee | BasicAttackKind::Admin => {
+                if pressed
+                    && character.basic_attack_cooldown == 0
+                    && !motor.constraints.action_locked
+                {
+                    character.basic_attack_cooldown = attack.cooldown_ticks;
+                    motor.basic_attack = true;
+                }
+            }
+            BasicAttackKind::Ranged => {
+                let full = attack.charge_ticks.max(1);
+                if motor.input.attack && !motor.constraints.action_locked {
+                    character.drawing = true;
+                    character.charge = character.charge.saturating_add(1).min(full);
+                } else if released {
+                    if character.drawing
+                        && character.charge >= full
+                        && character.basic_attack_cooldown == 0
+                    {
+                        character.basic_attack_cooldown = attack.cooldown_ticks;
+                        motor.charge_release = Some(1.0);
+                    }
+                    character.drawing = false;
+                    character.charge = 0;
+                }
+            }
+        }
     }
     if let Some(cast) = character.cast {
         if cast.remaining > 1 {
@@ -290,27 +319,14 @@ fn resolve(motor: &mut Motor, character: &mut CharacterState, slot: u8, aim: Vec
     }
 }
 
-/// Run a one-shot bow draw: a `draw` edge starts it, it advances on its own, and
-/// it reports the release when it reaches full. The charge lives in replay state
-/// so prediction and authority agree on the slow and the release.
+/// Report the current draw fraction for the movement slow and the HUD. The
+/// `abilities` stage owns advancing and releasing the draw.
 fn charge(motor: &mut Motor, character: &mut CharacterState) {
-    let full = motor.profile.charge_ticks;
-    if motor.input.draw && !character.drawing {
-        character.drawing = true;
-        character.charge = 0;
-    }
-    if !character.drawing {
-        character.charge = 0;
-        motor.charge = 0.0;
-        return;
-    }
-    character.charge = character.charge.saturating_add(1).min(full);
-    motor.charge = draw_fraction(character.charge, full);
-    if character.charge >= full {
-        character.drawing = false;
-        character.charge = 0;
-        motor.charge_release = Some(1.0);
-    }
+    motor.charge = if character.drawing {
+        draw_fraction(character.charge, motor.draw_ticks())
+    } else {
+        0.0
+    };
 }
 
 /// Draw fraction in 0..1; a zero full draw reads as fully charged.
@@ -325,6 +341,17 @@ fn draw_fraction(charge: u16, full: u16) -> f32 {
 /// Target-speed multiplier for a draw fraction: 1.0 undrawn, `mult` at full.
 fn draw_speed(mult: f32, fraction: f32) -> f32 {
     1.0 + (mult - 1.0) * fraction
+}
+
+impl Motor<'_> {
+    /// Ticks a ranged weapon draws before firing; 1 for any other weapon, so an
+    /// uncharged attack never reports a draw fraction.
+    fn draw_ticks(&self) -> u16 {
+        self.body
+            .basic_attack
+            .filter(|attack| attack.kind == BasicAttackKind::Ranged)
+            .map_or(1, |attack| attack.charge_ticks.max(1))
+    }
 }
 
 /// World-space aim direction: the body-relative aim rotated by yaw, or forward
@@ -391,10 +418,7 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
             1.0
         }
         * motor.constraints.speed_mult
-        * draw_speed(
-            motor.profile.charge_mult,
-            draw_fraction(character.charge, motor.profile.charge_ticks),
-        )
+        * draw_speed(motor.profile.charge_mult, motor.charge)
         * if character.cast.is_some_and(|cast| {
             motor
                 .body
