@@ -49,11 +49,18 @@ pub(crate) fn update(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut play: MessageWriter<crate::sounds::PlaySound>,
     mut state: Local<HeldState>,
     camera: Query<Entity, With<PlayerCamera>>,
     mut transforms: Query<&mut Transform>,
 ) {
     let item = session.held_item();
+    if state.item != item && item != 0 {
+        play.write(crate::sounds::PlaySound {
+            event: "equip",
+            position: None,
+        });
+    }
 
     if item == 0 || session.transport.is_none() {
         if let Some(entity) = state.entity.take() {
