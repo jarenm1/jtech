@@ -1,5 +1,5 @@
-use controller::PlayerInput;
-mod bow_power_hud;
+use controller::{CharacterState, PlayerInput};
+mod charge_hud;
 mod death_overlay;
 mod drops;
 mod game_hud;
@@ -37,10 +37,10 @@ use bevy::{
 };
 use image::codecs::gif::{GifEncoder, Repeat};
 use networking::ClientTransport;
-use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, PlayerState, look_direction};
+use physics::{EYE_HEIGHT, FIXED_DT, PLAYER_HEIGHT, look_direction};
 use protocol::{
-    BowPower, ClientMessage, EXPLOSIVE_BOW_ITEM, EditRejection, Health, InputBatch, InputPacket,
-    Inventory, MAX_INPUT_BATCH, ServerMessage, Snapshot,
+    ClientMessage, EXPLOSIVE_BOW_ITEM, EditRejection, Health, InputBatch, InputPacket, Inventory,
+    MAX_INPUT_BATCH, ServerMessage, Snapshot,
 };
 use voxel_render::{RenderFocus, VoxelRenderPlugin, VoxelRenderStats};
 use voxel_world::{
@@ -212,7 +212,7 @@ struct ClientSession {
     status: String,
     id: Option<u64>,
     session: u64,
-    state: PlayerState,
+    state: CharacterState,
     // Authoritative respawn generation; 0 until the first life change.
     life: u64,
     // Replicated independently of movement prediction.
@@ -234,7 +234,8 @@ struct ClientSession {
     selected: u8,
     /// Item id assigned to each hotbar slot; `None` is an empty slot.
     hotbar: [Option<u32>; 10],
-    bow_power: BowPower,
+    /// Whether the bow draw is held this tick; the motor owns the charge.
+    drawing: bool,
     packages: package_hud::ServerPackages,
     request: u64,
     accepted_edits: u64,
@@ -281,7 +282,7 @@ impl Default for ClientSession {
             status: "Connecting".into(),
             id: None,
             session: 0,
-            state: PlayerState::default(),
+            state: CharacterState::default(),
             life: 0,
             health: Health::default(),
             inventory: Inventory::default(),
@@ -302,7 +303,7 @@ impl Default for ClientSession {
                 hotbar[5] = Some(EXPLOSIVE_BOW_ITEM);
                 hotbar
             },
-            bow_power: BowPower::default(),
+            drawing: false,
             packages: package_hud::ServerPackages::default(),
             request: 0,
             accepted_edits: 0,
@@ -348,7 +349,14 @@ impl ClientSession {
         input: PlayerInput,
         bodies: &[physics::DynamicCollider],
     ) {
-        controller::step_player_with_bodies(world, &mut self.state, &input, FIXED_DT, bodies);
+        controller::step_character_player(
+            world,
+            &mut self.state,
+            None,
+            &input,
+            FIXED_DT,
+            bodies,
+        );
         self.pending.push_back(input);
     }
     fn receive_action(&mut self, result: ActionResult) {
@@ -513,7 +521,6 @@ impl Plugin for ClientPlugin {
                     death_overlay::sync,
                     pause_menu::sync_cursor.run_if(windowed),
                     controls.run_if(windowed),
-                    bow_power_hud::cycle_on_click.run_if(pause_menu::gameplay_enabled),
                     predict,
                     edit_blocks,
                     held_item::update,
@@ -521,7 +528,7 @@ impl Plugin for ClientPlugin {
                     game_hud::update,
                     game_hud::update_fps,
                     health_hud::update,
-                    bow_power_hud::update,
+                    charge_hud::update,
                     package_hud::update,
                     scatter::sync_scatter,
                 )
@@ -679,7 +686,7 @@ fn setup(
             far: camera_far_distance(),
             ..default()
         }),
-        Transform::from_translation(session.state.position + Vec3::Y * EYE_HEIGHT),
+        Transform::from_translation(session.state.motion.position + Vec3::Y * EYE_HEIGHT),
         PlayerCamera,
     ));
     if options.headless {
@@ -701,7 +708,7 @@ fn setup(
     pause_menu::spawn(&mut commands);
     death_overlay::spawn(&mut commands, &mut images);
     health_hud::spawn(&mut commands);
-    bow_power_hud::spawn(&mut commands);
+    charge_hud::spawn(&mut commands);
     package_hud::spawn(&mut commands);
 }
 
@@ -754,7 +761,7 @@ fn receive_network(
                 session.packages = package_hud::ServerPackages::default();
                 session.id = Some(id);
                 session.session = token;
-                session.state = spawn;
+                session.state.motion = spawn;
                 session.noclip_requested = spawn.noclip;
                 session.jump_pending = false;
                 session.health = health;
@@ -1039,11 +1046,11 @@ fn reconcile(
         return;
     }
     session.last_tick = snapshot.tick;
-    let previous = session.state.position;
+    let previous = session.state.motion.position;
     let life_changed = snapshot.you.life != session.life;
     session.life = snapshot.you.life;
     session.health = snapshot.you.health;
-    session.state = snapshot.you.state.motion;
+    session.state = snapshot.you.state;
     while session
         .pending
         .front()
@@ -1069,9 +1076,9 @@ fn reconcile(
         return;
     }
     for input in &session.pending {
-        controller::step_player_with_bodies(world, &mut session.state, input, FIXED_DT, bodies);
+        controller::step_character_player(world, &mut session.state, None, input, FIXED_DT, bodies);
     }
-    let difference = previous - session.state.position;
+    let difference = previous - session.state.motion.position;
     session.max_correction = session.max_correction.max(difference.length());
     if difference.length_squared() < 4.0 {
         session.correction = (session.correction + difference).clamp_length_max(2.0);
@@ -1096,11 +1103,6 @@ fn controls(
         session.pitch = (session.pitch - mouse.delta.y * 0.0025).clamp(-1.54, 1.54);
     }
     session.selected = selected_slot(&keys).unwrap_or(session.selected);
-    if !options.bot && !cursor.visible && keys.just_pressed(KeyCode::KeyR) {
-        if session.held_item() == EXPLOSIVE_BOW_ITEM {
-            session.bow_power = session.bow_power.next();
-        }
-    }
 }
 
 fn selected_slot(keys: &ButtonInput<KeyCode>) -> Option<u8> {
@@ -1157,9 +1159,9 @@ fn predict(
         session.noclip_requested = !session.noclip_requested;
     }
     if !session.noclip_requested
-        && !session.state.noclip
+        && !session.state.motion.noclip
         && world
-            .block(session.state.position.floor().as_ivec3())
+            .block(session.state.motion.position.floor().as_ivec3())
             .is_none()
     {
         session.accumulator = 0.0;
@@ -1197,7 +1199,7 @@ fn predict(
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyA)));
             movement[1] = f32::from(u8::from(keys.pressed(KeyCode::KeyW)))
                 - f32::from(u8::from(keys.pressed(KeyCode::KeyS)));
-            let flight = session.noclip_requested || session.state.noclip;
+            let flight = session.noclip_requested || session.state.motion.noclip;
             jump = session.consume_jump(flight, keys.pressed(KeyCode::Space));
             descend = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
         }
@@ -1212,6 +1214,7 @@ fn predict(
             noclip: session.noclip_requested,
             attack: session.consume_attack(),
             sprint: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+            draw: session.drawing,
             crouch: keys.pressed(KeyCode::KeyC),
             ability: [
                 keys.just_pressed(KeyCode::KeyQ),
@@ -1247,8 +1250,6 @@ fn edit_blocks(
     cursor: Option<Single<&CursorOptions>>,
     world: Res<VoxelWorld>,
     mut session: ResMut<ClientSession>,
-    time: Res<Time>,
-    mut bow_repeat: Local<BowRepeat>,
     menu: Res<pause_menu::PauseMenu>,
 ) {
     // Headless spawns no window entity, so there is no `CursorOptions`: treat
@@ -1260,7 +1261,7 @@ fn edit_blocks(
         || session.id.is_none()
         || session.health.is_depleted()
     {
-        *bow_repeat = BowRepeat::default();
+        session.drawing = false;
         return;
     }
     let strike = keys.just_pressed(KeyCode::KeyF);
@@ -1278,52 +1279,29 @@ fn edit_blocks(
         session.swing_at = Some(Instant::now());
     }
     let hit = buttons.just_pressed(MouseButton::Left) && !melee;
-    let bow_shot = repeat_bow(
-        &mut bow_repeat,
-        time.elapsed_secs_f64(),
-        session.held_item() == EXPLOSIVE_BOW_ITEM
-            && buttons.pressed(MouseButton::Right)
-            && !strike
-            && !hit,
-        session.packages.bow_shots_per_second,
-    );
-    let secondary = if session.held_item() == EXPLOSIVE_BOW_ITEM {
-        bow_shot
-    } else {
-        buttons.just_pressed(MouseButton::Right)
-    };
-    if let Some(message) = block_action(&mut session, &world, strike, hit, secondary) {
+    // The explosive bow draws while right click is held and fires on release,
+    // at the strongest power the draw earned. The motor owns the charge, so the
+    // server validates the claimed power against the same held ticks.
+    let bow = session.held_item() == EXPLOSIVE_BOW_ITEM;
+    session.drawing = bow && buttons.pressed(MouseButton::Right) && !strike && !hit;
+    if bow && buttons.just_released(MouseButton::Right) {
+        let fraction = controller::MovementProfile::default()
+            .charge_fraction(session.state.charge);
+        if let Some(power) = protocol::BowPower::from_charge(fraction) {
+            session.request += 1;
+            let request = session.request;
+            let (yaw, pitch) = (session.yaw, session.pitch);
+            session.send(ClientMessage::FireBow {
+                request,
+                yaw,
+                pitch,
+                power,
+            });
+        }
+    }
+    if let Some(message) = block_action(&mut session, &world, strike, hit) {
         session.send(message);
     }
-}
-
-#[derive(Default)]
-struct BowRepeat {
-    next: Option<f64>,
-    rate: u32,
-}
-
-/// Repeat while held, preserving fractional-frame cadence without catch-up bursts.
-fn repeat_bow(repeat: &mut BowRepeat, now: f64, held: bool, rate: u32) -> bool {
-    if repeat.rate != rate {
-        repeat.next = None;
-        repeat.rate = rate;
-    }
-    if !held || rate == 0 {
-        repeat.next = None;
-        return false;
-    }
-    let interval = 1.0 / f64::from(rate);
-    let deadline = repeat.next.unwrap_or(now);
-    if now + 1e-9 < deadline {
-        return false;
-    }
-    repeat.next = Some(if now - deadline < interval {
-        deadline + interval
-    } else {
-        now + interval
-    });
-    true
 }
 
 fn block_action(
@@ -1331,22 +1309,11 @@ fn block_action(
     world: &VoxelWorld,
     strike: bool,
     hit: bool,
-    secondary: bool,
 ) -> Option<ClientMessage> {
-    // Bow shots do not need a nearby grid target. The server owns the arrow origin.
-    if !strike && !hit && secondary && session.held_item() == EXPLOSIVE_BOW_ITEM {
-        session.request += 1;
-        return Some(ClientMessage::FireBow {
-            request: session.request,
-            yaw: session.yaw,
-            pitch: session.pitch,
-            power: session.bow_power,
-        });
-    }
     if !strike && !hit {
         return None;
     }
-    let origin = session.state.position + Vec3::Y * EYE_HEIGHT;
+    let origin = session.state.motion.position + Vec3::Y * EYE_HEIGHT;
     let direction = look_direction(session.yaw, session.pitch);
     let hit = world.raycast(origin, direction, 6.0)?;
     let expected_revision = world.chunks.get(&chunk_coord(hit.block))?.revision;
@@ -1380,9 +1347,9 @@ fn present_players(
     mut visibility: Query<&mut Visibility, With<RemoteActorEntity>>,
 ) {
     session.correction *= (-18.0 * time.delta_secs()).exp();
-    camera.translation = session.state.position + Vec3::Y * EYE_HEIGHT + session.correction;
+    camera.translation = session.state.motion.position + Vec3::Y * EYE_HEIGHT + session.correction;
     camera.rotation = Quat::from_rotation_y(session.yaw) * Quat::from_rotation_x(session.pitch);
-    focus.0 = session.state.position;
+    focus.0 = session.state.motion.position;
     for remote in remotes.0.values() {
         if let Ok(mut transform) = transforms.get_mut(remote.entity) {
             let alpha = (remote.received.elapsed().as_secs_f32() / 0.05).clamp(0.0, 1.0);

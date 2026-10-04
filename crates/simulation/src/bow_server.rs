@@ -12,6 +12,13 @@ use protocol::{BowPower, EditRejection, MAX_ARROWS, ServerMessage};
 use voxel_world::{CHUNK_SIZE, VoxelWorld};
 
 impl Simulation {
+    /// Draw ticks a release must hold to fire at `power`, from the motor's
+    /// full-draw length and the power's minimum fraction.
+    fn charge_ticks(power: BowPower) -> u16 {
+        let full = controller::MovementProfile::default().charge_ticks;
+        (power.min_charge() * f32::from(full)).ceil() as u16
+    }
+
     pub(super) fn fire_bow(
         &mut self,
         world: &VoxelWorld,
@@ -46,6 +53,8 @@ impl Simulation {
             Some(EditRejection::PackageUnavailable)
         } else if now < player.next_bow_time {
             Some(EditRejection::Cooldown)
+        } else if player.recent_charge < Self::charge_ticks(power) {
+            Some(EditRejection::NotCharged)
         } else if !yaw.is_finite()
             || !pitch.is_finite()
             || pitch.abs() > std::f32::consts::FRAC_PI_2
@@ -378,6 +387,13 @@ mod tests {
     use glam::IVec3;
     use voxel_world::Chunk;
 
+    /// A player holding a full bow draw, so `fire_bow` passes the charge check.
+    fn charged_player() -> Player {
+        let mut player = Player::new();
+        player.recent_charge = 60;
+        player
+    }
+
     #[test]
     fn bow_admits_25_shots_per_second_without_idle_or_replay_bursts() {
         let mut app = App::new();
@@ -385,7 +401,7 @@ mod tests {
         let mut world = VoxelWorld::default();
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        sim.players.insert(1, Player::new());
+        sim.players.insert(1, charged_player());
         let mut request = 0;
         for tick in 0..600 {
             sim.tick = tick;
@@ -424,7 +440,7 @@ mod tests {
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
         world.set_block(IVec3::new(5, 10, 4), 3).unwrap();
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = Player::new();
+        let mut player = charged_player();
         player.state.motion.position = Vec3::new(4.5, 9.0, 4.5);
         sim.players.insert(1, player);
         let yaw = -std::f32::consts::FRAC_PI_2;
@@ -479,7 +495,7 @@ mod tests {
             }
         }
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = Player::new();
+        let mut player = charged_player();
         player.state.motion.position = Vec3::new(10.5, 10.0, 10.5);
         player.state.motion.grounded = true;
         sim.players.insert(1, player);
@@ -510,7 +526,7 @@ mod tests {
         let mut world = VoxelWorld::default();
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = Player::new();
+        let mut player = charged_player();
         player.state.motion.position = Vec3::new(10.5, 10.0, 10.5);
         let center = player.state.motion.position;
         sim.players.insert(1, player);
@@ -550,7 +566,7 @@ mod tests {
             (4, Vec3::new(9.5, 10.0, 10.5), true),
             (5, Vec3::new(20.5, 10.0, 10.5), false),
         ] {
-            let mut player = Player::new();
+            let mut player = charged_player();
             player.state.motion.position = position;
             player.state.motion.noclip = noclip;
             sim.players.insert(id, player);
@@ -587,7 +603,7 @@ mod tests {
         let mut world = VoxelWorld::default();
         world.insert(IVec3::ZERO, Chunk::from_runs(0, &[(32768, 0)]).unwrap());
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = Player::new();
+        let mut player = charged_player();
         player.state.motion.position = Vec3::splat(10.0);
         sim.players.insert(1, player);
         sim.damage_player(1, 100);
@@ -625,7 +641,7 @@ mod tests {
             }
         }
         let mut sim = app.world_mut().resource_mut::<Simulation>();
-        let mut player = Player::new();
+        let mut player = charged_player();
         player.state.motion.position = Vec3::new(10.5, 20.0, 10.5);
         player
             .known

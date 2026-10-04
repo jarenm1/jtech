@@ -56,6 +56,7 @@ struct Bot {
     max_error: f32,
     yaw: f32,
     attack: bool,
+    draw: bool,
     actors: HashMap<u32, ActorSnapshot>,
     selected: u32,
     jitter: bool,
@@ -96,6 +97,7 @@ impl Bot {
             corrections: 0,
             yaw: 0.0,
             attack: false,
+            draw: false,
             actors: HashMap::new(),
             selected: 0,
             max_error: 0.0,
@@ -304,6 +306,7 @@ impl Bot {
             pitch,
             jump: movement != [0.0; 2],
             attack: self.attack,
+            draw: self.draw,
             selected: self.selected,
             ..Default::default()
         };
@@ -697,6 +700,10 @@ fn explosive_bow() -> Result<()> {
     // Arrows collide with characters, and both bots spawn on the same tile:
     // walk the second bot out of the fixture lane so the wall shot is clear.
     drive_second(&mut app, &mut first, &mut second, 24, [0.0, 1.0], 0.0)?;
+    // Charge the bow: the server validates the claimed power against the held
+    // draw, so hold it past the standard-power threshold before firing.
+    first.draw = true;
+    drive(&mut app, &mut [&mut first, &mut second], 40, [0.0; 2], 0.0)?;
     let yaw = -std::f32::consts::FRAC_PI_2;
     let shot = ClientMessage::FireBow {
         request: 1,
@@ -826,6 +833,7 @@ fn explosive_bow() -> Result<()> {
             "later bow shot did not replicate to both clients",
         )?;
     }
+    first.draw = false;
     fs::remove_dir_all(&package_root)?;
     Ok(())
 }

@@ -24,6 +24,8 @@ pub struct PlayerInput {
     pub selected: u32,
     /// Held sprint request.
     pub sprint: bool,
+    /// Held bow draw request: charges while held, fires on release.
+    pub draw: bool,
     /// Held crouch request.
     pub crouch: bool,
     /// One-tick ability requests, one per slot.
@@ -112,6 +114,7 @@ pub fn step_character_player(
         attack: input.attack,
         held_item: 0,
         sprint: input.sprint,
+        draw: input.draw,
         crouch: input.crouch,
         ability: input.ability,
         aim: Vec2::from_array(input.aim),

@@ -5,8 +5,6 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions},
 };
 
-use protocol::BowPower;
-
 use crate::{ClientSession, Options, game_hud::GameplayHud, inventory_ui::InventoryUi};
 
 #[derive(Resource, Default)]
@@ -40,12 +38,8 @@ pub(crate) struct PausePanel;
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     Resume,
-    Power,
     Quit,
 }
-
-#[derive(Component)]
-pub(crate) struct PowerText;
 
 pub(crate) fn spawn(commands: &mut Commands) {
     commands
@@ -94,7 +88,6 @@ pub(crate) fn spawn(commands: &mut Commands) {
                     ));
                     for (action, label) in [
                         (MenuAction::Resume, "Resume"),
-                        (MenuAction::Power, "Bow power"),
                         (MenuAction::Quit, "Quit game"),
                     ] {
                         panel
@@ -111,7 +104,7 @@ pub(crate) fn spawn(commands: &mut Commands) {
                                 BackgroundColor(button_color(Interaction::None)),
                             ))
                             .with_children(|button| {
-                                let mut text = button.spawn((
+                                button.spawn((
                                     Text::new(label),
                                     TextFont {
                                         font_size: 19.0,
@@ -119,9 +112,6 @@ pub(crate) fn spawn(commands: &mut Commands) {
                                     },
                                     TextColor(Color::srgb(0.96, 0.94, 0.87)),
                                 ));
-                                if matches!(action, MenuAction::Power) {
-                                    text.insert(PowerText);
-                                }
                             });
                     }
                 });
@@ -160,7 +150,6 @@ pub(crate) fn input(
 pub(crate) fn actions(
     buttons: Query<(&Interaction, &MenuAction), Changed<Interaction>>,
     mut menu: ResMut<PauseMenu>,
-    mut session: ResMut<ClientSession>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if !menu.open {
@@ -172,7 +161,6 @@ pub(crate) fn actions(
         }
         match action {
             MenuAction::Resume => menu.resume(),
-            MenuAction::Power => session.bow_power = session.bow_power.next(),
             MenuAction::Quit => {
                 exit.write(AppExit::Success);
             }
@@ -191,15 +179,13 @@ pub(crate) fn button_color(interaction: Interaction) -> Color {
 #[allow(clippy::too_many_arguments)] // Synchronize independent cursor and UI components.
 pub(crate) fn sync(
     menu: Res<PauseMenu>,
-    session: Res<ClientSession>,
     mut panel: Single<&mut Node, With<PausePanel>>,
     mut hud: Query<&mut Visibility, With<GameplayHud>>,
     mut buttons: Query<(&Interaction, &mut BackgroundColor), With<MenuAction>>,
-    mut power: Single<&mut Text, With<PowerText>>,
-    mut shown: Local<(Option<bool>, Option<BowPower>)>,
+    mut shown: Local<Option<bool>>,
 ) {
-    if shown.0 != Some(menu.open) {
-        shown.0 = Some(menu.open);
+    if *shown != Some(menu.open) {
+        *shown = Some(menu.open);
         panel.display = if menu.open {
             Display::Flex
         } else {
@@ -218,10 +204,6 @@ pub(crate) fn sync(
         if color.0 != desired {
             color.0 = desired;
         }
-    }
-    if shown.1 != Some(session.bow_power) {
-        shown.1 = Some(session.bow_power);
-        power.0 = format!("Bow power   {}", session.bow_power.label());
     }
 }
 
@@ -242,10 +224,6 @@ pub(crate) fn sync_cursor(
     } else {
         CursorGrabMode::Locked
     };
-}
-
-pub(crate) fn gameplay_enabled(menu: Res<PauseMenu>) -> bool {
-    !menu.blocks_gameplay()
 }
 
 #[cfg(test)]
@@ -338,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_loss_opens_menu_and_menu_actions_change_power_and_exit() {
+    fn focus_loss_opens_menu_and_quit_exits() {
         let mut app = app();
         app.world_mut()
             .query::<&mut Window>()
@@ -347,13 +325,6 @@ mod tests {
             .focused = false;
         app.update();
         assert!(app.world().resource::<PauseMenu>().open);
-        let power = app.world().resource::<ClientSession>().bow_power;
-        press_action(&mut app, MenuAction::Power);
-        app.update();
-        assert_eq!(
-            app.world().resource::<ClientSession>().bow_power,
-            power.next()
-        );
         press_action(&mut app, MenuAction::Quit);
         app.update();
         assert_eq!(app.world().resource::<Messages<AppExit>>().len(), 1);

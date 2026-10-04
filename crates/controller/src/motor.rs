@@ -25,6 +25,10 @@ struct Motor<'a> {
     fired: [Option<Vec2>; MAX_SLOTS],
     /// Whether the held weapon's basic attack fired this tick.
     basic_attack: bool,
+    /// Draw fraction reached this tick, for the host and the HUD.
+    charge: f32,
+    /// Release edge with the fraction reached, when the draw cleared this tick.
+    charge_release: Option<f32>,
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -48,6 +52,8 @@ pub fn step_character(
             attempted: Vec2::new(character.motion.velocity.x, character.motion.velocity.z),
             fired: [None; MAX_SLOTS],
             basic_attack: false,
+            charge: draw_fraction(character.charge, profile.charge_ticks),
+            charge_release: None,
         };
     }
     let profile = profile.bounded();
@@ -73,12 +79,15 @@ pub fn step_character(
         attempted: Vec2::ZERO,
         fired: [None; MAX_SLOTS],
         basic_attack: false,
+        charge: 0.0,
+        charge_release: None,
     };
     status(&mut motor, character);
     sanitize(&mut motor, character);
     stance(&mut motor, character);
     contact(&mut motor, character);
     abilities(&mut motor, character);
+    charge(&mut motor, character);
     steer(&mut motor, character);
     gravity(&mut motor, character);
     sweep_horizontal(&mut motor, character);
@@ -88,6 +97,8 @@ pub fn step_character(
         attempted: motor.attempted,
         fired: motor.fired,
         basic_attack: motor.basic_attack,
+        charge: motor.charge,
+        charge_release: motor.charge_release,
     }
 }
 
@@ -278,6 +289,40 @@ fn resolve(motor: &mut Motor, character: &mut CharacterState, slot: u8, aim: Vec
     }
 }
 
+/// Accumulate a held bow draw and report the release edge. The charge lives in
+/// replay state so prediction and authority agree on the movement slow.
+fn charge(motor: &mut Motor, character: &mut CharacterState) {
+    let full = motor.profile.charge_ticks;
+    if motor.input.draw {
+        character.charge = character.charge.saturating_add(1).min(full);
+        character.drawing = true;
+        motor.charge = draw_fraction(character.charge, full);
+        return;
+    }
+    if character.drawing {
+        character.drawing = false;
+        if character.charge >= motor.profile.charge_min_ticks {
+            motor.charge_release = Some(draw_fraction(character.charge, full));
+        }
+    }
+    character.charge = 0;
+    motor.charge = 0.0;
+}
+
+/// Draw fraction in 0..1; a zero full draw reads as fully charged.
+fn draw_fraction(charge: u16, full: u16) -> f32 {
+    if full == 0 {
+        1.0
+    } else {
+        (f32::from(charge) / f32::from(full)).clamp(0.0, 1.0)
+    }
+}
+
+/// Target-speed multiplier for a draw fraction: 1.0 undrawn, `mult` at full.
+fn draw_speed(mult: f32, fraction: f32) -> f32 {
+    1.0 + (mult - 1.0) * fraction
+}
+
 /// World-space aim direction: the body-relative aim rotated by yaw, or forward
 /// when the aim is zero.
 fn aim_vector(motor: &Motor, character: &CharacterState) -> Vec2 {
@@ -342,6 +387,10 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
             1.0
         }
         * motor.constraints.speed_mult
+        * draw_speed(
+            motor.profile.charge_mult,
+            draw_fraction(character.charge, motor.profile.charge_ticks),
+        )
         * if character.cast.is_some_and(|cast| {
             motor
                 .body

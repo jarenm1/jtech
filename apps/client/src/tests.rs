@@ -1,5 +1,6 @@
 use super::*;
-use controller::{CharacterState, step_player};
+use controller::{CharacterState, step_character_player, step_player};
+use physics::PlayerState;
 use protocol::PlayerSnapshot;
 use voxel_world::{AIR, STONE};
 fn arena() -> VoxelWorld {
@@ -27,7 +28,10 @@ fn reconciliation_preserves_blast_momentum_through_input_replay() {
         ..default()
     };
     let mut client = ClientSession {
-        state: start,
+        state: CharacterState {
+            motion: start,
+            ..default()
+        },
         ..default()
     };
     for sequence in 1..=10 {
@@ -67,12 +71,12 @@ fn reconciliation_preserves_blast_momentum_through_input_replay() {
         );
     }
     reconcile(&mut client, &world, &snapshot, &[]);
-    assert_eq!(client.state, expected);
-    assert!(client.state.position.x > start.position.x);
-    assert!(client.state.position.y > start.position.y);
-    assert!(client.state.external_velocity.x > 0.0);
+    assert_eq!(client.state.motion, expected);
+    assert!(client.state.motion.position.x > start.position.x);
+    assert!(client.state.motion.position.y > start.position.y);
+    assert!(client.state.motion.external_velocity.x > 0.0);
     reconcile(&mut client, &world, &snapshot, &[]);
-    assert_eq!(client.state, expected);
+    assert_eq!(client.state.motion, expected);
 }
 #[test]
 fn reconciliation_copies_authoritative_health_without_predicting_damage() {
@@ -84,7 +88,10 @@ fn reconciliation_copies_authoritative_health_without_predicting_damage() {
         ..default()
     };
     let mut client = ClientSession {
-        state: start,
+        state: CharacterState {
+            motion: start,
+            ..default()
+        },
         ..default()
     };
     let mut health = Health::default();
@@ -108,7 +115,7 @@ fn reconciliation_copies_authoritative_health_without_predicting_damage() {
     });
     reconcile(&mut client, &world, &snapshot, &[]);
     assert_eq!(client.health, health);
-    assert!(client.state.position.x > start.position.x);
+    assert!(client.state.motion.position.x > start.position.x);
     snapshot.tick += 1;
     snapshot.you.health.damage(u16::MAX);
     reconcile(&mut client, &world, &snapshot, &[]);
@@ -125,16 +132,19 @@ fn movement_prediction_preserves_replicated_health() {
         let mut health = Health::default();
         health.damage(damage);
         let mut client = ClientSession {
-            state: PlayerState {
-                position: Vec3::new(0.5, 0.0, 0.5),
-                velocity: Vec3::ZERO,
-                grounded: true,
+            state: CharacterState {
+                motion: PlayerState {
+                    position: Vec3::new(0.5, 0.0, 0.5),
+                    velocity: Vec3::ZERO,
+                    grounded: true,
+                    ..default()
+                },
                 ..default()
             },
             health,
             ..default()
         };
-        let start = client.state;
+        let start = client.state.motion;
         for sequence in 1..=20 {
             client.predict_input(
                 &world,
@@ -147,7 +157,7 @@ fn movement_prediction_preserves_replicated_health() {
             );
         }
         assert_eq!(client.health, health);
-        assert!(client.state.position.x > start.position.x);
+        assert!(client.state.motion.position.x > start.position.x);
         assert_eq!(client.pending.len(), 20);
     }
 }
@@ -180,7 +190,10 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
         ..default()
     };
     let mut client = ClientSession {
-        state: start,
+        state: CharacterState {
+            motion: start,
+            ..default()
+        },
         ..default()
     };
     let mut acknowledged = start;
@@ -197,8 +210,8 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
         }
         client.pending.push_back(input);
     }
-    client.state = expected;
-    client.state.position.x += 1.0;
+    client.state.motion = expected;
+    client.state.motion.position.x += 1.0;
     let snapshot = Snapshot {
         tick: 10,
         you: PlayerSnapshot {
@@ -212,7 +225,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
         actors: vec![],
     };
     reconcile(&mut client, &world, &snapshot, &[]);
-    assert_eq!(client.state, expected);
+    assert_eq!(client.state.motion, expected);
     assert_eq!(client.pending.front().unwrap().sequence, 11);
     assert_eq!(client.pending.back().unwrap().sequence, 30);
     assert!((client.correction.x - 1.0).abs() < 0.0001);
@@ -236,7 +249,7 @@ fn reconciliation_replays_only_unacknowledged_inputs_and_keeps_smoothing_out_of_
         &[],
     );
     assert!(client.pending.is_empty());
-    assert_eq!(client.state, expected);
+    assert_eq!(client.state.motion, expected);
 }
 #[test]
 fn terrain_changes_are_used_when_replaying_prediction() {
@@ -248,7 +261,10 @@ fn terrain_changes_are_used_when_replaying_prediction() {
         ..default()
     };
     let mut client = ClientSession {
-        state: start,
+        state: CharacterState {
+            motion: start,
+            ..default()
+        },
         ..default()
     };
     for sequence in 1..=20 {
@@ -257,10 +273,10 @@ fn terrain_changes_are_used_when_replaying_prediction() {
             movement: [1.0, 0.0],
             ..default()
         };
-        step_player(&world, &mut client.state, &input, FIXED_DT);
+        step_character_player(&world, &mut client.state, None, &input, FIXED_DT, &[]);
         client.pending.push_back(input);
     }
-    assert!(client.state.position.x > 2.0);
+    assert!(client.state.motion.position.x > 2.0);
     for y in 0..3 {
         world.set_block(IVec3::new(1, y, 0), STONE);
     }
@@ -281,8 +297,8 @@ fn terrain_changes_are_used_when_replaying_prediction() {
         },
         &[],
     );
-    assert!((client.state.position.x - 0.7).abs() < 0.0001);
-    assert!(!physics::overlaps_block(&client.state, IVec3::new(1, 0, 0)));
+    assert!((client.state.motion.position.x - 0.7).abs() < 0.0001);
+    assert!(!physics::overlaps_block(&client.state.motion, IVec3::new(1, 0, 0)));
 }
 #[test]
 fn reconciliation_uses_authoritative_loose_block_colliders() {
@@ -294,7 +310,10 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
         ..default()
     };
     let mut client = ClientSession {
-        state: start,
+        state: CharacterState {
+            motion: start,
+            ..default()
+        },
         ..default()
     };
     for sequence in 1..=20 {
@@ -303,7 +322,7 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
             movement: [1.0, 0.0],
             ..default()
         };
-        step_player(&world, &mut client.state, &input, FIXED_DT);
+        step_character_player(&world, &mut client.state, None, &input, FIXED_DT, &[]);
         client.pending.push_back(input);
     }
     let body = physics::DynamicCollider::cube(1, Vec3::new(1.5, 0.5, 0.5), Vec3::ZERO);
@@ -324,7 +343,7 @@ fn reconciliation_uses_authoritative_loose_block_colliders() {
         },
         &[body],
     );
-    assert!((client.state.position.x - 0.7).abs() < 0.001);
+    assert!((client.state.motion.position.x - 0.7).abs() < 0.001);
 }
 #[test]
 fn action_feedback_tracks_partial_hits_destruction_and_rejections() {
@@ -389,188 +408,58 @@ fn bow_slot_selection_and_untargeted_shot_routing() {
     assert_eq!(selected_slot(&keys), Some(6));
     let mut client = ClientSession {
         selected: selected_slot(&keys).unwrap(),
-        yaw: 0.75,
-        pitch: 1.0,
         ..default()
     };
-    // Empty/unloaded terrain and sky aiming must not suppress bow shots.
+    // Bow fire moved to `edit_blocks` on right-click release, so `block_action`
+    // only routes grid strikes and edits and never fires without a target.
     let world = VoxelWorld::default();
-    assert!(matches!(
-        block_action(&mut client, &world, false, false, true),
-        Some(ClientMessage::FireBow {
-            request: 1,
-            yaw: 0.75,
-            pitch: 1.0,
-            power: BowPower::Standard,
-        })
-    ));
-    assert!(block_action(&mut client, &world, false, false, false).is_none());
-    assert!(block_action(&mut client, &world, false, true, false).is_none());
-    assert_eq!(client.request, 1);
+    assert!(block_action(&mut client, &world, false, false).is_none());
+    assert!(block_action(&mut client, &world, false, true).is_none());
+    assert_eq!(client.request, 0);
     keys.reset_all();
     keys.press(KeyCode::Digit3);
     client.selected = selected_slot(&keys).unwrap();
-    assert!(block_action(&mut client, &world, false, false, true).is_none());
-}
-#[test]
-fn bow_requests_copy_each_selected_power() {
-    let mut client = ClientSession {
-        selected: 6,
-        ..default()
-    };
-    let world = VoxelWorld::default();
-    for (index, power) in [
-        BowPower::Low,
-        BowPower::Standard,
-        BowPower::High,
-        BowPower::Extreme,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        client.bow_power = power;
-        assert!(matches!(
-            block_action(&mut client, &world, false, false, true),
-            Some(ClientMessage::FireBow { power: sent, request, .. })
-                if sent == power && request == index as u64 + 1
-        ));
-    }
-}
-#[test]
-fn bow_power_keyboard_cycles_once_and_preserves_selection_across_slots() {
-    let mut app = App::new();
-    app.insert_resource(Options {
-        server: "127.0.0.1:4000".parse().unwrap(),
-        ..default()
-    })
-    .insert_resource(ClientSession {
-        selected: 6,
-        ..default()
-    })
-    .init_resource::<ButtonInput<KeyCode>>()
-    .init_resource::<AccumulatedMouseMotion>()
-    .init_resource::<pause_menu::PauseMenu>()
-    .add_systems(Update, controls);
-    let cursor = app
-        .world_mut()
-        .spawn(CursorOptions {
-            visible: false,
-            grab_mode: CursorGrabMode::Locked,
-            ..default()
-        })
-        .id();
-    assert_eq!(
-        app.world().resource::<ClientSession>().bow_power,
-        BowPower::Standard
-    );
-    for expected in [
-        BowPower::High,
-        BowPower::Extreme,
-        BowPower::Low,
-        BowPower::Standard,
-    ] {
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::KeyR);
-        app.update();
-        assert_eq!(app.world().resource::<ClientSession>().bow_power, expected);
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .clear();
-        app.update();
-        assert_eq!(app.world().resource::<ClientSession>().bow_power, expected);
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .reset_all();
-    }
-    for key in [KeyCode::Digit3, KeyCode::Digit6] {
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(key);
-        app.update();
-        assert_eq!(
-            app.world().resource::<ClientSession>().bow_power,
-            BowPower::Standard
-        );
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .reset_all();
-    }
-    app.world_mut()
-        .entity_mut(cursor)
-        .get_mut::<CursorOptions>()
-        .unwrap()
-        .visible = true;
-    app.world_mut()
-        .resource_mut::<ButtonInput<KeyCode>>()
-        .press(KeyCode::KeyR);
-    app.update();
-    assert_eq!(
-        app.world().resource::<ClientSession>().bow_power,
-        BowPower::Standard
-    );
-    app.world_mut()
-        .entity_mut(cursor)
-        .get_mut::<CursorOptions>()
-        .unwrap()
-        .visible = false;
-    app.world_mut().resource_mut::<ClientSession>().selected = 3;
-    app.update();
-    assert_eq!(
-        app.world().resource::<ClientSession>().bow_power,
-        BowPower::Standard
-    );
+    assert!(block_action(&mut client, &world, false, false).is_none());
 }
 #[test]
 fn equipped_bow_hits_and_debug_launches_use_grid_actions() {
     let mut client = ClientSession {
         selected: 6,
         pitch: -1.0,
-        state: PlayerState {
-            position: Vec3::new(0.5, 0.0, 0.5),
+        state: CharacterState {
+            motion: PlayerState {
+                position: Vec3::new(0.5, 0.0, 0.5),
+                ..default()
+            },
             ..default()
         },
         ..default()
     };
     let world = arena();
     assert!(matches!(
-        block_action(&mut client, &world, false, true, true),
+        block_action(&mut client, &world, false, true),
         Some(ClientMessage::Edit { block: 0, .. })
     ));
     assert!(matches!(
-        block_action(&mut client, &world, true, false, true),
+        block_action(&mut client, &world, true, false),
         Some(ClientMessage::Strike { .. })
     ));
-    // Material and empty slots never send a secondary action.
-    for selected in [1, 5, 7, 8, 9, 10] {
-        client.selected = selected;
-        assert!(block_action(&mut client, &world, false, false, true).is_none());
-    }
-}
-#[test]
-fn bow_cadence_changes_immediately_and_zero_rate_disables_firing() {
-    let mut repeat = BowRepeat::default();
-    assert!(repeat_bow(&mut repeat, 0.0, true, 1));
-    assert!(repeat_bow(&mut repeat, 0.1, true, 10));
-    assert!(!repeat_bow(&mut repeat, 0.11, true, 10));
-    assert!(repeat_bow(&mut repeat, 0.2, true, 10));
-    assert!(!repeat_bow(&mut repeat, 0.3, true, 0));
-    assert_eq!(repeat.next, None);
-    assert!(!repeat_bow(&mut repeat, 1.0, true, 0));
-    assert!(repeat_bow(&mut repeat, 1.1, true, 25));
 }
 #[test]
 fn reconciliation_replays_flight_mode_and_returns_to_walking() {
     let world = arena();
     let mut client = ClientSession {
-        state: PlayerState {
-            position: Vec3::new(0.5, 4.0, 0.5),
+        state: CharacterState {
+            motion: PlayerState {
+                position: Vec3::new(0.5, 4.0, 0.5),
+                ..default()
+            },
             ..default()
         },
         noclip_requested: true,
         ..default()
     };
-    let mut server = client.state;
+    let mut server = client.state.motion;
     let mut acknowledged = server;
     for sequence in 1..=10 {
         let input = PlayerInput {
@@ -598,8 +487,8 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
         actors: vec![],
     };
     reconcile(&mut client, &world, &snapshot, &[]);
-    assert_eq!(client.state, server);
-    assert!(client.state.noclip);
+    assert_eq!(client.state.motion, server);
+    assert!(client.state.motion.noclip);
     assert!(client.noclip_requested);
     client.noclip_requested = false;
     let input = PlayerInput {
@@ -627,9 +516,9 @@ fn reconciliation_replays_flight_mode_and_returns_to_walking() {
         );
     }
     reconcile(&mut client, &world, &snapshot, &[]);
-    assert_eq!(client.state, server);
-    assert!(!client.state.noclip);
-    assert!(client.state.velocity.y < 0.0);
+    assert_eq!(client.state.motion, server);
+    assert!(!client.state.motion.noclip);
+    assert!(client.state.motion.velocity.y < 0.0);
 }
 #[test]
 fn camera_far_distance_covers_vertical_corner_of_view_region() {
@@ -668,7 +557,10 @@ fn reordered_snapshots_ignore_stale_life_and_state() {
         ..default()
     };
     let mut client = ClientSession {
-        state: start,
+        state: CharacterState {
+            motion: start,
+            ..default()
+        },
         ..default()
     };
     let current = PlayerState {
@@ -682,7 +574,7 @@ fn reordered_snapshots_ignore_stale_life_and_state() {
         &[],
     );
     assert_eq!(client.life, 1);
-    assert_eq!(client.state, current);
+    assert_eq!(client.state.motion, current);
     // A late datagram from before the respawn must not rewind life or motion.
     let stale = PlayerState {
         position: Vec3::new(9.5, 0.0, 0.5),
@@ -695,7 +587,7 @@ fn reordered_snapshots_ignore_stale_life_and_state() {
         &[],
     );
     assert_eq!(client.life, 1);
-    assert_eq!(client.state, current);
+    assert_eq!(client.state.motion, current);
     assert_eq!(client.last_tick, 5);
 }
 #[test]
@@ -707,7 +599,10 @@ fn life_change_resets_replay_presentation_noclip_and_sequence() {
         ..default()
     };
     let mut client = ClientSession {
-        state: start,
+        state: CharacterState {
+            motion: start,
+            ..default()
+        },
         sequence: 12,
         ..default()
     };
@@ -731,7 +626,7 @@ fn life_change_resets_replay_presentation_noclip_and_sequence() {
         &[],
     );
     assert_eq!(client.life, 1);
-    assert_eq!(client.state, respawned);
+    assert_eq!(client.state.motion, respawned);
     assert!(client.pending.is_empty());
     assert_eq!(client.correction, Vec3::ZERO);
     assert!(!client.noclip_requested);
@@ -759,7 +654,7 @@ fn life_change_applies_even_when_the_snapshot_is_still_dead() {
     };
     reconcile(&mut client, &world, &snapshot(2, 1, respawned, health), &[]);
     assert_eq!(client.life, 1);
-    assert_eq!(client.state, respawned);
+    assert_eq!(client.state.motion, respawned);
     assert!(client.pending.is_empty());
     assert_eq!(client.correction, Vec3::ZERO);
     assert!(!client.noclip_requested);
@@ -793,7 +688,7 @@ fn dead_reconciliation_discards_local_replay_and_keeps_sequence_monotonic() {
         &[],
     );
     assert!(client.health.is_depleted());
-    assert_eq!(client.state, dead_state);
+    assert_eq!(client.state.motion, dead_state);
     assert!(client.pending.is_empty());
     assert_eq!(client.correction, Vec3::ZERO);
     assert_eq!(client.sequence, 40);
