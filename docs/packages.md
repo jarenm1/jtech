@@ -105,6 +105,14 @@ server uses the same existing projectile/explosion messages for presentation.
 | --- | --- |
 | `weapons` | List of `(melee-weapon id name range damage cooldown-ticks knockback [model])` |
 | `spawn-items` | Optional list of `(id count)` pairs granted on spawn and respawn |
+| `sounds` | Optional list of `(event path)` pairs the client plays on that event |
+
+`sounds` maps a fixed event set to files under the package's `assets/` dir:
+`"draw"` (a bow draw starts), `"fire"` (a shot leaves), `"hit"` (a projectile
+strikes). The client resolves them through the same `pkg://` asset source the
+models use, so an OGG or WAV dropped in `assets/` and named here plays with no
+further wiring; a missing file is silent rather than an error. Both package
+kinds accept `sounds`.
 
 `melee-weapon` is a host-provided constructor. `id` is an integer above 6 up to
 2³²−1 and unique across loaded packages; `name` is a display string replicated to

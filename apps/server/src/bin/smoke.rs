@@ -206,6 +206,7 @@ impl Bot {
                     bow_shots_per_second,
                     melee_weapons,
                     assets,
+                    sounds: _,
                 } => {
                     self.packages
                         .push((revision, packages, bow_shots_per_second, melee_weapons));

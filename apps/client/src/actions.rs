@@ -12,7 +12,7 @@ use physics::{EYE_HEIGHT, look_direction};
 use protocol::{ClientMessage, EXPLOSIVE_BOW_ITEM};
 use voxel_world::VoxelWorld;
 
-use crate::{ClientSession, Options, chunk_coord, pause_menu::PauseMenu};
+use crate::{ClientSession, Options, chunk_coord, pause_menu::PauseMenu, sounds::PlaySound};
 
 /// Semantic action state for one frame, produced by the key bindings.
 #[derive(Resource, Default)]
@@ -93,6 +93,7 @@ pub(crate) fn resolve(
     world: Res<VoxelWorld>,
     actions: Res<Actions>,
     mut session: ResMut<ClientSession>,
+    mut play: MessageWriter<PlaySound>,
     menu: Res<PauseMenu>,
 ) {
     let cursor_visible = cursor.is_some_and(|cursor| cursor.visible);
@@ -114,6 +115,13 @@ pub(crate) fn resolve(
     session.attack_held = attacking;
     if attacking && buttons.just_pressed(MouseButton::Left) {
         session.swing_at = Some(Instant::now());
+        // A ranged weapon starts its draw; the package authors the sound.
+        if matches!(held, Held::Weapon(BasicAttackKind::Ranged)) {
+            play.write(PlaySound {
+                event: "draw",
+                position: None,
+            });
+        }
     }
     // A bow's release kicks the viewmodel forward as the arrow leaves.
     if released && matches!(held, Held::Weapon(BasicAttackKind::Ranged)) {

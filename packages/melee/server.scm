@@ -25,3 +25,11 @@
 ;; must reference weapons this package registers.
 (define spawn-items
   (list (list 7 1) (list 8 1)))
+
+;; (sound event path) pairs; the client plays them on the matching event.
+;; Events: "draw" (a bow draw starts), "fire" (a shot leaves), "hit" (a strike).
+;; Paths are relative to this package's assets/ dir; a missing file is silent.
+(define sounds
+  (list (list "draw" "bow-draw.ogg")
+        (list "fire" "bow-fire.ogg")
+        (list "hit" "arrow-hit.ogg")))

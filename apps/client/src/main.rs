@@ -15,6 +15,7 @@ mod pause_menu;
 mod projectiles;
 mod scatter;
 mod sky;
+mod sounds;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
@@ -24,6 +25,7 @@ use std::{
 use bevy::{
     app::{AppExit, ScheduleRunnerPlugin},
     camera::RenderTarget,
+    ecs::system::SystemParam,
     image::BevyDefault,
     input::mouse::AccumulatedMouseMotion,
     prelude::*,
@@ -362,17 +364,12 @@ impl ClientSession {
         world: &VoxelWorld,
         input: PlayerInput,
         bodies: &[physics::DynamicCollider],
-    ) {
+    ) -> controller::MotorOutput {
         let attack = self.held_attack();
-        controller::step_character_player(
-            world,
-            &mut self.state,
-            attack,
-            &input,
-            FIXED_DT,
-            bodies,
-        );
+        let output =
+            controller::step_character_player(world, &mut self.state, attack, &input, FIXED_DT, bodies);
         self.pending.push_back(input);
+        output
     }
     fn receive_action(&mut self, result: ActionResult) {
         if result.accepted {
@@ -505,6 +502,8 @@ impl Plugin for ClientPlugin {
         );
         app.init_resource::<ClientSession>()
             .init_resource::<actions::Actions>()
+            .init_resource::<sounds::PackageSounds>()
+            .add_message::<sounds::PlaySound>()
             .init_resource::<RemotePlayers>()
             .init_resource::<RemoteActors>()
             .init_resource::<pause_menu::PauseMenu>()
@@ -528,26 +527,34 @@ impl Plugin for ClientPlugin {
             .add_systems(
                 Update,
                 (
-                    receive_network,
-                    pause_menu::input.run_if(windowed),
-                    pause_menu::actions,
-                    pause_menu::sync,
-                    death_overlay::input,
-                    death_overlay::actions,
-                    death_overlay::sync,
-                    pause_menu::sync_cursor.run_if(windowed),
-                    controls.run_if(windowed),
-                    actions::bindings,
-                    actions::resolve,
-                    predict,
-                    held_item::update,
-                    present_players,
-                    game_hud::update,
-                    game_hud::update_fps,
-                    health_hud::update,
-                    charge_hud::update,
-                    package_hud::update,
-                    scatter::sync_scatter,
+                    (
+                        receive_network,
+                        pause_menu::input.run_if(windowed),
+                        pause_menu::actions,
+                        pause_menu::sync,
+                        death_overlay::input,
+                        death_overlay::actions,
+                        death_overlay::sync,
+                        pause_menu::sync_cursor.run_if(windowed),
+                        controls.run_if(windowed),
+                        actions::bindings,
+                        actions::resolve,
+                    )
+                        .chain(),
+                    (
+                        predict,
+                        held_item::update,
+                        present_players,
+                        game_hud::update,
+                        game_hud::update_fps,
+                        health_hud::update,
+                        charge_hud::update,
+                        sounds::sync,
+                        sounds::play,
+                        package_hud::update,
+                        scatter::sync_scatter,
+                    )
+                        .chain(),
                 )
                     .chain(),
             )
@@ -730,21 +737,29 @@ fn setup(
 }
 
 #[allow(clippy::too_many_arguments)] // Independent Bevy presentation resources.
+/// Asset handles and the audio sink `receive_network` needs, grouped so the
+/// system stays inside Bevy's parameter limit.
+#[derive(SystemParam)]
+struct NetworkAssets<'w> {
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    actors: Res<'w, ActorAssets>,
+    loose_assets: Res<'w, loose_blocks::LooseBlockAssets>,
+    projectile_assets: Res<'w, projectiles::ProjectileAssets>,
+    drop_assets: Res<'w, drops::DropAssets>,
+    play: MessageWriter<'w, sounds::PlaySound>,
+}
+
 fn receive_network(
     mut commands: Commands,
     mut session: ResMut<ClientSession>,
     mut world: ResMut<VoxelWorld>,
     mut remotes: ResMut<RemotePlayers>,
     mut actors: ResMut<RemoteActors>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    assets: Res<ActorAssets>,
     mut loose: ResMut<loose_blocks::LooseBlocks>,
-    loose_assets: Res<loose_blocks::LooseBlockAssets>,
     mut projectiles: ResMut<projectiles::Projectiles>,
-    projectile_assets: Res<projectiles::ProjectileAssets>,
     mut drops: ResMut<drops::Drops>,
-    drop_assets: Res<drops::DropAssets>,
     mut package_assets: ResMut<package_assets::PackageAssets>,
+    mut res: NetworkAssets,
     mut scatter: ResMut<scatter::ScatterWorld>,
     mut snapshot_ids: Local<SnapshotIds>,
 ) {
@@ -869,14 +884,14 @@ fn receive_network(
                 );
             }
             ServerMessage::Physics { tick, bodies } => {
-                loose.receive(tick, &bodies, &mut commands, &loose_assets);
+                loose.receive(tick, &bodies, &mut commands, &res.loose_assets);
             }
             ServerMessage::Projectiles { tick, arrows } => {
                 projectiles.receive(
                     tick,
                     &arrows,
                     &mut commands,
-                    &projectile_assets,
+                    &res.projectile_assets,
                     Instant::now(),
                 );
             }
@@ -890,9 +905,13 @@ fn receive_network(
                     position,
                     radius,
                     &mut commands,
-                    &projectile_assets,
+                    &res.projectile_assets,
                     Instant::now(),
                 );
+                res.play.write(sounds::PlaySound {
+                    event: "hit",
+                    position: Some(position),
+                });
             }
             ServerMessage::Packages {
                 revision,
@@ -900,10 +919,15 @@ fn receive_network(
                 bow_shots_per_second,
                 melee_weapons,
                 assets,
+                sounds,
             } => {
-                session
-                    .packages
-                    .receive(revision, packages, bow_shots_per_second, melee_weapons);
+                session.packages.receive(
+                    revision,
+                    packages,
+                    bow_shots_per_second,
+                    melee_weapons,
+                    sounds,
+                );
                 for request in package_assets.sync(assets) {
                     session.send(request);
                 }
@@ -928,7 +952,7 @@ fn receive_network(
                     tick,
                     &snapshots,
                     &mut commands,
-                    &drop_assets,
+                    &res.drop_assets,
                     &session.packages,
                     Instant::now(),
                 );
@@ -981,8 +1005,8 @@ fn receive_network(
                 .or_insert_with(|| RemotePlayer {
                     entity: commands
                         .spawn((
-                            Mesh3d(assets.mesh.clone()),
-                            MeshMaterial3d(assets.material.clone()),
+                            Mesh3d(res.actors.mesh.clone()),
+                            MeshMaterial3d(res.actors.material.clone()),
                             Transform::from_translation(
                                 player.state.position + Vec3::Y * PLAYER_HEIGHT * 0.5,
                             ),
@@ -1020,7 +1044,7 @@ fn receive_network(
                     remote.received = now;
                 })
                 .or_insert_with(|| {
-                    let material = materials.add(StandardMaterial {
+                    let material = res.materials.add(StandardMaterial {
                         base_color: Color::srgb(0.85, 0.45, 0.25),
                         perceptual_roughness: 0.8,
                         ..default()
@@ -1028,7 +1052,7 @@ fn receive_network(
                     RemoteActor {
                         entity: commands
                             .spawn((
-                                Mesh3d(assets.dummy_mesh.clone()),
+                                Mesh3d(res.actors.dummy_mesh.clone()),
                                 MeshMaterial3d(material.clone()),
                                 Transform::from_translation(
                                     actor.state.position + Vec3::Y * PLAYER_HEIGHT * 0.5,
@@ -1129,6 +1153,7 @@ fn predict(
     options: Res<Options>,
     world: Res<VoxelWorld>,
     actions: Res<actions::Actions>,
+    mut play: MessageWriter<sounds::PlaySound>,
     mut session: ResMut<ClientSession>,
     loose: Res<loose_blocks::LooseBlocks>,
     menu: Res<pause_menu::PauseMenu>,
@@ -1207,7 +1232,13 @@ fn predict(
             ability: actions.ability,
             aim: [0.0, 1.0],
         };
-        session.predict_input(&world, input, colliders);
+        let output = session.predict_input(&world, input, colliders);
+        if output.charge_release.is_some() {
+            play.write(sounds::PlaySound {
+                event: "fire",
+                position: None,
+            });
+        }
     }
     if !session.pending.is_empty() {
         let mut inputs = InputBatch::new();

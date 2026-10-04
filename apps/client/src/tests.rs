@@ -702,6 +702,7 @@ fn controls_block_look_and_slot_changes_while_dead() {
     .init_resource::<AccumulatedMouseMotion>()
     .init_resource::<pause_menu::PauseMenu>()
     .init_resource::<actions::Actions>()
+    .add_message::<sounds::PlaySound>()
     .init_resource::<loose_blocks::LooseBlocks>()
     .insert_resource(arena())
     .insert_resource(Time::<()>::default())
@@ -776,6 +777,7 @@ fn left_click_plays_swing_animation_and_attacks_with_a_held_weapon() {
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<pause_menu::PauseMenu>()
         .init_resource::<actions::Actions>()
+        .add_message::<sounds::PlaySound>()
         .insert_resource(Options::default())
         .insert_resource(arena())
         .insert_resource(ClientSession {
@@ -812,6 +814,7 @@ fn left_click_with_an_empty_hand_mines_without_attacking() {
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<pause_menu::PauseMenu>()
         .init_resource::<actions::Actions>()
+        .add_message::<sounds::PlaySound>()
         .insert_resource(Options::default())
         .insert_resource(arena())
         .insert_resource(ClientSession {
