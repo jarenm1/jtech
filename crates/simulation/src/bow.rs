@@ -1,5 +1,7 @@
 //! Authoritative point-projectile flight with swept terrain and loose-cube hits.
+use crate::actors::SimEntity;
 use game_packages::{BlastSpec, ProjectileSpec};
+use gameplay::combat::SwingTarget;
 use glam::Vec3;
 use protocol::{ArrowSnapshot, BowPower, PhysicsBodySnapshot};
 use voxel_world::VoxelWorld;
@@ -8,13 +10,18 @@ pub(super) struct Arrow {
     pub snapshot: ArrowSnapshot,
     /// Flight parameters, independent of the package that authored them.
     pub projectile: ProjectileSpec,
-    /// Blast applied on impact; a light spec makes a plain arrow.
-    pub blast: BlastSpec,
+    /// Blast applied on impact; `None` makes a plain arrow that damages the
+    /// character it strikes directly instead of exploding.
+    pub blast: Option<BlastSpec>,
+    /// Whole health points a plain arrow removes from the character it hits.
+    pub damage: u16,
+    /// Impulse in kg·m/s a plain arrow applies along its flight direction.
+    pub knockback: f32,
     /// Bow preset this arrow was fired with, when it came from the bow package.
     pub power: Option<BowPower>,
-    /// Player id that fired the arrow; kept on queued detonations for event
+    /// Entity that fired the arrow; kept on queued detonations for event
     /// attribution.
-    pub shooter: Option<u64>,
+    pub shooter: Option<SimEntity>,
     age: u32,
     traveled: f32,
     pending_steps: u32,
@@ -22,7 +29,9 @@ pub(super) struct Arrow {
 
 pub(super) enum Flight {
     Flying,
-    Impact(Vec3),
+    /// Impact at a point, with the swing-target id struck if the arrow hit a
+    /// character rather than terrain or a loose body.
+    Impact(Vec3, Option<u64>),
     Expired,
 }
 
@@ -41,18 +50,19 @@ impl Arrow {
         direction: Vec3,
         shot: game_packages::Shot,
     ) -> Self {
-        let mut arrow = Self::new_arrow(id, origin, direction, shot.projectile, shot.impact());
+        let mut arrow = Self::new_arrow(id, origin, direction, shot.projectile, Some(shot.impact()));
         arrow.power = Some(shot.power);
         arrow
     }
 
-    /// Build an arrow from explicit flight and blast parameters.
+    /// Build an arrow from explicit flight and impact parameters. `blast: None`
+    /// makes a plain arrow that damages the character it strikes directly.
     pub fn new_arrow(
         id: u32,
         origin: Vec3,
         direction: Vec3,
         projectile: ProjectileSpec,
-        blast: BlastSpec,
+        blast: Option<BlastSpec>,
     ) -> Self {
         Self {
             snapshot: ArrowSnapshot {
@@ -62,6 +72,8 @@ impl Arrow {
             },
             projectile,
             blast,
+            damage: 0,
+            knockback: 0.0,
             power: None,
             shooter: None,
             age: 0,
@@ -77,6 +89,7 @@ impl Arrow {
         &mut self,
         world: &VoxelWorld,
         bodies: &[PhysicsBodySnapshot],
+        targets: &[SwingTarget],
         ready: bool,
     ) -> Flight {
         self.age += 1;
@@ -86,7 +99,7 @@ impl Arrow {
         self.pending_steps = (self.pending_steps + 1).min(3);
         if ready {
             for _ in 0..std::mem::take(&mut self.pending_steps) {
-                let result = self.step(world, bodies);
+                let result = self.step(world, bodies, targets);
                 if !matches!(result, Flight::Flying) {
                     return result;
                 }
@@ -95,7 +108,12 @@ impl Arrow {
         Flight::Flying
     }
 
-    fn step(&mut self, world: &VoxelWorld, bodies: &[PhysicsBodySnapshot]) -> Flight {
+    fn step(
+        &mut self,
+        world: &VoxelWorld,
+        bodies: &[PhysicsBodySnapshot],
+        targets: &[SwingTarget],
+    ) -> Flight {
         if self.traveled >= self.projectile.max_travel {
             return Flight::Expired;
         }
@@ -116,17 +134,28 @@ impl Arrow {
         let mut impact = world
             .raycast(start, direction, distance)
             .map(|hit| hit.distance);
+        let mut hit_target = None;
         for body in bodies {
             if let Some(hit) = ray_cube(start, direction, body.position, distance)
                 && impact.is_none_or(|old| hit < old)
             {
                 impact = Some(hit);
+                hit_target = None;
+            }
+        }
+        for target in targets {
+            if let Some(hit) = physics::raycast_body(start, direction, target.position, target.shape)
+                && hit <= distance
+                && impact.is_none_or(|old| hit < old)
+            {
+                impact = Some(hit);
+                hit_target = Some(target.id);
             }
         }
         if let Some(hit) = impact {
             // Detonate just outside the surface so the impacted face and its
             // neighboring exposed faces can receive blast work.
-            return Flight::Impact(start + direction * (hit - 0.02).max(0.0));
+            return Flight::Impact(start + direction * (hit - 0.02).max(0.0), hit_target);
         }
         self.snapshot.position += direction * distance;
         self.traveled += distance;
@@ -189,9 +218,9 @@ mod tests {
         }
         let mut arrow = Arrow::new(7, Vec3::new(2.5, 10.5, 2.5), Vec3::X, BowPower::Standard);
         for _ in 0..100 {
-            match arrow.step(&world, &[]) {
+            match arrow.step(&world, &[], &[]) {
                 Flight::Flying => {}
-                Flight::Impact(position) => {
+                Flight::Impact(position, _) => {
                     assert!((position.x - 19.98).abs() < 0.001);
                     assert!(position.y < 10.5);
                     return;
@@ -212,7 +241,7 @@ mod tests {
             material: 3,
         };
         let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, BowPower::Standard);
-        let Flight::Impact(position) = arrow.step(&world, &[body]) else {
+        let Flight::Impact(position, _) = arrow.step(&world, &[body], &[]) else {
             panic!("missed body");
         };
         assert!((position.x - 2.98).abs() < 0.001);
@@ -227,14 +256,14 @@ mod tests {
         let world = empty_world();
         let mut arrow = Arrow::new(1, Vec3::new(1., 20., 1.), Vec3::X, BowPower::Standard);
         for _ in 0..180 {
-            if matches!(arrow.step(&world, &[]), Flight::Expired) {
+            if matches!(arrow.step(&world, &[], &[]), Flight::Expired) {
                 assert!(arrow.snapshot.position.x <= 65.0 && arrow.snapshot.position.x > 64.0);
                 break;
             }
         }
         assert!(arrow.traveled >= arrow.projectile.max_travel);
         let mut arrow = Arrow::new(2, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
-        assert!(matches!(arrow.step(&world, &[]), Flight::Expired));
+        assert!(matches!(arrow.step(&world, &[], &[]), Flight::Expired));
     }
 
     #[test]
@@ -248,16 +277,16 @@ mod tests {
         };
         let mut arrow = Arrow::new(1, Vec3::new(2.9, 5.5, 2.5), Vec3::X, BowPower::Standard);
         assert!(matches!(
-            arrow.tick(&world, &[stale], false),
+            arrow.tick(&world, &[stale], &[], false),
             Flight::Flying
         ));
         assert_eq!(arrow.snapshot.position.x, 2.9);
-        assert!(matches!(arrow.tick(&world, &[], true), Flight::Flying));
+        assert!(matches!(arrow.tick(&world, &[], &[], true), Flight::Flying));
         assert!((arrow.snapshot.position.x - 4.1).abs() < 0.001);
         for _ in 0..arrow.projectile.max_age_ticks {
-            arrow.tick(&world, &[], false);
+            arrow.tick(&world, &[], &[], false);
         }
-        assert!(matches!(arrow.tick(&world, &[], false), Flight::Expired));
+        assert!(matches!(arrow.tick(&world, &[], &[], false), Flight::Expired));
         assert!(arrow.pending_steps <= 3);
     }
 }

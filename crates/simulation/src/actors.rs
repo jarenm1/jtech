@@ -27,17 +27,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use voxel_world::VoxelWorld;
 
 /// Fixed ticks a dead actor waits before respawning at its spawn point.
-const ACTOR_RESPAWN_TICKS: u64 = 300;
-
-/// A ranged weapon's impact when it authors no blast: a light hit rather than
-/// an explosion. Radius and window stay inside the host's validated bounds.
-const PLAIN_ARROW_BLAST: game_packages::BlastSpec = game_packages::BlastSpec {
-    radius: 1.0,
-    energy: 800.0,
-    player_speed: 2.0,
-    absorbed_fraction: 0.5,
-    load_window: 0.02,
-};
+pub(super) const ACTOR_RESPAWN_TICKS: u64 = 300;
 
 /// Fallback flight for a ranged weapon that somehow carries no spec.
 const PLAIN_PROJECTILE: game_packages::ProjectileSpec = game_packages::ProjectileSpec {
@@ -47,7 +37,7 @@ const PLAIN_PROJECTILE: game_packages::ProjectileSpec = game_packages::Projectil
     max_age_ticks: 600,
 };
 /// High bit separates actor ids from player ids inside swing target lists.
-const ACTOR_TARGET: u64 = 1 << 63;
+pub(super) const ACTOR_TARGET: u64 = 1 << 63;
 /// Bound on the replicated actor set.
 pub const MAX_ACTORS: usize = 32;
 
@@ -198,6 +188,17 @@ impl ActorKind {
 pub enum SimEntity {
     Player(u64),
     Actor(u32),
+}
+
+impl SimEntity {
+    /// Swing-target id for this entity, matching the ids in melee and
+    /// projectile target lists.
+    pub(super) fn target_id(self) -> u64 {
+        match self {
+            SimEntity::Player(id) => id,
+            SimEntity::Actor(id) => u64::from(id) | ACTOR_TARGET,
+        }
+    }
 }
 
 /// Per-tick attribution event pushed onto `Simulation::events`. The backlog is
@@ -607,44 +608,35 @@ impl Simulation {
             let direction = look_direction(player.input.yaw, player.input.pitch);
             if attack.kind == BasicAttackKind::Ranged {
                 // The explosive bow uses its package's authored shot; a ranged
-                // weapon carries its own flight spec and a plain impact.
-                let (projectile, blast) = if held == protocol::EXPLOSIVE_BOW_ITEM {
-                    match self.packages.fire(protocol::BowPower::Standard) {
-                        Ok(shot) => (shot.projectile, shot.impact()),
-                        Err(_) => continue,
-                    }
-                } else {
-                    (
-                        melee.ranged(held).unwrap_or(PLAIN_PROJECTILE),
-                        PLAIN_ARROW_BLAST,
-                    )
-                };
-                self.spawn_projectile(origin, direction, projectile, blast, Some(id));
+                // weapon carries its own flight spec and hits directly.
+                let (projectile, blast, damage, knockback) =
+                    if held == protocol::EXPLOSIVE_BOW_ITEM {
+                        match self.packages.fire(protocol::BowPower::Standard) {
+                            Ok(shot) => (shot.projectile, Some(shot.impact()), 0, 0.0),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        let spec = melee.spec(held).unwrap_or(gameplay::combat::MELEE_HANDS);
+                        (
+                            melee.ranged(held).unwrap_or(PLAIN_PROJECTILE),
+                            None,
+                            spec.damage,
+                            spec.knockback,
+                        )
+                    };
+                self.spawn_projectile(
+                    origin,
+                    direction,
+                    projectile,
+                    blast,
+                    damage,
+                    knockback,
+                    Some(SimEntity::Player(id)),
+                );
                 continue;
             }
             let spec = melee.spec(held).unwrap_or(gameplay::combat::MELEE_HANDS);
-            let mut targets: Vec<SwingTarget> = self
-                .actors
-                .iter()
-                .filter(|(_, actor)| !actor.health.is_depleted())
-                .map(|(&actor_id, actor)| SwingTarget {
-                    id: u64::from(actor_id) | ACTOR_TARGET,
-                    position: actor.state.motion.position,
-                    shape: actor.body.shape,
-                })
-                .collect();
-            targets.extend(
-                self.players
-                    .iter()
-                    .filter(|(other, player)| {
-                        **other != id && !player.health.is_depleted() && !player.state.motion.noclip
-                    })
-                    .map(|(&other, player)| SwingTarget {
-                        id: other,
-                        position: player.state.motion.position,
-                        shape: CollisionShape::default(),
-                    }),
-            );
+            let targets = self.swing_targets(Some(id));
             let Some(hit) = resolve_swing(world, origin, direction, &spec, &targets) else {
                 continue;
             };
