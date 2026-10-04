@@ -266,12 +266,15 @@ fn basic_attack_for(packages: &game_packages::PackageHost, item: u32) -> BasicAt
             cooldown_ticks: (60 / rate).max(1) as u16,
         };
     }
-    let spec = packages
-        .melee_table()
-        .spec(item)
-        .unwrap_or(gameplay::combat::MELEE_HANDS);
+    let table = packages.melee_table();
+    let kind = if table.ranged(item).is_some() {
+        BasicAttackKind::Ranged
+    } else {
+        BasicAttackKind::Melee
+    };
+    let spec = table.spec(item).unwrap_or(gameplay::combat::MELEE_HANDS);
     BasicAttack {
-        kind: BasicAttackKind::Melee,
+        kind,
         cooldown_ticks: spec.cooldown_ticks.min(u32::from(u16::MAX)) as u16,
     }
 }
@@ -1949,30 +1952,32 @@ mod tests {
         player.input.pitch = 0.0;
         player.input.yaw = 0.0;
         player.input.attack = true;
-        // The war hammer is registered by packages/melee but not owned: the
+        // The sword is registered by packages/melee but not owned: the
         // swing is refused outright rather than downgraded to hands.
-        player.input.selected = 8;
+        player.input.selected = 7;
         sim.players.insert(1, player);
 
         sim.tick = 100;
         swing(&mut sim, &world, 1);
         assert_eq!(sim.actor_health(dummy).unwrap().current(), 100);
 
-        sim.players.get_mut(&1).unwrap().inventory.add(8, 1);
+        sim.players.get_mut(&1).unwrap().inventory.add(7, 1);
         swing(&mut sim, &world, 1);
-        // Head-zone hit with the authored 30-damage spec.
+        // Head-zone hit with the authored 12-damage spec.
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
-            100 - 30 * gameplay::combat::HEADSHOT_MULTIPLIER
+            100 - 12 * gameplay::combat::HEADSHOT_MULTIPLIER
         );
-        // The authored 60-tick cooldown, not the hands default, gates the next swing.
+        // The authored 24-tick cooldown, not the hands default, gates the next swing.
         swing(&mut sim, &world, 1);
         assert_eq!(
             sim.actor_health(dummy).unwrap().current(),
-            100 - 30 * gameplay::combat::HEADSHOT_MULTIPLIER
+            100 - 12 * gameplay::combat::HEADSHOT_MULTIPLIER
         );
-        sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
-        swing(&mut sim, &world, 1);
+        for _ in 0..10 {
+            sim.players.get_mut(&1).unwrap().state.basic_attack_cooldown = 0;
+            swing(&mut sim, &world, 1);
+        }
         assert!(sim.actor_health(dummy).unwrap().is_depleted());
         put_resources(&mut app, world, sim);
     }

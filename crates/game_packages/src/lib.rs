@@ -40,6 +40,8 @@ const API: &str = "
   (list radius energy player-speed absorbed pulse))
 (define (melee-weapon id name range damage cooldown-ticks knockback . model)
   (list id name range damage cooldown-ticks knockback model))
+(define (ranged-weapon id name range damage cooldown-ticks knockback speed gravity travel lifetime . model)
+  (list id name range damage cooldown-ticks knockback speed gravity travel lifetime model))
 ";
 
 /// Prefer packages beside the executable, then the working directory. The final
@@ -288,6 +290,9 @@ pub struct MeleeWeapon {
     /// Display name for logs and a future presentation API.
     pub name: String,
     pub spec: MeleeSpec,
+    /// Flight parameters when the weapon is ranged; `None` for melee. A ranged
+    /// weapon's basic attack spawns a projectile instead of a raycast.
+    pub ranged: Option<ProjectileSpec>,
     /// Model file under the package's `assets/` directory, if authored.
     pub model: Option<String>,
 }
@@ -344,10 +349,27 @@ impl MeleePackage {
 
 fn melee_weapon(value: SteelVal, package_dir: &Path) -> Result<MeleeWeapon, String> {
     let SteelVal::ListV(fields) = value else {
-        return Err("each weapon must be a melee-weapon value".into());
+        return Err("each weapon must be a melee-weapon or ranged-weapon value".into());
     };
-    if fields.len() != 7 {
-        return Err("melee-weapon takes id, name, range, damage, cooldown-ticks, knockback, optional model".into());
+    let ranged = match fields.len() {
+        7 => None,
+        11 => Some(ProjectileSpec {
+            speed: number(&fields[6], "weapon projectile speed")?,
+            gravity: number(&fields[7], "weapon projectile gravity")?,
+            max_travel: number(&fields[8], "weapon projectile travel")?,
+            max_age_ticks: u32::try_from(integer(&fields[9], "weapon projectile lifetime")?)
+                .unwrap_or(u32::MAX),
+        }),
+        _ => {
+            return Err(
+                "melee-weapon takes id, name, range, damage, cooldown-ticks, knockback, optional \
+                 model; ranged-weapon adds speed, gravity, travel, lifetime"
+                    .into(),
+            );
+        }
+    };
+    if fields.len() != 7 && fields.len() != 11 {
+        return Err("each weapon must be a melee-weapon or ranged-weapon value".into());
     }
     let id = integer(&fields[0], "weapon id")?;
     let id = u32::try_from(id)
@@ -388,12 +410,13 @@ fn melee_weapon(value: SteelVal, package_dir: &Path) -> Result<MeleeWeapon, Stri
              cooldown 0..=600 ticks, knockback 0..=10000"
         )
     })?;
-    let model = weapon_model(&fields[6], package_dir)?;
+    let model = weapon_model(&fields[fields.len() - 1], package_dir)?;
     Ok(MeleeWeapon {
         id,
         package: String::new(),
         name,
         spec,
+        ranged,
         model,
     })
 }
@@ -511,6 +534,11 @@ impl MeleeTable {
     /// the bow, and unknown ids.
     pub fn spec(&self, item: u32) -> Option<MeleeSpec> {
         self.weapons.get(&item).map(|weapon| weapon.spec)
+    }
+
+    /// Flight parameters when `item` is a ranged weapon; `None` for melee.
+    pub fn ranged(&self, item: u32) -> Option<ProjectileSpec> {
+        self.weapons.get(&item).and_then(|weapon| weapon.ranged)
     }
 
     /// Every registered weapon, for replication to clients.

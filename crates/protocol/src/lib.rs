@@ -239,6 +239,8 @@ pub struct MeleeWeaponInfo {
     pub damage: u16,
     pub cooldown_ticks: u32,
     pub knockback: f32,
+    /// True when the weapon's basic attack fires a projectile instead of a swing.
+    pub ranged: bool,
     /// Asset path relative to the owning package's `assets/` dir, if the weapon
     /// ships a 3D model.
     pub model: Option<String>,

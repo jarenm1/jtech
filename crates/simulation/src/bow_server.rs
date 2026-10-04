@@ -94,20 +94,19 @@ impl Simulation {
     }
 
     /// Spawn a projectile from a ranged basic attack or ability. Returns false
-    /// when the bow package is unavailable or the arrow budget is full.
+    /// when the arrow budget is full.
     pub(super) fn spawn_projectile(
         &mut self,
         origin: Vec3,
         direction: Vec3,
+        projectile: game_packages::ProjectileSpec,
+        blast: game_packages::BlastSpec,
         shooter: Option<u64>,
     ) -> bool {
         if self.arrows.len() + self.detonations.len() >= MAX_ARROWS || self.next_arrow == u32::MAX {
             return false;
         }
-        let Ok(shot) = self.packages.fire(BowPower::Standard) else {
-            return false;
-        };
-        let mut arrow = Arrow::from_shot(self.next_arrow, origin, direction, shot);
+        let mut arrow = Arrow::new_arrow(self.next_arrow, origin, direction, projectile, blast);
         arrow.shooter = shooter;
         self.arrows.push(arrow);
         self.next_arrow += 1;
@@ -136,7 +135,7 @@ impl Simulation {
                 Flight::Impact(position) => self.detonations.push_back((
                     arrow.snapshot.id,
                     position,
-                    arrow.shot.impact(),
+                    arrow.blast,
                     arrow.shooter.map(SimEntity::Player),
                 )),
                 Flight::Expired => {}
@@ -343,14 +342,14 @@ mod tests {
         assert_eq!(
             sim.arrows
                 .iter()
-                .map(|arrow| arrow.shot.power)
+                .map(|arrow| arrow.power)
                 .collect::<Vec<_>>(),
-            BowPower::ALL
+            BowPower::ALL.map(Some)
         );
         // A replay with a changed preset must not alter an existing arrow.
         sim.fire_bow(&world, 1, 1, yaw, 0.0, BowPower::Extreme);
         assert_eq!(sim.arrows.len(), 4);
-        assert_eq!(sim.arrows[0].shot.power, BowPower::Low);
+        assert_eq!(sim.arrows[0].power, Some(BowPower::Low));
         // Occupy this tick's two detonation slots, retaining the new impacts in the queue.
         for id in [100, 101] {
             sim.detonations.push_back((
