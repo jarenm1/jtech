@@ -23,6 +23,8 @@ struct Motor<'a> {
     constraints: Constraints,
     /// Ability slots that resolved this tick, with their aim, for the host.
     fired: [Option<Vec2>; MAX_SLOTS],
+    /// Whether the held weapon's basic attack fired this tick.
+    basic_attack: bool,
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -45,6 +47,7 @@ pub fn step_character(
         return MotorOutput {
             attempted: Vec2::new(character.motion.velocity.x, character.motion.velocity.z),
             fired: [None; MAX_SLOTS],
+            basic_attack: false,
         };
     }
     let profile = profile.bounded();
@@ -69,6 +72,7 @@ pub fn step_character(
         },
         attempted: Vec2::ZERO,
         fired: [None; MAX_SLOTS],
+        basic_attack: false,
     };
     status(&mut motor, character);
     sanitize(&mut motor, character);
@@ -83,6 +87,7 @@ pub fn step_character(
     MotorOutput {
         attempted: motor.attempted,
         fired: motor.fired,
+        basic_attack: motor.basic_attack,
     }
 }
 
@@ -183,6 +188,17 @@ const BLINK_STEP: f32 = 0.5;
 fn abilities(motor: &mut Motor, character: &mut CharacterState) {
     for cooldown in character.cooldowns.iter_mut() {
         *cooldown = cooldown.saturating_sub(1);
+    }
+    // Basic attack: a one-tick edge gated by the held weapon's cooldown. The
+    // host resolves the hit; the motor only owns the cadence.
+    character.basic_attack_cooldown = character.basic_attack_cooldown.saturating_sub(1);
+    if motor.input.attack
+        && character.basic_attack_cooldown == 0
+        && !motor.constraints.action_locked
+        && let Some(attack) = motor.body.basic_attack
+    {
+        character.basic_attack_cooldown = attack.cooldown_ticks;
+        motor.basic_attack = true;
     }
     if let Some(cast) = character.cast {
         if cast.remaining > 1 {

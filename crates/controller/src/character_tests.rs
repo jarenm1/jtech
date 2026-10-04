@@ -522,6 +522,49 @@ fn ability_on_cooldown_is_ignored() {
 }
 
 #[test]
+fn basic_attack_fires_once_per_weapon_cooldown() {
+    let world = tests::arena();
+    let body = CharacterBody::default().with_basic_attack(Some(BasicAttack {
+        kind: BasicAttackKind::Melee,
+        cooldown_ticks: 30,
+    }));
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut intent = CharacterIntent {
+        attack: true,
+        ..Default::default()
+    };
+    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    assert!(output.basic_attack, "the first press must fire");
+    assert_eq!(state.basic_attack_cooldown, 30);
+    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    assert!(!output.basic_attack, "the cooldown must block the next press");
+    let mut refired = false;
+    for _ in 0..30 {
+        if step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]).basic_attack
+        {
+            refired = true;
+            break;
+        }
+    }
+    assert!(refired, "the attack must fire again once ready");
+}
+
+#[test]
+fn no_basic_attack_without_a_weapon() {
+    let world = tests::arena();
+    let body = CharacterBody::default();
+    let profile = MovementProfile::default();
+    let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
+    let mut intent = CharacterIntent {
+        attack: true,
+        ..Default::default()
+    };
+    let output = step_character(&world, &mut state, &body, &profile, &mut intent, FIXED_DT, &[]);
+    assert!(!output.basic_attack, "an unarmed body must not swing");
+}
+
+#[test]
 fn replay_restores_complete_motor_state_and_matches_human_adapter() {
     let world = tests::arena();
     let mut authority = actor(Vec3::new(0.5, 0.0, 0.5));

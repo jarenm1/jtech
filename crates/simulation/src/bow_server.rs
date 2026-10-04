@@ -93,6 +93,28 @@ impl Simulation {
         self.finish_edit(id, request, Ok(None));
     }
 
+    /// Spawn a projectile from a ranged basic attack or ability. Returns false
+    /// when the bow package is unavailable or the arrow budget is full.
+    pub(super) fn spawn_projectile(
+        &mut self,
+        origin: Vec3,
+        direction: Vec3,
+        shooter: Option<u64>,
+    ) -> bool {
+        if self.arrows.len() + self.detonations.len() >= MAX_ARROWS || self.next_arrow == u32::MAX {
+            return false;
+        }
+        let Ok(shot) = self.packages.fire(BowPower::Standard) else {
+            return false;
+        };
+        let mut arrow = Arrow::from_shot(self.next_arrow, origin, direction, shot);
+        arrow.shooter = shooter;
+        self.arrows.push(arrow);
+        self.next_arrow += 1;
+        self.arrow_revision += 1;
+        true
+    }
+
     pub(super) fn advance_bow(&mut self, world: &mut VoxelWorld) {
         let bodies = self
             .physics
