@@ -4,11 +4,7 @@ use protocol::ServerMessage;
 
 impl Simulation {
     pub(super) fn poll_packages(&mut self) {
-        if self.packages.poll() {
-            for player in self.players.values_mut() {
-                player.next_bow_time = 0;
-            }
-        }
+        self.packages.poll();
     }
 
     pub(super) fn replicate_packages(&mut self) {

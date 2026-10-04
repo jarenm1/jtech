@@ -43,8 +43,6 @@ pub enum EditRejection {
     PackageUnavailable,
     Dead,
     OutOfStock,
-    /// A bow release claimed more power than the held draw earned.
-    NotCharged,
 }
 
 
@@ -99,13 +97,6 @@ pub enum ClientMessage {
         request: u64,
         target: IVec3,
         expected_revision: u64,
-    },
-    /// Aim and power preset; the server authors muzzle, velocity, blast, and cooldown.
-    FireBow {
-        request: u64,
-        yaw: f32,
-        pitch: f32,
-        power: BowPower,
     },
     Respawn {
         life: u64,

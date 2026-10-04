@@ -55,8 +55,8 @@ once the whole player fits in loaded empty space.
 
 Equip the bow with **6**, aim steeply down at the ground near your feet, and fire
 with **right click** to launch yourself. Shoot beside or behind you for a sideways
-boost. Hold the draw longer for a stronger, wider blast; a full draw is **4x**.
-At standard power, a close ground shot can lift you several blocks.
+boost. The draw takes a second and fires at full power; a close ground shot can
+lift you several blocks.
 Press **V** to leave noclip before trying a blast jump.
 
 Nearby players, including the shooter, receive server-authoritative impulses.

@@ -234,8 +234,8 @@ struct ClientSession {
     selected: u8,
     /// Item id assigned to each hotbar slot; `None` is an empty slot.
     hotbar: [Option<u32>; 10],
-    /// Whether the bow draw is held this tick; the motor owns the charge.
-    drawing: bool,
+    /// One-tick bow draw request, consumed like jump so a click draws once.
+    draw_pending: bool,
     packages: package_hud::ServerPackages,
     request: u64,
     accepted_edits: u64,
@@ -303,7 +303,7 @@ impl Default for ClientSession {
                 hotbar[5] = Some(EXPLOSIVE_BOW_ITEM);
                 hotbar
             },
-            drawing: false,
+            draw_pending: false,
             packages: package_hud::ServerPackages::default(),
             request: 0,
             accepted_edits: 0,
@@ -342,6 +342,10 @@ impl ClientSession {
     /// One-tick melee request, consumed like jump so a click swings once.
     fn consume_attack(&mut self) -> bool {
         std::mem::take(&mut self.attack_pending)
+    }
+    /// One-tick bow draw request, consumed like jump so a click draws once.
+    fn consume_draw(&mut self) -> bool {
+        std::mem::take(&mut self.draw_pending)
     }
     fn predict_input(
         &mut self,
@@ -1214,7 +1218,7 @@ fn predict(
             noclip: session.noclip_requested,
             attack: session.consume_attack(),
             sprint: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
-            draw: session.drawing,
+            draw: session.consume_draw(),
             crouch: keys.pressed(KeyCode::KeyC),
             ability: [
                 keys.just_pressed(KeyCode::KeyQ),
@@ -1261,7 +1265,7 @@ fn edit_blocks(
         || session.id.is_none()
         || session.health.is_depleted()
     {
-        session.drawing = false;
+        session.draw_pending = false;
         return;
     }
     let strike = keys.just_pressed(KeyCode::KeyF);
@@ -1279,25 +1283,13 @@ fn edit_blocks(
         session.swing_at = Some(Instant::now());
     }
     let hit = buttons.just_pressed(MouseButton::Left) && !melee;
-    // The explosive bow draws while right click is held and fires on release,
-    // at the strongest power the draw earned. The motor owns the charge, so the
-    // server validates the claimed power against the same held ticks.
+    // The explosive bow draws on a single right click and fires itself at full
+    // draw; the motor owns the draw, so the server fires on the same edge. The
+    // swing animation spans the whole draw so the pull-back is visible.
     let bow = session.held_item() == EXPLOSIVE_BOW_ITEM;
-    session.drawing = bow && buttons.pressed(MouseButton::Right) && !strike && !hit;
-    if bow && buttons.just_released(MouseButton::Right) {
-        let fraction = controller::MovementProfile::default()
-            .charge_fraction(session.state.charge);
-        if let Some(power) = protocol::BowPower::from_charge(fraction) {
-            session.request += 1;
-            let request = session.request;
-            let (yaw, pitch) = (session.yaw, session.pitch);
-            session.send(ClientMessage::FireBow {
-                request,
-                yaw,
-                pitch,
-                power,
-            });
-        }
+    if bow && buttons.just_pressed(MouseButton::Right) && !strike && !hit {
+        session.draw_pending = true;
+        session.swing_at = Some(Instant::now());
     }
     if let Some(message) = block_action(&mut session, &world, strike, hit) {
         session.send(message);

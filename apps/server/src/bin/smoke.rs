@@ -700,32 +700,14 @@ fn explosive_bow() -> Result<()> {
     // Arrows collide with characters, and both bots spawn on the same tile:
     // walk the second bot out of the fixture lane so the wall shot is clear.
     drive_second(&mut app, &mut first, &mut second, 24, [0.0, 1.0], 0.0)?;
-    // Charge the bow: the server validates the claimed power against the held
-    // draw, so hold it past the standard-power threshold before firing.
+    // A single draw request runs to full and fires itself; the motor owns the
+    // draw, so the server fires on the same edge. The arrow flies along the
+    // shooter's authoritative yaw, so aim before drawing.
+    first.yaw = -std::f32::consts::FRAC_PI_2;
     first.draw = true;
-    drive(&mut app, &mut [&mut first, &mut second], 40, [0.0; 2], 0.0)?;
-    let yaw = -std::f32::consts::FRAC_PI_2;
-    let shot = ClientMessage::FireBow {
-        request: 1,
-        yaw,
-        pitch: 0.0,
-        power: protocol::BowPower::Standard,
-    };
-    first.net.send(shot.clone())?;
-    first.net.send(shot.clone())?;
-    first.net.send(ClientMessage::FireBow {
-        request: 2,
-        yaw,
-        pitch: 0.0,
-        power: protocol::BowPower::Standard,
-    })?;
+    drive(&mut app, &mut [&mut first, &mut second], 1, [0.0; 2], 0.0)?;
+    first.draw = false;
     drive(&mut app, &mut [&mut first, &mut second], 120, [0.0; 2], 0.0)?;
-    require(first.edits.get(&1) == Some(&true), "bow shot was rejected")?;
-    require(
-        first.edits.get(&2) == Some(&false)
-            && first.rejections.get(&2) == Some(&EditRejection::Cooldown),
-        "bow rapid-fire request was not rejected by cooldown",
-    )?;
     require(
         first.explosions.len() == 1 && first.explosions == second.explosions,
         "bow impact did not replicate exactly once to both clients",
@@ -733,7 +715,7 @@ fn explosive_bow() -> Result<()> {
     let (id, position, radius) = first.explosions[0];
     require(
         position.is_finite()
-            && (radius - 6.0).abs() < 0.05
+            && (radius - 8.0).abs() < 0.05
             && (position.x - (base.x + 12) as f32).abs() < 0.05
             && position.distance(muzzle) > 6.0,
         "bow did not impact the distant wall with the reloaded blast policy",
@@ -785,46 +767,11 @@ fn explosive_bow() -> Result<()> {
             "bow terrain destruction did not replicate to both clients",
         )?;
     }
-    // Replay after the cooldown expires, requiring a fresh reply, not the old map entry.
-    let deltas = [first.deltas, second.deltas];
-    first.edits.remove(&1);
-    first.edits.remove(&2);
-    first.net.send(shot)?;
-    first.net.send(ClientMessage::FireBow {
-        request: 2,
-        yaw,
-        pitch: 0.0,
-        power: protocol::BowPower::Standard,
-    })?;
+    // A second draw fires a fresh arrow.
+    first.draw = true;
+    drive(&mut app, &mut [&mut first, &mut second], 1, [0.0; 2], 0.0)?;
+    first.draw = false;
     drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
-    require(
-        first.edits.get(&1) == Some(&true)
-            && first.edits.get(&2) == Some(&false)
-            && first.rejections.get(&2) == Some(&EditRejection::Cooldown),
-        "bow replay did not preserve accepted and rejected results",
-    )?;
-    for (bot, before) in [&first, &second].into_iter().zip(deltas) {
-        require(
-            bot.explosions.len() == 1
-                && bot.deltas == before
-                && bot
-                    .flights
-                    .iter()
-                    .all(|(_, arrows)| arrows.iter().all(|arrow| arrow.id == id)),
-            "bow replay repeated flight, explosion, or terrain damage",
-        )?;
-    }
-    first.net.send(ClientMessage::FireBow {
-        request: 3,
-        yaw,
-        pitch: 0.5,
-        power: protocol::BowPower::Standard,
-    })?;
-    drive(&mut app, &mut [&mut first, &mut second], 210, [0.0; 2], 0.0)?;
-    require(
-        first.edits.get(&3) == Some(&true),
-        "bow cooldown did not permit a later fresh shot",
-    )?;
     for bot in [&first, &second] {
         require(
             bot.flights
@@ -833,7 +780,6 @@ fn explosive_bow() -> Result<()> {
             "later bow shot did not replicate to both clients",
         )?;
     }
-    first.draw = false;
     fs::remove_dir_all(&package_root)?;
     Ok(())
 }

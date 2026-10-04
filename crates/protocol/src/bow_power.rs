@@ -13,8 +13,7 @@ pub enum BowPower {
 impl BowPower {
     pub const ALL: [Self; 4] = [Self::Low, Self::Standard, Self::High, Self::Extreme];
 
-    /// Minimum draw fraction a release must reach to fire at this power. The
-    /// server validates a client's claimed power against its held draw.
+    /// Minimum draw fraction a release must reach to fire at this power.
     pub fn min_charge(self) -> f32 {
         match self {
             Self::Low => 0.15,
@@ -31,54 +30,25 @@ impl BowPower {
             .rev()
             .find(|power| fraction >= power.min_charge())
     }
-
-    pub fn next(self) -> Self {
-        match self {
-            Self::Low => Self::Standard,
-            Self::Standard => Self::High,
-            Self::High => Self::Extreme,
-            Self::Extreme => Self::Low,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Low => "0.5x",
-            Self::Standard => "1x",
-            Self::High => "2x",
-            Self::Extreme => "4x",
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClientMessage, MAX_FRAME, decode, encode};
+    use crate::{MAX_FRAME, decode, encode};
 
     #[test]
-    fn power_presets_cycle_and_round_trip_in_shots() {
-        let mut power = BowPower::Low;
-        for expected in BowPower::ALL {
-            assert_eq!(power, expected);
-            let bytes = encode(
-                &ClientMessage::FireBow {
-                    request: 1,
-                    yaw: 0.0,
-                    pitch: 0.0,
-                    power,
-                },
-                MAX_FRAME,
-            )
-            .unwrap();
-            let ClientMessage::FireBow { power: decoded, .. } = decode(&bytes, MAX_FRAME).unwrap()
-            else {
-                panic!("wrong message")
-            };
-            assert_eq!(decoded, power);
-            power = power.next();
+    fn power_presets_map_from_draw_fractions_and_round_trip() {
+        assert_eq!(BowPower::from_charge(0.0), None);
+        assert_eq!(BowPower::from_charge(0.14), None);
+        assert_eq!(BowPower::from_charge(0.15), Some(BowPower::Low));
+        assert_eq!(BowPower::from_charge(0.5), Some(BowPower::Standard));
+        assert_eq!(BowPower::from_charge(0.7), Some(BowPower::High));
+        assert_eq!(BowPower::from_charge(1.0), Some(BowPower::Extreme));
+        for power in BowPower::ALL {
+            let bytes = encode(&power, MAX_FRAME).unwrap();
+            assert_eq!(decode::<BowPower>(&bytes, MAX_FRAME).unwrap(), power);
         }
-        assert_eq!(power, BowPower::Low);
         assert!(decode::<BowPower>(&[4], MAX_FRAME).is_err());
     }
 }

@@ -22,13 +22,12 @@ fn ground_shot(gpu: bool, power: BowPower, pitch: f32) -> f32 {
         }
     }
     let mut player = Player::new();
-    player.recent_charge = 60;
     player.state.motion.position = Vec3::new(16.5, 10.0, 16.5);
     player.state.motion.grounded = true;
     {
         let mut sim = app.world_mut().resource_mut::<Simulation>();
         sim.players.insert(1, player);
-        sim.fire_bow(&world, 1, 1, 0.0, pitch, power);
+        sim.fire_bow(&world, 1, 0.0, pitch, power);
         assert_eq!(sim.metrics.bow_shots, 1);
     }
     app.insert_resource(world);

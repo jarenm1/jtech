@@ -20,17 +20,18 @@ pub(crate) fn spawn(commands: &mut Commands) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                bottom: px(22),
-                right: px(24),
-                width: px(180),
-                height: px(12),
+                left: percent(50),
+                top: percent(58),
+                margin: UiRect::left(px(-120)),
+                width: px(240),
+                height: px(14),
                 border: UiRect::all(px(2)),
                 display: Display::None,
                 ..default()
             },
             BackgroundColor(palette::PANEL),
             BorderColor::all(palette::AMBER),
-            BorderRadius::all(px(6)),
+            BorderRadius::all(px(7)),
             GlobalZIndex(10),
             GameplayHud,
             ChargeTrack,
@@ -43,7 +44,7 @@ pub(crate) fn spawn(commands: &mut Commands) {
                     ..default()
                 },
                 BackgroundColor(palette::AMBER),
-                BorderRadius::all(px(4)),
+                BorderRadius::all(px(5)),
                 ChargeFill,
             ));
         });

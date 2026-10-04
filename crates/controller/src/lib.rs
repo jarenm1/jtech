@@ -28,8 +28,8 @@ pub struct CharacterIntent {
     pub held_item: u32,
     /// Held sprint request: scales target speed by the profile's sprint multiplier.
     pub sprint: bool,
-    /// Held draw request: charges a bow while held and releases it when cleared.
-    /// The motor owns the charge; the host fires on the release edge.
+    /// One-tick draw request: starts a bow draw the motor runs to completion,
+    /// firing on its own at full draw.
     pub draw: bool,
     /// Held crouch request: lowers the body and scales target speed.
     pub crouch: bool,
@@ -155,7 +155,7 @@ impl Default for MovementProfile {
             crouch_height: 0.9,
             charge_ticks: 60,
             charge_min_ticks: 9,
-            charge_mult: 0.4,
+            charge_mult: 0.15,
             acceleration: 10_000.0,
             braking: 10_000.0,
             air_control: 1.0,

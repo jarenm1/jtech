@@ -353,11 +353,6 @@ struct Player {
     highest_request: u64,
     physics_revision: Option<u64>,
     body_push_velocity: Vec3,
-    // Deadline in 1/(60 * bow shots per second) seconds for fractional-tick cadence.
-    next_bow_time: u64,
-    /// Peak draw charge seen recently, so a release and its fire request can
-    /// arrive in different ticks without rejecting a legitimate shot.
-    recent_charge: u16,
     arrow_revision: Option<u64>,
     package_revision: Option<u64>,
     inventory: Inventory,
@@ -394,8 +389,6 @@ impl Player {
             highest_request: 0,
             physics_revision: None,
             body_push_velocity: Vec3::ZERO,
-            next_bow_time: 0,
-            recent_charge: 0,
             arrow_revision: None,
             package_revision: None,
             inventory: Inventory::default(),
@@ -1332,6 +1325,8 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     character_colliders(&sim.players, &sim.actors, None, 0.0, &mut characters);
     // Players whose basic attack fired this tick, resolved after the loop.
     let mut basic_attacks: Vec<u64> = Vec::new();
+    // Players whose bow draw completed this tick, fired after the loop.
+    let mut bow_fires: Vec<(u64, protocol::BowPower)> = Vec::new();
     for (&id, player) in sim.players.iter_mut() {
         if player.health.is_depleted() {
             // Dead players are frozen: no input movement, noclip, or GPU body push
@@ -1381,10 +1376,12 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 bodies,
             );
             let attempted = output.attempted;
-            player.recent_charge = player
-                .state
-                .charge
-                .max(player.recent_charge.saturating_sub(2));
+            if let Some(fraction) = output.charge_release {
+                bow_fires.push((
+                    id,
+                    protocol::BowPower::from_charge(fraction).unwrap_or_default(),
+                ));
+            }
             if output.basic_attack {
                 basic_attacks.push(id);
             }
@@ -1427,6 +1424,14 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
     sim.collider_scratch = colliders;
     sim.character_scratch = characters;
     sim.resolve_attacks(&world, &basic_attacks);
+    for (id, power) in bow_fires {
+        let (yaw, pitch) = sim
+            .players
+            .get(&id)
+            .map(|player| (player.state.yaw, player.input.pitch))
+            .unwrap_or_default();
+        sim.fire_bow(&world, id, yaw, pitch, power);
+    }
     for (id, message) in incoming.reliable {
         match message {
             ClientMessage::Edit {
@@ -1448,12 +1453,6 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 target,
                 expected_revision,
             } => sim.edit(&mut world, id, request, target, 0, expected_revision, true),
-            ClientMessage::FireBow {
-                request,
-                yaw,
-                pitch,
-                power,
-            } => sim.fire_bow(&world, id, request, yaw, pitch, power),
             ClientMessage::Resync { coord } => {
                 if let Some(player) = sim.players.get_mut(&id) {
                     // Baseline transmission has a bounded per-tick batch. Retain
