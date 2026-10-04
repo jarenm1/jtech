@@ -338,16 +338,36 @@ impl ClientSession {
         let pressed = std::mem::take(&mut self.jump_pending);
         if flight { held } else { pressed }
     }
+    /// The held item's basic attack, matching the server's mapping so prediction
+    /// applies the same cadence and charge slow. Registered weapons require
+    /// ownership, exactly as the server checks.
+    fn held_attack(&self) -> Option<controller::BasicAttack> {
+        let item = self.held_item();
+        let attack = protocol::basic_attack_for(
+            item,
+            &self.packages.melee_weapons,
+            self.packages.bow_shots_per_second,
+        )?;
+        let registered = self
+            .packages
+            .melee_weapons
+            .iter()
+            .any(|weapon| weapon.item == item);
+        (registered && self.inventory.count(item) == 0)
+            .then_some(None)
+            .unwrap_or(Some(attack))
+    }
     fn predict_input(
         &mut self,
         world: &VoxelWorld,
         input: PlayerInput,
         bodies: &[physics::DynamicCollider],
     ) {
+        let attack = self.held_attack();
         controller::step_character_player(
             world,
             &mut self.state,
-            None,
+            attack,
             &input,
             FIXED_DT,
             bodies,
@@ -1072,8 +1092,9 @@ fn reconcile(
         session.correction = Vec3::ZERO;
         return;
     }
+    let attack = session.held_attack();
     for input in &session.pending {
-        controller::step_character_player(world, &mut session.state, None, input, FIXED_DT, bodies);
+        controller::step_character_player(world, &mut session.state, attack, input, FIXED_DT, bodies);
     }
     let difference = previous - session.state.motion.position;
     session.max_correction = session.max_correction.max(difference.length());

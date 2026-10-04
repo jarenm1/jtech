@@ -400,6 +400,41 @@ pub struct BasicAttack {
     pub charge_ticks: u16,
 }
 
+/// Ordered movement-modifier pipeline. Each stage contributes a multiplicative
+/// factor to the target speed; the motor applies them in this fixed order so
+/// authority, prediction and replay agree. External momentum is separate and is
+/// never scaled by these.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpeedModifiers {
+    /// Active status effects (stun, root, slow).
+    pub status: f32,
+    /// Crouch stance.
+    pub stance: f32,
+    /// Sprint request.
+    pub sprint: f32,
+    /// An in-progress slow cast.
+    pub cast: f32,
+    /// A bow draw.
+    pub charge: f32,
+}
+impl Default for SpeedModifiers {
+    fn default() -> Self {
+        Self {
+            status: 1.0,
+            stance: 1.0,
+            sprint: 1.0,
+            cast: 1.0,
+            charge: 1.0,
+        }
+    }
+}
+impl SpeedModifiers {
+    /// Product of every stage, in application order.
+    pub fn factor(&self) -> f32 {
+        self.status * self.stance * self.sprint * self.cast * self.charge
+    }
+}
+
 /// Per-tick motor output: the horizontal velocity the character attempted, the
 /// aim of each ability slot that resolved this tick, and whether the basic
 /// attack fired, for the host to apply effects to.
@@ -413,6 +448,8 @@ pub struct MotorOutput {
     /// Set on the tick a draw is released with at least the minimum charge:
     /// the fraction reached, for the host to fire with.
     pub charge_release: Option<f32>,
+    /// Movement modifiers applied this tick, in pipeline order.
+    pub speed: SpeedModifiers,
 }
 
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.

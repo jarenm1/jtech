@@ -1,7 +1,7 @@
 use crate::{
     AbilityKind, BasicAttackKind, Cast, CastBehavior, CharacterBody, CharacterIntent,
     CharacterState, CollisionShape, Constraints, Dash, MAX_SLOTS, MotorOutput, MovementProfile,
-    finite,
+    SpeedModifiers, finite,
 };
 use glam::{Vec2, Vec3};
 use physics::DynamicCollider;
@@ -30,6 +30,8 @@ struct Motor<'a> {
     charge: f32,
     /// Release edge with the fraction reached, when the draw cleared this tick.
     charge_release: Option<f32>,
+    /// Movement modifiers applied this tick, in pipeline order.
+    speed: SpeedModifiers,
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -58,6 +60,7 @@ pub fn step_character(
                 body.basic_attack.map_or(0, |attack| attack.charge_ticks).max(1),
             ),
             charge_release: None,
+            speed: SpeedModifiers::default(),
         };
     }
     let profile = profile.bounded();
@@ -85,6 +88,7 @@ pub fn step_character(
         basic_attack: false,
         charge: 0.0,
         charge_release: None,
+        speed: SpeedModifiers::default(),
     };
     status(&mut motor, character);
     sanitize(&mut motor, character);
@@ -103,6 +107,7 @@ pub fn step_character(
         basic_attack: motor.basic_attack,
         charge: motor.charge,
         charge_release: motor.charge_release,
+        speed: motor.speed,
     }
 }
 
@@ -406,30 +411,31 @@ fn steer(motor: &mut Motor, character: &mut CharacterState) {
         )
         .clamp_length_max(1.0)
     };
-    let speed = motor.profile.speed
-        * if motor.input.sprint {
-            motor.profile.sprint_mult
-        } else {
-            1.0
-        }
-        * if character.crouching {
+    let cast_slow = character.cast.is_some_and(|cast| {
+        motor
+            .body
+            .abilities
+            .get(cast.slot as usize)
+            .is_some_and(|spec| spec.behavior == CastBehavior::Slow)
+    });
+    // Movement modifiers, in pipeline order. Each is multiplicative on the
+    // target speed; external momentum stays separate and unscaled.
+    motor.speed = SpeedModifiers {
+        status: motor.constraints.speed_mult,
+        stance: if character.crouching {
             motor.profile.crouch_mult
         } else {
             1.0
-        }
-        * motor.constraints.speed_mult
-        * draw_speed(motor.profile.charge_mult, motor.charge)
-        * if character.cast.is_some_and(|cast| {
-            motor
-                .body
-                .abilities
-                .get(cast.slot as usize)
-                .is_some_and(|spec| spec.behavior == CastBehavior::Slow)
-        }) {
-            0.5
+        },
+        sprint: if motor.input.sprint {
+            motor.profile.sprint_mult
         } else {
             1.0
-        };
+        },
+        cast: if cast_slow { 0.5 } else { 1.0 },
+        charge: draw_speed(motor.profile.charge_mult, motor.charge),
+    };
+    let speed = motor.profile.speed * motor.speed.factor();
     let horizontal = (right * movement.x + forward * movement.y) * speed;
     let target = Vec2::new(horizontal.x, horizontal.z);
     let previous = physics::bounded_horizontal(

@@ -91,6 +91,11 @@ mod tests {
             cooldown_ticks: 30,
             knockback: 0.0,
             attack_kind,
+            charge_ticks: if attack_kind == controller::BasicAttackKind::Ranged {
+                protocol::DRAW_TICKS
+            } else {
+                0
+            },
             model: None,
         }
     }
