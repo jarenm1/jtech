@@ -551,6 +551,7 @@ impl Plugin for ClientPlugin {
                         charge_hud::update,
                         sounds::sync,
                         sounds::play,
+                        sounds::loops,
                         package_hud::update,
                         scatter::sync_scatter,
                     )

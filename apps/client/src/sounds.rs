@@ -58,6 +58,55 @@ pub(crate) fn play(
     }
 }
 
+/// A looping package sound, keyed by the state event that keeps it alive.
+#[derive(Component)]
+pub(crate) struct SoundLoop(&'static str);
+
+/// The loop events active this frame, from the predicted state. These are
+/// states the client owns, so a loop starts and stops on the same frame the
+/// state changes — no round trip.
+fn active_loops(session: &ClientSession) -> impl Iterator<Item = &'static str> {
+    [
+        (session.state.drawing, "drawing"),
+        (session.health.is_depleted(), "dead"),
+    ]
+    .into_iter()
+    .filter_map(|(active, event)| active.then_some(event))
+}
+
+/// Keep exactly the active looping sounds playing: start the ones that became
+/// active, stop the ones that ended. A package that authors no loop for an
+/// event stays silent.
+pub(crate) fn loops(
+    mut commands: Commands,
+    session: Res<ClientSession>,
+    asset_server: Res<AssetServer>,
+    sounds: Res<PackageSounds>,
+    assets: Res<PackageAssets>,
+    playing: Query<(Entity, &SoundLoop)>,
+) {
+    let active: Vec<&'static str> = active_loops(&session).collect();
+    for (entity, sound) in &playing {
+        if !active.contains(&sound.0) {
+            commands.entity(entity).despawn();
+        }
+    }
+    for event in active {
+        if playing.iter().any(|(_, sound)| sound.0 == event) {
+            continue;
+        }
+        let Some(uri) = sounds.uri(&assets, event) else {
+            continue;
+        };
+        let source: Handle<AudioSource> = asset_server.load(uri);
+        commands.spawn((
+            AudioPlayer::new(source),
+            PlaybackSettings::LOOP,
+            SoundLoop(event),
+        ));
+    }
+}
+
 /// Keep the sound table in step with the replicated package manifest.
 pub(crate) fn sync(
     session: Res<ClientSession>,

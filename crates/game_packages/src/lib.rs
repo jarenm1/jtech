@@ -283,7 +283,16 @@ fn sounds(vm: &mut Vm) -> Result<Vec<(String, String)>, String> {
         };
         if !matches!(
             event.as_str(),
-            "draw" | "fire" | "hit" | "equip" | "death" | "respawn" | "jump" | "land"
+            "draw"
+                | "fire"
+                | "hit"
+                | "equip"
+                | "death"
+                | "respawn"
+                | "jump"
+                | "land"
+                | "drawing"
+                | "dead"
         ) {
             return Err(format!("unknown sound event {event}"));
         }

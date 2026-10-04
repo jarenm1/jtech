@@ -121,6 +121,12 @@ lands on the right frame; the package only chooses the file.
 | `respawn` | the player's life counter changes |
 | `jump` | a jump is requested |
 | `land` | the player touches down |
+| `drawing` | **loops** while a ranged weapon is drawing |
+| `dead` | **loops** while the player is dead |
+
+The looping events start when their state becomes active and stop when it ends,
+on the same frame, because the client owns that state. A package that authors no
+loop for an event stays silent.
 
 The client resolves them through the same `pkg://` asset source the models use,
 so a WAV, OGG or FLAC file dropped in `assets/` and named here plays with no
