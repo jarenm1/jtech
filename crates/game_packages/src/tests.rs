@@ -388,7 +388,7 @@ fn scatter_rules_are_validated_and_compiled() {
     let generator = load_terrain_source(TERRAIN).unwrap();
     assert_eq!(generator.species_count(), 3);
     assert_eq!(generator.species_name(0), "oak");
-    assert_eq!(generator.species_model(0), "oak.glb");
+    assert_eq!(generator.species_model(0), "tree.glb");
     let placed: usize = (-6..=6)
         .flat_map(|cx| {
             (-6..=6).flat_map(move |cz| (-2..=3).map(move |cy| glam::IVec3::new(cx, cy, cz)))
@@ -408,8 +408,8 @@ fn scatter_rules_are_validated_and_compiled() {
             "(list \"willow\" \"boulder\")",
             "unknown species",
         ),
-        ("\"oak.glb\"", "\"missing.glb\"", "missing model"),
-        ("\"oak.glb\"", "\"../oak.glb\"", "escaping model"),
+        ("\"tree.glb\"", "\"missing.glb\"", "missing model"),
+        ("\"tree.glb\"", "\"../tree.glb\"", "escaping model"),
     ];
     for (from, to, label) in cases {
         assert!(
