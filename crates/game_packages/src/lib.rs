@@ -42,6 +42,12 @@ const API: &str = "
   (list id name range damage cooldown-ticks knockback model))
 (define (ranged-weapon id name range damage cooldown-ticks knockback speed gravity travel lifetime . model)
   (list id name range damage cooldown-ticks knockback speed gravity travel lifetime model))
+(define (effect . primitives) primitives)
+(define (damage amount kind) (list 'damage amount kind))
+(define (heal amount) (list 'heal amount))
+(define (status kind ticks) (list 'status kind ticks))
+(define (impulse speed) (list 'impulse speed))
+(define (sound event) (list 'sound event))
 ";
 
 /// Prefer packages beside the executable, then the working directory. The final
@@ -301,6 +307,110 @@ fn sounds(vm: &mut Vm) -> Result<Vec<(String, String)>, String> {
     Ok(sounds)
 }
 
+/// Parse the optional `effects` export: `(item-id trigger effect)` triples,
+/// where `effect` is a list of primitives from the `effect` constructor. The
+/// host applies them natively, so a package declares behavior without a VM in
+/// the tick.
+fn effects(vm: &mut Vm) -> Result<Vec<(u32, Trigger, Vec<EffectPrimitive>)>, String> {
+    let Ok(value) = vm.engine.extract_value("effects") else {
+        return Ok(Vec::new());
+    };
+    let SteelVal::ListV(entries) = value else {
+        return Err("effects must be a list of (item-id trigger effect) triples".into());
+    };
+    let mut effects = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        let SteelVal::ListV(fields) = entry else {
+            return Err("each effect must be an (item-id trigger effect) triple".into());
+        };
+        if fields.len() != 3 {
+            return Err("each effect must be an (item-id trigger effect) triple".into());
+        }
+        let id = u32::try_from(integer(&fields[0], "effect item id")?)
+            .map_err(|_| "effect item id must be a positive integer".to_string())?;
+        let SteelVal::StringV(trigger) = &fields[1] else {
+            return Err("effect trigger must be a string".into());
+        };
+        let trigger = match trigger.as_str() {
+            "on-hit" => Trigger::OnHit,
+            "on-kill" => Trigger::OnKill,
+            "on-fire" => Trigger::OnFire,
+            "on-expire" => Trigger::OnExpire,
+            other => return Err(format!("unknown effect trigger {other}")),
+        };
+        let SteelVal::ListV(primitives) = &fields[2] else {
+            return Err("effect must be a list of primitives".into());
+        };
+        let mut list = Vec::with_capacity(primitives.len());
+        for primitive in primitives.iter() {
+            list.push(effect_primitive(primitive.clone())?);
+        }
+        effects.push((id, trigger, list));
+    }
+    Ok(effects)
+}
+
+/// One `(name ...)` primitive from an `effect` list.
+fn effect_primitive(value: SteelVal) -> Result<EffectPrimitive, String> {
+    let SteelVal::ListV(fields) = value else {
+        return Err("each effect primitive must be a list".into());
+    };
+    let Some(SteelVal::SymbolV(tag)) = fields.first() else {
+        return Err("each effect primitive must start with its name".into());
+    };
+    match tag.as_str() {
+        "damage" => {
+            let amount = u16::try_from(integer(&fields[1], "damage amount")?).unwrap_or(u16::MAX);
+            let SteelVal::StringV(kind) = &fields[2] else {
+                return Err("damage kind must be a string".into());
+            };
+            let kind = match kind.as_str() {
+                "physical" => DamageKind::Physical,
+                "fire" => DamageKind::Fire,
+                "frost" => DamageKind::Frost,
+                "shock" => DamageKind::Shock,
+                "poison" => DamageKind::Poison,
+                other => return Err(format!("unknown damage kind {other}")),
+            };
+            Ok(EffectPrimitive::Damage { amount, kind })
+        }
+        "heal" => Ok(EffectPrimitive::Heal {
+            amount: u16::try_from(integer(&fields[1], "heal amount")?).unwrap_or(u16::MAX),
+        }),
+        "status" => {
+            let SteelVal::StringV(kind) = &fields[1] else {
+                return Err("status kind must be a string".into());
+            };
+            let kind = match kind.as_str() {
+                "stun" => controller::StatusKind::Stun,
+                "sleep" => controller::StatusKind::Sleep,
+                "root" => controller::StatusKind::Root,
+                "slow" => controller::StatusKind::Slow,
+                "silence" => controller::StatusKind::Silence,
+                "knockup" => controller::StatusKind::Knockup,
+                "taunt" => controller::StatusKind::Taunt,
+                "fear" => controller::StatusKind::Fear,
+                "blind" => controller::StatusKind::Blind,
+                other => return Err(format!("unknown status kind {other}")),
+            };
+            let ticks = u16::try_from(integer(&fields[2], "status ticks")?).unwrap_or(u16::MAX);
+            Ok(EffectPrimitive::Status { kind, ticks })
+        }
+        "impulse" => Ok(EffectPrimitive::Impulse {
+            speed: number(&fields[1], "impulse speed")?.clamp(0.0, 100.0),
+        }),
+        "sound" => {
+            let SteelVal::StringV(event) = &fields[1] else {
+                return Err("sound event must be a string".into());
+            };
+            Ok(EffectPrimitive::Sound {
+                event: event.to_string(),
+            })
+        }
+        other => Err(format!("unknown effect primitive {other}")),
+    }
+}
+
 fn projectile_spec(value: SteelVal) -> Result<ProjectileSpec, String> {
     let [speed, gravity, max_travel, age] = numbers(value, "projectile-for-power")?;
     bound("speed", speed, 0.1, 200.0)?;
@@ -335,6 +445,74 @@ fn blast_spec(value: SteelVal) -> Result<BlastSpec, String> {
     })
 }
 
+/// Damage type, for resistances and on-hit conditions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DamageKind {
+    Physical,
+    Fire,
+    Frost,
+    Shock,
+    Poison,
+}
+
+/// One primitive an effect applies, in declaration order. The host applies
+/// these natively, so a package declares behavior without a VM in the tick.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EffectPrimitive {
+    /// Typed damage to the target.
+    Damage { amount: u16, kind: DamageKind },
+    /// Restore health to the attacker.
+    Heal { amount: u16 },
+    /// Apply a status to the target for a duration.
+    Status {
+        kind: controller::StatusKind,
+        ticks: u16,
+    },
+    /// Knockback along the hit direction, in kg·m/s.
+    Impulse { speed: f32 },
+    /// Play a package sound by event name.
+    Sound { event: String },
+}
+
+/// A trigger a weapon's effects attach to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    OnHit,
+    OnKill,
+    OnFire,
+    OnExpire,
+}
+
+/// A weapon's declared effects, one primitive list per trigger. Empty lists
+/// mean the trigger does nothing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Effects {
+    pub on_hit: Vec<EffectPrimitive>,
+    pub on_kill: Vec<EffectPrimitive>,
+    pub on_fire: Vec<EffectPrimitive>,
+    pub on_expire: Vec<EffectPrimitive>,
+}
+
+impl Effects {
+    pub fn get(&self, trigger: Trigger) -> &[EffectPrimitive] {
+        match trigger {
+            Trigger::OnHit => &self.on_hit,
+            Trigger::OnKill => &self.on_kill,
+            Trigger::OnFire => &self.on_fire,
+            Trigger::OnExpire => &self.on_expire,
+        }
+    }
+
+    fn get_mut(&mut self, trigger: Trigger) -> &mut Vec<EffectPrimitive> {
+        match trigger {
+            Trigger::OnHit => &mut self.on_hit,
+            Trigger::OnKill => &mut self.on_kill,
+            Trigger::OnFire => &mut self.on_fire,
+            Trigger::OnExpire => &mut self.on_expire,
+        }
+    }
+}
+
 /// A melee weapon one package contributes to the shared item table.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeleeWeapon {
@@ -351,6 +529,8 @@ pub struct MeleeWeapon {
     pub ranged: Option<ProjectileSpec>,
     /// Model file under the package's `assets/` directory, if authored.
     pub model: Option<String>,
+    /// Declared on-hit/on-kill/on-fire/on-expire effects.
+    pub effects: Effects,
 }
 
 /// Immutable melee policy: authored weapons plus the items granted to every
@@ -395,6 +575,14 @@ impl MeleePackage {
                     "spawn-items grants item {item} that this package does not register"
                 ));
             }
+        }
+        for (id, trigger, list) in effects(vm)? {
+            let Some(weapon) = weapons.iter_mut().find(|weapon| weapon.id == id) else {
+                return Err(format!(
+                    "effects references item {id} that this package does not register"
+                ));
+            };
+            *weapon.effects.get_mut(trigger) = list;
         }
         Ok(Self {
             generation,
@@ -476,6 +664,7 @@ fn melee_weapon(value: SteelVal, package_dir: &Path) -> Result<MeleeWeapon, Stri
         spec,
         ranged,
         model,
+        effects: Effects::default(),
     })
 }
 
@@ -602,6 +791,12 @@ impl MeleeTable {
     /// Every registered weapon, for replication to clients.
     pub fn weapons(&self) -> impl Iterator<Item = &MeleeWeapon> {
         self.weapons.values()
+    }
+
+    /// Declared effects for a registered weapon; `None` for hands and unknown
+    /// ids.
+    pub fn effects(&self, item: u32) -> Option<&Effects> {
+        self.weapons.get(&item).map(|weapon| &weapon.effects)
     }
 
     /// Registered weapons are equipment; everything else stacks.

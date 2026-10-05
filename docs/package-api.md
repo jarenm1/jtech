@@ -143,3 +143,95 @@ tractable, and neither is needed for a weapon pack.
   tag, the way arrows already carry one.
 - **Client parity.** Anything the client needs to render or predict must
   replicate. A package cannot assume client-side code.
+
+## 6. v2 direction: declarative effects, native application
+
+The goal is more extensibility without a VM in the tick. A package **declares**
+what happens; the host **applies** it natively. That keeps the tick free of
+interpretation, keeps the simulation deterministic and replayable, and still
+hot-reloads — the declared tables swap at a tick boundary exactly like the
+weapon table does today.
+
+### Effect primitives
+
+An effect is a list of primitives, each a host-provided constructor:
+
+```scheme
+;; (effect . primitives)
+(define flame
+  (effect (damage 4 "fire")
+          (status "burn" 120)
+          (impulse 12.0)
+          (sound "ignite")))
+
+(define lifesteal
+  (effect (heal 3)))
+```
+
+| Primitive | Meaning | Bounds |
+| --- | --- | --- |
+| `(damage amount type)` | typed damage to the target | amount 0–65535, type a known string |
+| `(heal amount)` | restore health to the attacker | amount 0–65535 |
+| `(status kind ticks)` | apply a status for a duration | kind a known string, ticks 1–36000 |
+| `(impulse speed)` | knockback along the hit direction | speed 0–100 |
+| `(sound event)` | play a package sound | event from the fixed set |
+| `(spawn projectile)` | spawn an authored projectile | a `projectile` spec |
+
+Every primitive is validated at load against that table, exactly like the
+existing bounds. The host applies them in declaration order.
+
+### Triggers
+
+Effects attach to a weapon and fire on a fixed event set — the same moments the
+sound system already uses, so the two share one vocabulary:
+
+| Trigger | Fires when |
+| --- | --- |
+| `on-hit` | the weapon damages a character |
+| `on-kill` | the weapon's damage depletes a character |
+| `on-fire` | a ranged weapon releases a shot |
+| `on-expire` | a projectile expires without hitting |
+
+```scheme
+(melee-weapon 9 "Flame Sword" 3.2 10 24 350.0 "flame.glb"
+              (on-hit flame)
+              (on-kill (effect (sound "kill"))))
+```
+
+### Why this shape
+
+- **No VM in the tick.** The declared primitives compile into a native table;
+  applying one is a match arm, not an interpretation. Bevy's frame budget is
+  untouched.
+- **Deterministic by construction.** There is no script to run, so there is no
+  wall clock, no RNG, and no way to make the simulation non-replayable.
+- **Hot reloads for free.** The table swaps at a tick boundary like every other
+  package table. Edit `server.scm`, save, and the next swing uses the new
+  effect — which is exactly the testing loop you want.
+- **A migration path to scripting.** When a case genuinely needs logic the
+  primitives cannot express, the trigger becomes a callback that *returns*
+  primitives. The host API does not change; only the source of the list does.
+
+### Client-only mods (tier A)
+
+Cosmetic mods need no server involvement and cannot affect gameplay, so they
+are safe to load locally. The client gains a local asset directory that
+resolves **ahead of** the server's `pkg://` source:
+
+```
+client assets/  →  pkg:// (server packages)  →  built-in fallback
+```
+
+A local `.glb` or audio file with the same relative path overrides the server's
+copy. No scripting, no VM, no determinism risk — just a resolution order. This
+is the cheap 80% of "client-only mods": reskins, model swaps, sound packs.
+
+### Deferred
+
+- **Scripted effects** (a callback returning primitives) — the migration path
+  above, once the primitives prove insufficient.
+- **Client-side Scheme** — custom HUD, particles, screen effects. A second VM
+  and a second API surface; do it when a concrete case demands it.
+- **World access** — a package reading or writing voxels. Breaks the
+  "packages are data" property; needs its own trust story.
+

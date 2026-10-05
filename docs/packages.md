@@ -106,6 +106,37 @@ server uses the same existing projectile/explosion messages for presentation.
 | `weapons` | List of `(melee-weapon id name range damage cooldown-ticks knockback [model])` |
 | `spawn-items` | Optional list of `(id count)` pairs granted on spawn and respawn |
 | `sounds` | Optional list of `(event path)` pairs the client plays on that event |
+| `effects` | Optional list of `(item-id trigger effect)` triples applied on that trigger |
+
+`effects` declares what a weapon does beyond its swing, as data the host
+applies natively — no VM runs in the tick, so the frame budget is untouched and
+the simulation stays deterministic and replayable. Edit and save to hot-reload
+the table like any other package export.
+
+```scheme
+(define effects
+  (list (list 9 "on-hit"
+              (effect (damage 4 "frost")
+                      (status "slow" 120)
+                      (impulse 8.0)))))
+```
+
+Triggers: `"on-hit"` (the weapon damages a character), `"on-kill"` (its damage
+depletes one), `"on-fire"` (a ranged weapon releases a shot), `"on-expire"` (a
+projectile expires without hitting). Primitives, applied in declaration order:
+
+| Primitive | Meaning | Bounds |
+| --- | --- | --- |
+| `(damage amount kind)` | typed damage to the target | amount 0–65535; kind `physical`/`fire`/`frost`/`shock`/`poison` |
+| `(heal amount)` | restore health to the attacker | 0–65535 |
+| `(status kind ticks)` | apply a status to the target | kind from the host's status set; ticks 1–65535 |
+| `(impulse speed)` | knockback along the hit direction | 0–100 |
+| `(sound event)` | play a package sound | event from the sound set |
+
+An `effects` entry must reference an item id the same package registers, or the
+package fails to load. Status kinds are the host's fixed set for now; a custom
+effect kind (a burn that ticks damage) needs the status model to carry per-kind
+data.
 
 `sounds` maps a fixed event set to files under the package's `assets/` dir. The
 client detects these moments locally (prediction) or receives them, so a sound

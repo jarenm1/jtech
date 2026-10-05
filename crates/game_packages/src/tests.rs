@@ -229,14 +229,17 @@ fn melee_package_registers_weapons_and_spawn_items() {
     let Package::Melee(package) = compile_melee(MELEE).unwrap() else {
         panic!("melee source compiled to another kind");
     };
-    assert_eq!(package.weapons.len(), 2);
+    assert_eq!(package.weapons.len(), 3);
     assert_eq!(package.weapons[0].id, 7);
     assert_eq!(package.weapons[0].name, "Sword");
     assert_eq!(package.weapons[0].spec.damage, 12);
     assert!(package.weapons[0].ranged.is_none());
     assert_eq!(package.weapons[1].id, 8);
     assert!(package.weapons[1].ranged.is_some());
-    assert_eq!(package.spawn_items, vec![(7, 1), (8, 1)]);
+    assert_eq!(package.weapons[2].id, 9);
+    assert_eq!(package.weapons[2].name, "Frost Sword");
+    assert_eq!(package.weapons[2].effects.on_hit.len(), 3);
+    assert_eq!(package.spawn_items, vec![(7, 1), (8, 1), (9, 1)]);
 }
 
 #[test]
@@ -254,7 +257,7 @@ fn melee_packages_merge_and_conflicting_ids_error_the_later_package() {
     let mut host = PackageHost::new(&fixture.0);
     let table = host.melee_table();
     assert!(table.spec(7).is_some() && table.spec(10).is_some());
-    assert_eq!(table.spawn_items(), &[(7, 1), (8, 1), (10, 1)]);
+    assert_eq!(table.spawn_items(), &[(7, 1), (8, 1), (9, 1), (10, 1)]);
 
     // Sorted order: "melee" claims id 7 first; the conflicting reload of
     // "z-blade" errors while the winner stays loaded.

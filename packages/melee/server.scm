@@ -19,12 +19,24 @@
     ;; A plain sword: the melee basic attack. Ships the package's 3D model.
     (melee-weapon 7 "Sword" 3.0 12 24 350.0 "knife.glb")
     ;; A plain bow: the ranged basic attack, no explosion.
-    (ranged-weapon 8 "Bow" 16.0 14 30 0.0 40.0 9.0 200000.0 36000)))
+    (ranged-weapon 8 "Bow" 16.0 14 30 0.0 40.0 9.0 200000.0 36000)
+    ;; A frost sword: the same swing, plus a chill on hit.
+    (melee-weapon 9 "Frost Sword" 3.2 10 24 350.0 "knife.glb")))
+
+;; Declared effects: (item-id trigger effect) triples. The host applies the
+;; primitives natively, so a package declares behavior without a VM in the tick.
+;; Status kinds are the host's fixed set for now; a custom effect kind (a burn
+;; that ticks damage) needs the status model to carry per-kind data.
+(define effects
+  (list (list 9 "on-hit"
+              (effect (damage 4 "frost")
+                      (status "slow" 120)
+                      (impulse 8.0)))))
 
 ;; Items every player receives on connect and respawn: (id count) pairs that
 ;; must reference weapons this package registers.
 (define spawn-items
-  (list (list 7 1) (list 8 1)))
+  (list (list 7 1) (list 8 1) (list 9 1)))
 
 ;; (sound event path) pairs; the client plays them on the matching event.
 ;; Events: "draw" (a bow draw starts), "fire" (a shot leaves), "hit" (a strike),
