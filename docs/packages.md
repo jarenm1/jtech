@@ -129,14 +129,16 @@ projectile expires without hitting). Primitives, applied in declaration order:
 | --- | --- | --- |
 | `(damage amount kind)` | typed damage to the target | amount 0–65535; kind `physical`/`fire`/`frost`/`shock`/`poison` |
 | `(heal amount)` | restore health to the attacker | 0–65535 |
-| `(status kind ticks)` | apply a status to the target | kind from the host's status set; ticks 1–65535 |
+| `(status kind ticks magnitude)` | apply a status to the target | kind from the host's status set; ticks 1–65535; magnitude 0–65535 |
 | `(impulse speed)` | knockback along the hit direction | 0–100 |
 | `(sound event)` | play a package sound | event from the sound set |
 
 An `effects` entry must reference an item id the same package registers, or the
-package fails to load. Status kinds are the host's fixed set for now; a custom
-effect kind (a burn that ticks damage) needs the status model to carry per-kind
-data.
+package fails to load. Status kinds are the host's fixed set: `stun`, `sleep`,
+`root`, `slow`, `silence`, `knockup`, `taunt`, `fear`, `blind`, and `burn` (a
+damage-over-time whose `magnitude` is the whole points lost per tick). A
+package-defined kind needs the status model to carry per-kind data, which is
+the next step.
 
 `sounds` maps a fixed event set to files under the package's `assets/` dir. The
 client detects these moments locally (prediction) or receives them, so a sound

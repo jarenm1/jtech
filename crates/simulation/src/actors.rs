@@ -561,6 +561,10 @@ impl Simulation {
             );
             self.step_scratch = step_bodies;
             actor.intent = intent;
+            if output.damage_over_time > 0 {
+                // A burn ticks damage: the motor owns the timer, the host the health.
+                actor.health.damage(output.damage_over_time);
+            }
             if output.basic_attack {
                 self.actor_attacks.push(id);
             }
@@ -719,14 +723,18 @@ impl Simulation {
                         player.health.heal(*amount);
                     }
                 }
-                EffectPrimitive::Status { kind, ticks } => {
+                EffectPrimitive::Status {
+                    kind,
+                    ticks,
+                    magnitude,
+                } => {
                     if target & ACTOR_TARGET != 0 {
                         let actor_id = (target & !ACTOR_TARGET) as u32;
                         if let Some(actor) = self.actors.get_mut(&actor_id) {
-                            actor.state.statuses.apply(*kind, *ticks);
+                            actor.state.statuses.apply(*kind, *ticks, *magnitude);
                         }
                     } else if let Some(victim) = self.players.get_mut(&target) {
-                        victim.state.statuses.apply(*kind, *ticks);
+                        victim.state.statuses.apply(*kind, *ticks, *magnitude);
                     }
                 }
                 EffectPrimitive::Impulse { speed } => {
