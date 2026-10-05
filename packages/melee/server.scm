@@ -30,7 +30,7 @@
 (define effects
   (list (list 9 "on-hit"
               (effect (damage 4 "frost")
-                      (status "slow" 120)
+                      (status "slow" 120 0.5)
                       (impulse 8.0)))))
 
 ;; Items every player receives on connect and respawn: (id count) pairs that

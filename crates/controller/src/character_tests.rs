@@ -389,12 +389,12 @@ fn crouch_lowers_the_body_under_a_low_ceiling() {
 #[test]
 fn status_effects_compose_by_strongest_wins_and_expire() {
     let mut list = StatusList::default();
-    list.apply(StatusKind::Slow, 10);
-    list.apply(StatusKind::Slow, 4);
+    list.apply(StatusKind::Slow, 10, 0.5);
+    list.apply(StatusKind::Slow, 4, 0.5);
     assert_eq!(list.entries()[0].unwrap().remaining, 10, "shorter refresh keeps the longer");
-    list.apply(StatusKind::Slow, 20);
+    list.apply(StatusKind::Slow, 20, 0.5);
     assert_eq!(list.entries()[0].unwrap().remaining, 20, "longer refresh replaces");
-    list.apply(StatusKind::Stun, 3);
+    list.apply(StatusKind::Stun, 3, 0.0);
     let constraints = list.constraints();
     assert!(constraints.movement_locked && constraints.action_locked);
     assert_eq!(constraints.speed_mult, 0.5);
@@ -406,12 +406,25 @@ fn status_effects_compose_by_strongest_wins_and_expire() {
 }
 
 #[test]
+fn burn_ticks_damage_over_time() {
+    let mut list = StatusList::default();
+    list.apply(StatusKind::Burn, 3, 4.0);
+    assert_eq!(list.damage_over_time(), 4);
+    list.apply(StatusKind::Burn, 3, 2.0);
+    assert_eq!(list.damage_over_time(), 4, "strongest magnitude wins");
+    for _ in 0..3 {
+        list.tick();
+    }
+    assert_eq!(list.damage_over_time(), 0, "burn must expire");
+}
+
+#[test]
 fn stun_locks_movement_and_jump() {
     let world = tests::arena();
     let body = CharacterBody::default();
     let profile = MovementProfile::default();
     let mut state = actor(Vec3::new(0.5, -0.5, 0.5));
-    state.statuses.apply(StatusKind::Stun, 30);
+    state.statuses.apply(StatusKind::Stun, 30, 0.0);
     let mut intent = CharacterIntent {
         movement: Vec2::X,
         jump: true,

@@ -1382,6 +1382,10 @@ fn advance(mut simulation: ResMut<Simulation>, mut world: ResMut<VoxelWorld>) {
                 bodies,
             );
             let attempted = output.attempted;
+            if output.damage_over_time > 0 {
+                // A burn ticks damage: the motor owns the timer, the host the health.
+                player.health.damage(output.damage_over_time);
+            }
             if output.charge_release.is_some() {
                 // A completed draw fires the same ranged attack as the edge.
                 basic_attacks.push(id);

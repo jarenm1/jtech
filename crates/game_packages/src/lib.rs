@@ -45,7 +45,7 @@ const API: &str = "
 (define (effect . primitives) primitives)
 (define (damage amount kind) (list 'damage amount kind))
 (define (heal amount) (list 'heal amount))
-(define (status kind ticks) (list 'status kind ticks))
+(define (status kind ticks magnitude) (list 'status kind ticks magnitude))
 (define (impulse speed) (list 'impulse speed))
 (define (sound event) (list 'sound event))
 ";
@@ -391,10 +391,16 @@ fn effect_primitive(value: SteelVal) -> Result<EffectPrimitive, String> {
                 "taunt" => controller::StatusKind::Taunt,
                 "fear" => controller::StatusKind::Fear,
                 "blind" => controller::StatusKind::Blind,
+                "burn" => controller::StatusKind::Burn,
                 other => return Err(format!("unknown status kind {other}")),
             };
             let ticks = u16::try_from(integer(&fields[2], "status ticks")?).unwrap_or(u16::MAX);
-            Ok(EffectPrimitive::Status { kind, ticks })
+            let magnitude = number(&fields[3], "status magnitude")?.clamp(0.0, 65535.0);
+            Ok(EffectPrimitive::Status {
+                kind,
+                ticks,
+                magnitude,
+            })
         }
         "impulse" => Ok(EffectPrimitive::Impulse {
             speed: number(&fields[1], "impulse speed")?.clamp(0.0, 100.0),
@@ -463,10 +469,13 @@ pub enum EffectPrimitive {
     Damage { amount: u16, kind: DamageKind },
     /// Restore health to the attacker.
     Heal { amount: u16 },
-    /// Apply a status to the target for a duration.
+    /// Apply a status to the target for a duration. `magnitude` is the
+    /// per-kind value: the damage a burn deals each tick, or the speed
+    /// fraction a slow applies.
     Status {
         kind: controller::StatusKind,
         ticks: u16,
+        magnitude: f32,
     },
     /// Knockback along the hit direction, in kg·m/s.
     Impulse { speed: f32 },

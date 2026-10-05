@@ -32,6 +32,8 @@ struct Motor<'a> {
     charge_release: Option<f32>,
     /// Movement modifiers applied this tick, in pipeline order.
     speed: SpeedModifiers,
+    /// Damage the active statuses deal this tick.
+    damage_over_time: u16,
     /// Horizontal velocity the character attempted this tick, before terrain
     /// and loose bodies clamped the axis sweeps.
     attempted: Vec2,
@@ -61,6 +63,7 @@ pub fn step_character(
             ),
             charge_release: None,
             speed: SpeedModifiers::default(),
+            damage_over_time: 0,
         };
     }
     let profile = profile.bounded();
@@ -89,6 +92,7 @@ pub fn step_character(
         charge: 0.0,
         charge_release: None,
         speed: SpeedModifiers::default(),
+        damage_over_time: 0,
     };
     status(&mut motor, character);
     sanitize(&mut motor, character);
@@ -108,6 +112,7 @@ pub fn step_character(
         charge: motor.charge,
         charge_release: motor.charge_release,
         speed: motor.speed,
+        damage_over_time: motor.damage_over_time,
     }
 }
 
@@ -115,6 +120,7 @@ pub fn step_character(
 fn status(motor: &mut Motor, character: &mut CharacterState) {
     character.statuses.tick();
     motor.constraints = character.statuses.constraints();
+    motor.damage_over_time = character.statuses.damage_over_time();
 }
 
 /// Bound the tick and the replay state, and advance yaw from held turn.

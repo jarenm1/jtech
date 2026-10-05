@@ -212,20 +212,25 @@ pub enum StatusKind {
     Taunt,
     Fear,
     Blind,
+    /// Damage over time: `magnitude` is the whole points lost per tick.
+    Burn,
 }
 
 /// One active status effect; `remaining` counts down in fixed ticks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `magnitude` carries the per-kind value: the damage a `Burn` deals each tick,
+/// or the speed fraction a `Slow` applies. Kinds that gate only ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Status {
     pub kind: StatusKind,
     pub remaining: u16,
+    pub magnitude: f32,
 }
 
 /// Maximum simultaneously active statuses per character.
 pub const MAX_STATUSES: usize = 8;
 
 /// Bounded set of active statuses in application order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatusList {
     entries: [Option<Status>; MAX_STATUSES],
 }
@@ -238,10 +243,11 @@ impl StatusList {
     /// Apply or refresh a status. Strongest-wins per kind: a longer remaining
     /// duration replaces a shorter one, otherwise the existing entry stands.
     /// A full list drops the new status rather than evicting an active one.
-    pub fn apply(&mut self, kind: StatusKind, ticks: u16) {
+    pub fn apply(&mut self, kind: StatusKind, ticks: u16, magnitude: f32) {
         for status in self.entries.iter_mut().flatten() {
             if status.kind == kind {
                 status.remaining = status.remaining.max(ticks);
+                status.magnitude = status.magnitude.max(magnitude);
                 return;
             }
         }
@@ -249,8 +255,20 @@ impl StatusList {
             *slot = Some(Status {
                 kind,
                 remaining: ticks,
+                magnitude,
             });
         }
+    }
+
+    /// Whole points of damage the active statuses deal this tick, from every
+    /// `Burn`. The host applies it; the motor only owns the timer.
+    pub fn damage_over_time(&self) -> u16 {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|status| status.kind == StatusKind::Burn)
+            .map(|status| status.magnitude.max(0.0) as u16)
+            .sum()
     }
 
     /// Decrement every active status and drop the ones that expire.
@@ -284,6 +302,8 @@ impl StatusList {
                 StatusKind::Silence => constraints.cast_locked = true,
                 StatusKind::Slow => constraints.speed_mult = constraints.speed_mult.min(0.5),
                 StatusKind::Taunt | StatusKind::Fear | StatusKind::Blind => {}
+                // A burn deals damage but gates nothing.
+                StatusKind::Burn => {}
             }
         }
         constraints
@@ -499,6 +519,9 @@ pub struct MotorOutput {
     pub charge_release: Option<f32>,
     /// Movement modifiers applied this tick, in pipeline order.
     pub speed: SpeedModifiers,
+    /// Whole points of damage the active statuses deal this tick, for the host
+    /// to apply. The motor owns the timer; the host owns the health.
+    pub damage_over_time: u16,
 }
 
 /// Complete motor state for replay. Physics motion is feet-anchored; yaw is radians.
