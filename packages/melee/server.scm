@@ -19,7 +19,7 @@
     ;; A plain sword: the melee basic attack. Ships the package's 3D model.
     (melee-weapon 7 "Sword" 3.0 12 24 350.0 "knife.glb")
     ;; A plain bow: the ranged basic attack, no explosion.
-    (ranged-weapon 8 "Bow" 16.0 14 30 0.0 40.0 9.0 100000.0 18000)))
+    (ranged-weapon 8 "Bow" 16.0 14 30 0.0 40.0 9.0 200000.0 36000)))
 
 ;; Items every player receives on connect and respawn: (id count) pairs that
 ;; must reference weapons this package registers.

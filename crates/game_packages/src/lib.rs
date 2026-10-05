@@ -305,8 +305,8 @@ fn projectile_spec(value: SteelVal) -> Result<ProjectileSpec, String> {
     let [speed, gravity, max_travel, age] = numbers(value, "projectile-for-power")?;
     bound("speed", speed, 0.1, 200.0)?;
     bound("gravity", gravity, 0.0, 100.0)?;
-    bound("max travel", max_travel, 0.1, 100_000.0)?;
-    bound("lifetime ticks", age, 1.0, 18_000.0)?;
+    bound("max travel", max_travel, 0.1, 200_000.0)?;
+    bound("lifetime ticks", age, 1.0, 36_000.0)?;
     if age.fract() != 0.0 {
         return Err("lifetime ticks must be an integer".into());
     }

@@ -141,7 +141,21 @@ impl Arrow {
             // neighboring exposed faces can receive blast work.
             return Flight::Impact(start + direction * (hit - 0.02).max(0.0), hit_target);
         }
-        self.snapshot.position += direction * distance;
+        let end = start + direction * distance;
+        // Terrain outside the loaded chunks still blocks: sample the analytic
+        // surface so an arrow cannot pass through a mountain nobody has loaded.
+        // The loaded case is already covered by the raycast above.
+        if world.block(end.floor().as_ivec3()).is_none() {
+            let column = world.generator.sample(
+                end.x.floor() as i64,
+                end.z.floor() as i64,
+                world.seed,
+            );
+            if end.y <= column.raw_height {
+                return Flight::Impact(Vec3::new(end.x, column.raw_height, end.z), None);
+            }
+        }
+        self.snapshot.position = end;
         self.traveled += distance;
         // An arrow may leave the loaded world and fall back into it: terrain
         // only blocks it where chunks are loaded, and the age cap bounds it.
@@ -233,9 +247,9 @@ mod tests {
     #[test]
     fn arrows_fly_past_the_loaded_boundary_and_expire_on_age() {
         let world = empty_world();
-        // An arrow leaving the loaded world keeps flying, so a shot straight up
-        // can fall back into loaded terrain.
-        let mut arrow = Arrow::new(1, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
+        // An arrow above the terrain leaving the loaded world keeps flying, so
+        // a shot straight up can fall back into loaded terrain.
+        let mut arrow = Arrow::new(1, Vec3::new(95.9, 200., 1.), Vec3::X, BowPower::Standard);
         assert!(matches!(arrow.step(&world, &[], &[]), Flight::Flying));
         assert!(arrow.snapshot.position.x > 96.0);
         // The age cap still bounds its lifetime.
@@ -246,20 +260,37 @@ mod tests {
     }
 
     #[test]
+    fn an_arrow_cannot_pass_through_unloaded_terrain() {
+        let world = empty_world();
+        // Far outside the loaded chunks, the analytic surface still blocks: the
+        // arrow lands on it rather than flying through a mountain nobody loaded.
+        let mut arrow = Arrow::new(1, Vec3::new(95.9, 10., 1.), Vec3::X, BowPower::Standard);
+        let Flight::Impact(position, _) = arrow.step(&world, &[], &[]) else {
+            panic!("arrow passed through unloaded terrain");
+        };
+        let column = world
+            .generator
+            .sample(position.x.floor() as i64, position.z.floor() as i64, world.seed);
+        assert!((position.y - column.raw_height).abs() < 0.001);
+    }
+
+    #[test]
     fn a_vertical_arrow_falls_back_into_the_loaded_world() {
         let world = empty_world();
-        let mut arrow = Arrow::new(1, Vec3::new(48.5, 20.5, 48.5), Vec3::Y, BowPower::Standard);
+        let mut arrow = Arrow::new(1, Vec3::new(48.5, 200.5, 48.5), Vec3::Y, BowPower::Standard);
         let origin = arrow.snapshot.position;
         let mut apex = origin.y;
+        let mut landed = None;
         for _ in 0..1800 {
-            let _ = arrow.step(&world, &[], &[]);
-            apex = apex.max(arrow.snapshot.position.y);
-            if arrow.snapshot.position.y <= origin.y && arrow.snapshot.velocity.y < 0.0 {
+            if let Flight::Impact(position, _) = arrow.step(&world, &[], &[]) {
+                landed = Some(position);
                 break;
             }
+            apex = apex.max(arrow.snapshot.position.y);
         }
         assert!(apex > origin.y + 100.0, "arrow did not climb: {apex}");
-        assert!(arrow.snapshot.position.y <= origin.y + 0.5);
+        let landed = landed.expect("arrow never came back down");
+        assert!(landed.y < origin.y, "arrow landed above its origin");
     }
 
     #[test]
