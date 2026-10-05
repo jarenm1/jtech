@@ -1905,6 +1905,39 @@ mod tests {
     }
 
     #[test]
+    fn declared_on_hit_effects_apply_to_the_target() {
+        let mut app = headless_app(1);
+        let (_generated, mut sim) = take_resources(&mut app);
+        let mut world = empty_world();
+        for x in 0..8 {
+            for z in 0..8 {
+                world.set_block(IVec3::new(x, 0, z), voxel_world::STONE).unwrap();
+            }
+        }
+        let dummy = sim.spawn_actor(Vec3::new(2.5, 1.0, 0.5)).unwrap();
+        let mut player = Player::new();
+        player.state.motion.position = Vec3::new(2.5, 1.0, 3.5);
+        player.input.pitch = 0.0;
+        player.input.yaw = 0.0; // -Z faces the dummy
+        player.input.selected = 9; // the frost sword, which declares an on-hit
+        player.inventory.add(9, 1);
+        sim.players.insert(1, player);
+
+        sim.tick = 100;
+        swing_cycle(&mut sim, &world, 1);
+        // The package's declared on-hit applies its status to the dummy.
+        let statuses = sim.actors[&dummy].state.statuses;
+        assert!(
+            statuses
+                .entries()
+                .iter()
+                .flatten()
+                .any(|status| status.kind == controller::StatusKind::Slow),
+            "declared on-hit status did not apply"
+        );
+    }
+
+    #[test]
     fn melee_swings_damage_knockback_and_respawn_actors() {
         let mut app = headless_app(1);
         let (_generated, mut sim) = take_resources(&mut app);

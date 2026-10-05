@@ -679,6 +679,69 @@ impl Simulation {
                 }
                 self.damage_player_event(SimEntity::Player(id), hit.target, hit.damage);
             }
+            // Declared on-hit effects apply on top of the swing's own damage.
+            if let Some(effects) = self.packages.melee_table().effects(held) {
+                let on_hit = effects.on_hit.clone();
+                self.apply_effects(&on_hit, id, hit.target, direction);
+            }
+        }
+    }
+
+    /// Apply a weapon's declared effects to a hit target. Damage and impulse
+    /// add to the swing's own; heal returns health to the attacker; status
+    /// applies to the target's controller state. Sound effects are ignored
+    /// until the server replicates them.
+    fn apply_effects(
+        &mut self,
+        effects: &[game_packages::EffectPrimitive],
+        attacker: u64,
+        target: u64,
+        direction: Vec3,
+    ) {
+        use game_packages::EffectPrimitive;
+        for effect in effects {
+            match effect {
+                EffectPrimitive::Damage { amount, .. } => {
+                    if target & ACTOR_TARGET != 0 {
+                        let actor_id = (target & !ACTOR_TARGET) as u32;
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.health.damage(*amount);
+                            if actor.health.is_depleted() {
+                                actor.respawn_at = Some(self.tick + ACTOR_RESPAWN_TICKS);
+                            }
+                        }
+                    } else {
+                        self.damage_player_event(SimEntity::Player(attacker), target, *amount);
+                    }
+                }
+                EffectPrimitive::Heal { amount } => {
+                    if let Some(player) = self.players.get_mut(&attacker) {
+                        player.health.heal(*amount);
+                    }
+                }
+                EffectPrimitive::Status { kind, ticks } => {
+                    if target & ACTOR_TARGET != 0 {
+                        let actor_id = (target & !ACTOR_TARGET) as u32;
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.state.statuses.apply(*kind, *ticks);
+                        }
+                    } else if let Some(victim) = self.players.get_mut(&target) {
+                        victim.state.statuses.apply(*kind, *ticks);
+                    }
+                }
+                EffectPrimitive::Impulse { speed } => {
+                    let impulse = direction * *speed;
+                    if target & ACTOR_TARGET != 0 {
+                        let actor_id = (target & !ACTOR_TARGET) as u32;
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.state.apply_impulse(&actor.body, impulse);
+                        }
+                    } else if let Some(victim) = self.players.get_mut(&target) {
+                        apply_player_impulse(&mut victim.state.motion, impulse);
+                    }
+                }
+                EffectPrimitive::Sound { .. } => {}
+            }
         }
     }
 

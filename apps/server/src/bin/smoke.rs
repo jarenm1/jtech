@@ -1003,7 +1003,7 @@ fn main() -> Result<()> {
             .last()
             .ok_or("no package message received")?;
         require(
-            weapons.len() == 2
+            weapons.len() == 3
                 && weapons.iter().any(|w| w.item == 7 && w.damage == 12)
                 && weapons
                     .iter()

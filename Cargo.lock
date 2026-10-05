@@ -2689,6 +2689,7 @@ dependencies = [
 name = "game_packages"
 version = "0.1.0"
 dependencies = [
+ "controller",
  "gameplay",
  "glam",
  "parking_lot",
