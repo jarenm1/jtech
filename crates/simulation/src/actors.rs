@@ -33,8 +33,8 @@ pub(super) const ACTOR_RESPAWN_TICKS: u64 = 300;
 const PLAIN_PROJECTILE: game_packages::ProjectileSpec = game_packages::ProjectileSpec {
     speed: 40.0,
     gravity: 9.0,
-    max_travel: 100_000.0,
-    max_age_ticks: 18_000,
+    max_travel: 200_000.0,
+    max_age_ticks: 36_000,
 };
 /// High bit separates actor ids from player ids inside swing target lists.
 pub(super) const ACTOR_TARGET: u64 = 1 << 63;
