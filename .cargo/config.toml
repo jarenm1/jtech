@@ -1,0 +1,15 @@
+# Shared compilation cache for every workspace on this machine.
+#
+# Each workspace keeps its own `target/` (a shared target dir lets sibling
+# workspaces poison each other's artifacts), so without this every new
+# workspace would recompile all ~600 registry crates from scratch. Those
+# crates compile from identical `~/.cargo/registry` paths with identical
+# flags in every workspace, so sccache serves them from one shared
+# content-addressed cache instead.
+#
+# Workspace members keep incremental compilation — sccache passes those
+# through — so warm rebuilds are unaffected. The cache lives in
+# `$SCCACHE_DIR` and is capped by `$SCCACHE_CACHE_SIZE`; the flake dev shell
+# sets both. See AGENTS.md, "Compile caching".
+[build]
+rustc-wrapper = "sccache"
