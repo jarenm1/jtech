@@ -29,15 +29,18 @@ agent work happens in a dedicated jj workspace under `~/workspaces/`.
    - Result is `/home/jaren/jtech` → you are in `default`. Create a workspace
      (step 2) before any write, build, or test.
    - Result is a path under `~/workspaces/` → continue there.
-2. Create one workspace per task, based on `main@origin`:
+2. Create one workspace per task, based on `main@origin`, from the repo root:
    ```sh
-   jj git fetch
-   jj workspace add ~/workspaces/<slug> -r main@origin
+   scripts/agent-workspace.sh <slug>
    ```
-   `<slug>` = short task name, e.g. `terrain-chunking`. Never base on
-   `default`'s tip — it carries the human's unmerged work and produces
-   unmergeable PRs. If a task needs code not yet on `main`, tell the human
-   to land it first instead of basing on it.
+   `<slug>` = short task name, e.g. `terrain-chunking`. The script runs
+   `jj git fetch`, adds the workspace from `main@origin`, points its `target`
+   at `~/workspaces/.targets/<slug>`, and seeds that target from the most
+   recently built sibling so the dependency build is reused instead of
+   repeated — see "Build artifacts live outside the workspace" and "Seeding a
+   new workspace from a sibling". Never base on `default`'s tip — it carries
+   the human's unmerged work and produces unmergeable PRs. If a task needs code
+   not yet on `main`, tell the human to land it first instead of basing on it.
 3. Keep every write inside `~/workspaces/<slug>`: `cwd`, file paths, temp
    files, build outputs. Reads of `/home/jaren/jtech` are fine; writes are
    not. Nothing enforces this but convention — check `jj root` before edits.
@@ -67,15 +70,22 @@ scripts/agent-scope.sh --cpu-quota 200% -- cargo build
 scripts/agent-scope.sh --gpu -- direnv exec ~/workspaces/<slug> cargo run -p voxel-client -- --frames 300 --screenshot /tmp/shot.png
 ```
 
-- Per-scope defaults: `CPUQuota=400%` (half the cores), `MemoryMax=8G`, swap
-  disabled. Override with `--cpu-quota`/`--memory-max` or `AGENT_CPU_QUOTA`/
-  `AGENT_MEMORY_MAX`.
+- Per-scope defaults: `CPUQuota=800%` (a burst ceiling — one agent alone may
+  use the whole machine), `MemoryMax=8G`, swap disabled. Override with
+  `--cpu-quota`/`--memory-max` or `AGENT_CPU_QUOTA`/`AGENT_MEMORY_MAX`.
 - Every scope also joins one shared `agents.slice` with an aggregate cap
-  (`AGENT_SLICE_CPU_QUOTA`, default `600%`; `AGENT_SLICE_MEMORY_MAX`, default
-  `16G`), so the *total* across agents stays bounded no matter how many run.
-  `--no-slice` opts out; `--slice NAME` picks another slice.
-- `CARGO_BUILD_JOBS` is derived from the quota, so a capped scope does not
-  spawn more compilers than it can run.
+  (`AGENT_SLICE_CPU_QUOTA`, default `700%`; `AGENT_SLICE_MEMORY_MAX`, default
+  `20G`), so the *total* across agents stays bounded no matter how many run.
+  The **slice** quota, not the per-scope quota, is what bounds N concurrent
+  agents; `700%` leaves one core for the human's editor and rust-analyzer.
+  `--no-slice` opts out; `--slice NAME` picks another slice. The script
+  re-applies the slice caps on every invocation, so tune them with the
+  `AGENT_SLICE_*` variables, not a systemd drop-in.
+- `CARGO_BUILD_JOBS` scales to how many agents are running: one agent alone
+  gets all 8 cores, six agents get 2 each. Memory is the binding constraint,
+  not CPU — six agents at `-j8` would spawn 48 rustc processes and blow the
+  slice memory cap, while the slice CPU quota already throttles throughput
+  under contention. Override with `AGENT_CARGO_JOBS` or `--jobs`.
 - `--gpu` takes an exclusive `flock` so only one agent touches the GPU at a
   time. CPU-only work — including `--headless --render-backend software` —
   does not need it.
@@ -128,6 +138,83 @@ wrapper.
   unclear) plus `cargo test -p` for touched crates with tests. The compile gate
   is the agent's; gameplay/behavioral sign-off is the human's — state in your
   report exactly what needs manual verification and the command to run it.
+- Pick one build selection and keep it. `cargo build --workspace` and
+  `cargo build -p <crate>` resolve features differently, so switching between
+  them recompiles shared deps and leaves *both* artifact sets in `target/debug`
+  (observed: 138 crates recompiled, two `libbevy_app-*.rlib` side by side).
+  `--workspace` is the stable superset; `-p <crate>` is faster per invocation
+  but thrashes against a `--workspace` build.
+
+#### Build artifacts live outside the workspace
+
+In a jj workspace, `<ws>/target` is a **symlink** to
+`~/workspaces/.targets/<slug>`. Cargo is unaffected — it still writes to
+`<ws>/target`, through the link — but nix is:
+
+- A jj workspace has no `.git`, so nix treats the directory as a plain path and
+  copies the *entire* tree into the store every time the flake is re-evaluated
+  (a `flake.nix`/`flake.lock` change, or a fresh `direnv allow`). With a real
+  `target/` in the tree that copy is 10-35G per workspace; with the symlink it
+  is 25 bytes. nix does not follow the link, and `.gitignore` is not consulted
+  for non-git paths.
+- The copy is GC-rooted by `<ws>/.direnv/flake-inputs/`, so it does not go away
+  on its own. `scripts/agent-cleanup.sh --apply --gc` drops those roots and
+  runs `nix store gc`.
+- If the symlink is missing (a workspace created by hand), cargo writes a real
+  `target/` back into the tree. `scripts/agent-cleanup.sh --apply` migrates it
+  back out — a rename, so it is instant and loses nothing.
+- The external directory must exist; a dangling symlink makes cargo fail. The
+  workspace script creates it, and the cleanup script recreates it on demand.
+
+#### Seeding a new workspace from a sibling
+
+`scripts/agent-workspace.sh` fills the new target dir with **hardlinks** to the
+most recently built sibling's target. Cargo then finds the whole dependency
+build already fresh and compiles only the workspace crates:
+
+| fresh workspace, `cargo build --workspace` | wall |
+|---|---|
+| cold, nothing to reuse | 9m33s |
+| sccache only | 8m58s |
+| seeded from a sibling | **46s** |
+
+- Hardlinks cost no disk: the sibling's artifacts are shared, not copied, and
+  `du` double-counts them. Cargo replaces files rather than writing through the
+  links, so the sibling is never corrupted (verified: the sibling's binary keeps
+  its own inode and behaviour).
+- The seed is skipped when every sibling is mid-build, because a partially
+  written artifact would be hardlinked as-is and cargo would trust its
+  fingerprint.
+- A seed from a workspace on a different `Cargo.lock` or profile is simply
+  partially stale: cargo rebuilds what does not match.
+- The first workspace on a machine has no sibling to seed from and pays the
+  cold build once.
+
+### Compile caching
+
+Seeding (above) is the primary mechanism for a cheap fresh workspace. sccache
+is the fallback for when there is no sibling to seed from, or the seed is
+stale: `.cargo/config.toml` sets `rustc-wrapper = "sccache"`, so registry
+crates are served from one shared content-addressed cache.
+
+- The cache lives in `$SCCACHE_DIR` (`~/.cache/sccache`), capped by
+  `SCCACHE_CACHE_SIZE` (10G); both are set by the flake dev shell. sccache
+  evicts least-recently-used entries past the cap, so it cannot grow without
+  bound.
+- It is worth less than it looks: sccache refuses to cache `bin` and
+  `proc-macro` crates, and those are a large share of a Bevy build. Measured on
+  a fresh workspace: 9m33s cold, 8m58s with sccache, 46s seeded. Do not rely on
+  it for the fresh-workspace case.
+- Workspace members keep incremental compilation (sccache passes those
+  through), so warm rebuilds are unaffected either way.
+- `sccache --show-stats` reports hit rate and cache size.
+- `sccache` is provided by the flake dev shell. Because the wrapper is set in
+  `.cargo/config.toml`, a `cargo` invocation outside the dev shell fails
+  loudly with "sccache: not found" — run it through `direnv exec` (or
+  `nix develop`) as above.
+- The server's `SCCACHE_DIR` is fixed when the server starts, and a client with
+  a different value silently uses the running server's cache. After changing
+  it, run `sccache --stop-server`.
 
 ### Handoff to the human
 
@@ -142,6 +229,36 @@ jj workspace add ~/workspaces/review-<slug> -r <change-id>
 After the human returns findings, resume in the same workspace and
 `jj squash` fixes into the relevant commit. Leave the workspace in place when
 reporting done — the human runs `jj workspace forget <slug>` after review.
+
+#### Reclaiming disk
+
+Every workspace keeps its own target dir, and a full one runs 10-35G, so
+abandoned workspaces and stale nix copies are the main disk consumers. Before
+reporting done, run:
+
+```sh
+scripts/agent-cleanup.sh                 # report what is reclaimable
+scripts/agent-cleanup.sh --apply         # migrate + delete
+scripts/agent-cleanup.sh --apply --gc    # also drop stale nix roots and GC
+```
+
+- **migrate** — moves a real in-tree `target/` out to
+  `~/workspaces/.targets/<slug>` and symlinks it back (a rename, so instant).
+- **orphaned** — deletes target dirs with no registered jj workspace behind
+  them, plus the abandoned shared `~/workspaces/.cargo-target`.
+- **stale** — deletes `incremental` and `examples` for workspaces idle longer
+  than `--stale-days` (default 7).
+- **sweep** (`--sweep`) — runs `cargo-sweep` over `deps` for those same
+  workspaces, dropping artifacts older than `--stale-days`. Where superseded
+  dependency versions pile up; costs a recompile (from the sccache cache) on
+  the next build, so it is opt-in and needs the dev shell on PATH.
+- **gcroot** (`--gc`) — drops nix-direnv roots for copies of this repo, then
+  runs `nix store gc`. Each flake change otherwise leaves a GC-rooted copy of
+  every workspace in the store.
+
+It never touches `deps` or the built binaries of a live workspace, so the next
+warm build stays fast. The `.omp/hooks/post/` hook runs the same sweep
+(`--apply --quiet`, no GC) at session shutdown.
 
 ### Pull requests (optional review layer)
 

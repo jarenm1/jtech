@@ -6,7 +6,10 @@
 !.env.example
 
 # Rust
-/target/
+# No trailing slash: `target` is a symlink into ~/workspaces/.targets, and a
+# trailing slash only matches real directories. See AGENTS.md, "Workspace
+# isolation".
+/target
 
 # Python
 .venv/

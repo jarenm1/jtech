@@ -36,6 +36,11 @@ debug = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+# Dependencies carry no debug info. They are ~600 crates, and their DWARF is
+# most of `target/debug/deps` and most of the link time for the client binary.
+# Workspace crates keep line tables, so backtraces still resolve in the code
+# being edited; a frame inside a dependency shows a symbol but no line number.
+debug = false
 
 [profile.release]
 lto = "thin"

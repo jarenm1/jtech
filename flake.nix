@@ -33,6 +33,13 @@
               rustfmt
               clippy
               rust-analyzer
+              # Shared compilation cache: every workspace compiles the same
+              # registry crates with the same flags, so sccache turns a fresh
+              # workspace's cold build into cache hits. Wired up by
+              # .cargo/config.toml; see AGENTS.md, "Compile caching".
+              sccache
+              # Reclaims stale artifacts from per-workspace target dirs.
+              cargo-sweep
               python3
               uv
               pkg-config
@@ -62,6 +69,13 @@
 
             # Use the host driver; the toolkit does not provide a kernel driver.
             shellHook = ''
+              # One cache shared by every workspace and every agent. Capped so
+              # it cannot grow without bound on a disk that is already tight;
+              # sccache evicts least-recently-used entries past the cap. The
+              # dependency build for this workspace is ~2G, so 10G holds it
+              # with room for a second toolchain.
+              export SCCACHE_DIR="''${SCCACHE_DIR:-$HOME/.cache/sccache}"
+              export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-10G}"
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:${
                 pkgs.lib.makeLibraryPath [
                   cuda.cudatoolkit
