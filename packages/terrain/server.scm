@@ -82,7 +82,7 @@
 ;; wider.
 (define scatter-species
   (list
-    (species "oak" "oak.glb" 6.0 0.5 0.6 0.0 120.0 0.25 1.0 0.8 1.4 0.15 0.012 0.52)
+    (species "oak" "tree.glb" 6.0 0.5 0.6 0.0 120.0 0.25 1.0 0.8 1.4 0.2 0.012 0.52)
     (species "pine" "pine.glb" 5.0 0.45 0.8 0.0 200.0 0.15 1.0 0.9 1.6 0.15 0.014 0.5)
     (species "boulder" "boulder.glb" 9.0 0.3 1.5 0.0 400.0 0.0 1.0 0.6 1.4 0.35 0.0 0.0)))
 

@@ -1943,14 +1943,14 @@ fn default_spec() -> TerrainSpec {
             species: vec![
                 SpeciesSpec {
                     name: "oak".into(),
-                    model: "oak.glb".into(),
+                    model: "tree.glb".into(),
                     spacing: 6.0,
                     density: 0.5,
                     slope_max: 0.6,
                     altitude: (0.0, 120.0),
                     moisture: (0.25, 1.0),
                     scale: (0.8, 1.4),
-                    sink: 0.15,
+                    sink: 0.2,
                     cluster: (0.012, 0.52),
                 },
                 SpeciesSpec {
