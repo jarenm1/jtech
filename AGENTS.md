@@ -85,6 +85,8 @@ gh pr create --head <slug> --base main --title "<type>: <summary>" --body-file /
 ```
 Write `/tmp/pr-body.md` outside the workspace so it is not snapshotted into the commit. Rebase on linear history with `jj git fetch && jj rebase -b <slug> -d main@origin && jj git push --bookmark <slug>`.
 
+Merge pull requests only after explicit human authorization. Creating or pushing a PR does not authorize merging it.
+
 ### Visual evidence
 
 Attach evidence only for changes with a visible surface, matching the medium to the effect:
