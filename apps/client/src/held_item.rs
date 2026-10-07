@@ -90,6 +90,7 @@ pub(crate) fn update(
                 uri,
                 bytes,
                 Transform::IDENTITY,
+                None,
             )
         });
         let child = match spawned {

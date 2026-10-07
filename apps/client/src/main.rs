@@ -1,19 +1,25 @@
 use controller::PlayerInput;
 mod bow_power_hud;
+mod book;
+mod character_preview;
+mod character_ui;
 mod death_overlay;
 mod drops;
 mod game_hud;
 mod health_hud;
 mod held_item;
 mod inventory_ui;
+mod item_icon;
 mod lighting;
 mod loose_blocks;
 mod package_hud;
 mod package_assets;
+mod pane;
 mod pause_menu;
 mod projectiles;
 mod scatter;
 mod sky;
+mod ui_theme;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
@@ -486,6 +492,9 @@ impl Plugin for ClientPlugin {
             .init_resource::<pause_menu::PauseMenu>()
             .init_resource::<death_overlay::DeathOverlay>()
             .init_resource::<inventory_ui::InventoryUi>()
+            .init_resource::<inventory_ui::SelectedCategory>()
+            .init_resource::<item_icon::ItemIcons>()
+            .init_resource::<item_icon::PreviewItem>()
             .init_resource::<package_assets::PackageAssets>()
             .init_resource::<scatter::ScatterWorld>()
             .init_resource::<ClipFrames>()
@@ -494,8 +503,23 @@ impl Plugin for ClientPlugin {
                 Update,
                 (
                     inventory_ui::input.run_if(windowed),
+                    book::pick.run_if(windowed),
+                    inventory_ui::select_category,
                     inventory_ui::sync,
+                    inventory_ui::sync_tabs,
+                    inventory_ui::sync_preview_tile,
+                    character_ui::sync_stats,
+                    inventory_ui::highlight,
+                    inventory_ui::apply_icons,
+                    inventory_ui::tooltip.run_if(windowed),
                     inventory_ui::drag.run_if(windowed),
+                    item_icon::sync,
+                    item_icon::sync_preview,
+                    item_icon::sync_cameras,
+                    book::sync_cameras,
+                    character_preview::sync,
+                    pane::drag.run_if(windowed),
+                    pane::close,
                 )
                     .chain()
                     .before(pause_menu::sync),
@@ -696,7 +720,12 @@ fn setup(
         }),
         dummy_mesh: meshes.add(Capsule3d::new(0.32, 1.1)),
     });
-    inventory_ui::spawn(&mut commands);
+    let preview = character_preview::spawn(&mut commands, &mut images, &mut meshes, &mut materials);
+    let item_preview = item_icon::spawn_preview(&mut commands, &mut images);
+    let book = book::spawn(&mut commands, &mut images, &mut meshes, &mut materials);
+    inventory_ui::spawn(&mut commands, Some(preview), &item_preview, &book);
+    commands.insert_resource(item_preview);
+    commands.insert_resource(book);
     game_hud::spawn(&mut commands);
     pause_menu::spawn(&mut commands);
     death_overlay::spawn(&mut commands, &mut images);

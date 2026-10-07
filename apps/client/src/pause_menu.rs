@@ -142,7 +142,7 @@ pub(crate) fn input(
     }
     if keys.just_pressed(KeyCode::Escape) && window.focused {
         if inventory.open {
-            // Escape peels the topmost layer first: panel, then menu.
+            // Escape peels the topmost layer first: pane, then menu.
             inventory.open = false;
             menu.hold_for_mouse_release();
         } else if menu.open {
@@ -226,7 +226,7 @@ pub(crate) fn sync(
 }
 
 /// Single writer for cursor state. Any overlay that needs the mouse — pause
-/// menu, inventory panel, death screen — releases the grab here so systems
+/// menu, inventory pane, death screen — releases the grab here so systems
 /// cannot fight over `CursorOptions`.
 pub(crate) fn sync_cursor(
     menu: Res<PauseMenu>,

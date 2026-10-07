@@ -135,12 +135,22 @@ item above the centered hotbar, and owned item counts on the hotbar tiles.
 Package status and reload errors appear at the upper right; the FPS counter is at
 the upper left.
 
-**Tab** opens the inventory panel: a scrollable grid of every owned stack plus
-the explosive bow. Drag a cell onto a hotbar slot to assign it, drag between
-hotbar slots to swap, and drop a hotbar item back on the grid to clear the
-slot. The panel releases the cursor and blocks gameplay input; **Esc** closes
-it before the pause menu. Inventories are unbounded — new item kinds append to
-the grid and stack counts are uncapped.
+**Tab** opens the inventory pane: an offscreen 3D book whose pages carry the
+UI. The left page is a scrollable list of every owned item grouped into
+categories (weapons, materials, other) and sorted by name, with the explosive
+bow first; the right page holds an offscreen preview of the player's current
+representation — with the name and guild (placeholders until the protocol
+carries them) as a nameplate — beside a stats block. Each row shows the item's
+icon, name and stack count, and hovering one shows a detail tooltip where unique
+equipment (weapons) lists its damage, range, swing speed and knockback. An item
+that ships a 3D model renders it offscreen into its row icon; everything else
+falls back to a flat colour swatch, so the list mixes 3D and 2D icons. Drag a row
+onto a hotbar slot to assign it, drag between hotbar slots to swap, and drop a
+hotbar item back on the list to clear the slot. The pane releases the cursor and
+blocks gameplay input; close it with the **X** at its top right or **Esc**, which
+closes the pane before the pause menu. Inventories are unbounded — new item kinds
+append to the list and stack counts are uncapped. The pane's colors live in
+`ui_theme::palette` for retheming.
 
 Press **Esc** to open the translucent pause menu. Choose **Resume** or press
 **Esc** again to return, adjust **Bow power**, or choose **Quit game** to exit.

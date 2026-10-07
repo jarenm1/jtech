@@ -199,6 +199,7 @@ fn upgrade_models(
             &uri,
             &bytes,
             Transform::from_translation(visual.current),
+            None,
         ) else {
             continue;
         };
