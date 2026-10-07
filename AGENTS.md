@@ -296,22 +296,35 @@ jj git push --bookmark <slug>
 
 #### Visual evidence
 
-Gameplay-affecting diffs SHOULD have evidence. What works today, cheapest
-first:
+Attach evidence only for changes with a visible surface, and match the medium
+to what the change affects:
+
+| Change | Evidence |
+|---|---|
+| Behavior over time — movement, animation, interaction, timing | **motion**: a headless clip (GIF), or a recorded clip when headless cannot show it |
+| Still visual — rendering, UI layout, colors, a single frame | **one image**: a headless screenshot, or a host screenshot when headless cannot show it |
+| No visible surface — data, math, protocol, refactor, logic | **none**: a headless assert or test output is the evidence |
+
+A still cannot show motion and a clip wastes review time on a static change;
+pick the one that matches. Never attach an image to prove something a test
+already proves.
+
+What works today, cheapest first:
 
 - **Headless asserts** — `cargo run -p server --bin smoke` already runs a
   scripted client in-process; add assertions and paste the output. Preferred
   for logic; not visual.
 - **Headless captures** — `voxel-client --headless --render-backend software
   --frames N --screenshot out.png` renders offscreen on the CPU (lavapipe), so
-  it needs no display server and no GPU. This is the default for visual
+  it needs no display server and no GPU. This is the default for still visual
   evidence; wrap it in `scripts/agent-scope.sh --` (CPU cap; no `--gpu`
   needed). Slower than the real GPU: fine for stills, not for frame-time
   numbers.
-- **Headless clips** — add `--clip out.gif --clip-fps N` for motion. The GIF is
-  encoded in-process (no ffmpeg needed) and plays inline in a PR body, unlike a
-  video file. Sampling is frame-counted, so the clip plays at `--clip-fps`
-  regardless of how fast the renderer runs.
+- **Headless clips** — add `--clip out.gif --clip-fps N` for motion — the
+  default for gameplay/behavioral evidence. The GIF is encoded in-process (no
+  ffmpeg needed) and plays inline in a PR body, unlike a video file. Sampling
+  is frame-counted, so the clip plays at `--clip-fps` regardless of how fast
+  the renderer runs.
 - **Screenshots** — only when headless cannot show what you need. Run the
   client on the host display (`DISPLAY=:0`/`WAYLAND_DISPLAY=wayland-1` are set
   in this environment) and capture with `grim` (wayland) or
