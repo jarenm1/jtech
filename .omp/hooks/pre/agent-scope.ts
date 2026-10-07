@@ -28,7 +28,7 @@ function wrapCommand(wrapper: string, command: string): string {
     /\bvoxel-client\b/.test(command) && !CPU_RENDER.test(command) ? "--gpu " : "";
   const script = `'${wrapper.replaceAll("'", "'\\''")}'`;
   const body = `'${command.replaceAll("'", "'\\''")}'`;
-  return `${script} -- ${flags}bash -c ${body}`;
+  return `${script} ${flags}-- bash -c ${body}`;
 }
 
 /** Nearest ancestor of `start` that contains the wrapper, if any. */
